@@ -1,58 +1,59 @@
-pip install pywin32
+import win32com.client
+import re
 
-
-# Connect to Outlook
-outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-
-# 6 = Inbox
-inbox = outlook.GetDefaultFolder(6)
-
-# Counters
-total = 0
-read = 0
-unread = 0
-approved_count = 0
-matching_count = 0
-
-# Regular expressions
 approved_pattern = re.compile(r"\bapproved\b", re.IGNORECASE)
-
 subject_pattern = re.compile(
     r"\btime(?:\s+|-)?card\b|^\s*FW:\s*FYI:?",
     re.IGNORECASE
 )
 
-for item in inbox.Items:
-    try:
-        # Only MailItem objects
-        if item.Class != 43:
-            continue
 
-        total += 1
+def get_approved_cards(inbox=None, verbose=True):
+    if inbox is None:
+        outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+        inbox = outlook.GetDefaultFolder(6)
 
-        if item.UnRead:
-            unread += 1
-        else:
-            read += 1
+    total = 0
+    read = 0
+    unread = 0
+    approved_count = 0
+    matching_emails = []
 
-        subject = item.Subject or ""
+    for item in inbox.Items:
+        try:
+            if item.Class != 43:
+                continue
 
-        # Count every subject containing "Approved"
-        if approved_pattern.search(subject):
-            approved_count += 1
+            total += 1
 
-        # Count Approved + (Time Card OR FW: FYI)
-        if approved_pattern.search(subject) and subject_pattern.search(subject):
-            matching_count += 1
-            print(subject)
+            if item.UnRead:
+                unread += 1
+            else:
+                read += 1
 
-    except Exception as e:
-        print(f"Error: {e}")
+            subject = item.Subject or ""
 
-print("\n========== RESULTS ==========")
-print(f"Total Emails                : {total:,}")
-print(f"Read Emails                 : {read:,}")
-print(f"Unread Emails               : {unread:,}")
-print(f"Subjects with 'Approved'    : {approved_count:,}")
-print(f"Approved + Time Card/FW:FYI : {matching_count:,}")
- 
+            if approved_pattern.search(subject):
+                approved_count += 1
+
+                if subject_pattern.search(subject):
+                    matching_emails.append(item)
+
+        except Exception as e:
+            print(f"Error: {e}")
+
+    if verbose:
+        print("\n========== RESULTS ==========")
+        print(f"Total Emails                : {total:,}")
+        print(f"Read Emails                 : {read:,}")
+        print(f"Unread Emails               : {unread:,}")
+        print(f"Subjects with 'Approved'    : {approved_count:,}")
+        print(f"Approved + Time Card/FW:FYI : {len(matching_emails):,}")
+
+    return matching_emails
+
+
+if __name__ == "__main__":
+    results = get_approved_cards()
+    for email in results:
+        print(email.Subject)
