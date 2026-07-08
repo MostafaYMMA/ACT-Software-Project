@@ -1,59 +1,741 @@
-import win32com.client
-import re
 
+
+import os
+import re
+import shutil
+import tempfile
+import traceback
+import zipfile
+
+import win32com.client
+
+# ----------------------------------------------------------------------
+# Optional third-party extraction libraries (each wrapped so a missing
+# library only disables that one format).
+# ----------------------------------------------------------------------
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
+
+try:
+    import docx
+except ImportError:
+    docx = None
+
+try:
+    import docx2txt
+except ImportError:
+    docx2txt = None
+
+try:
+    import openpyxl
+except ImportError:
+    openpyxl = None
+
+try:
+    import xlrd
+except ImportError:
+    xlrd = None
+
+try:
+    from pptx import Presentation
+except ImportError:
+    Presentation = None
+
+try:
+    import extract_msg
+except ImportError:
+    extract_msg = None
+
+try:
+    from odf import text as odf_text
+    from odf.opendocument import load as odf_load
+except ImportError:
+    odf_text = None
+    odf_load = None
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+
+try:
+    from striprtf.striprtf import rtf_to_text
+except ImportError:
+    rtf_to_text = None
+
+
+# ----------------------------------------------------------------------
+# Compiled regular expressions (compiled ONCE, reused everywhere).
+# ----------------------------------------------------------------------
+
+# --- Strict approval/timecard logic -- used ONLY for BODY matching
+#     (and for informational subject reporting). DO NOT MODIFY. ---
 approved_pattern = re.compile(r"\bapproved\b", re.IGNORECASE)
+
 subject_pattern = re.compile(
     r"\btime(?:\s+|-)?card\b|^\s*FW:\s*FYI:?",
     re.IGNORECASE
 )
 
+# --- Keyword list -- used for ATTACHMENT matching (any ONE keyword
+#     is enough) AND for informational reporting in body/subject. ---
+KEYWORDS = [
+    "Time card",
+    "Timecard",
+    "Time-card",
+    "Time Card Status",
+    "Approved",
+    "Reported time by entry date",
+]
 
-def get_approved_cards(inbox=None, verbose=True):
-    if inbox is None:
-        outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-        inbox = outlook.GetDefaultFolder(6)
+KEYWORD_PATTERNS = [
+    (kw, re.compile(re.escape(kw), re.IGNORECASE)) for kw in KEYWORDS
+]
 
-    total = 0
-    read = 0
-    unread = 0
-    approved_count = 0
-    matching_emails = []
+# Word-splitting regex (from the uploaded script) -- used to build a
+# clean word list from extracted attachment text.
+WORD_SPLIT_PATTERN = re.compile(r"\b[\w'-]+\b")
 
-    for item in inbox.Items:
-        try:
-            if item.Class != 43:
-                continue
+OL_MAIL_ITEM_CLASS = 43
+OL_FOLDER_INBOX = 6
 
-            total += 1
+DEBUG = True  # set to False to silence per-email debug prints
 
-            if item.UnRead:
-                unread += 1
+
+# ----------------------------------------------------------------------
+# Global counters
+# ----------------------------------------------------------------------
+class Counters:
+    def __init__(self):
+        self.total_emails = 0
+        self.read_emails = 0
+        self.unread_emails = 0
+        self.subjects_with_approved = 0
+        self.subjects_matching_logic = 0          # informational only
+        self.total_attachments_scanned = 0
+        self.total_matching_attachments = 0        # attachments with >=1 keyword
+        self.emails_with_attachment_keywords = 0
+        self.emails_with_body_keywords = 0
+        self.emails_matched_via_body = 0
+        self.emails_matched_via_attachment = 0
+        self.emails_with_matching_attachment = 0
+        self.total_emails_matched = 0
+
+    def report(self):
+        print("\n" + "=" * 70)
+        print("SUMMARY")
+        print("=" * 70)
+        print(f"Total emails scanned:                     {self.total_emails}")
+        print(f"Read emails:                               {self.read_emails}")
+        print(f"Unread emails:                             {self.unread_emails}")
+        print(f"Subjects containing 'Approved' (info only):{self.subjects_with_approved}")
+        print(f"Subjects matching logic (info only):       {self.subjects_matching_logic}")
+        print(f"Total attachments scanned (all emails):    {self.total_attachments_scanned}")
+        print(f"Total matching attachments (>=1 keyword):  {self.total_matching_attachments}")
+        print(f"Emails w/ keywords found in attachment:    {self.emails_with_attachment_keywords}")
+        print(f"Emails w/ keywords found in body:          {self.emails_with_body_keywords}")
+        print(f"Emails matched via BODY (strict logic):    {self.emails_matched_via_body}")
+        print(f"Emails matched via ATTACHMENT (keyword):   {self.emails_matched_via_attachment}")
+        print(f"Emails with a MATCHING attachment:         {self.emails_with_matching_attachment}")
+        print(f"TOTAL EMAILS MATCHED (body OR attachment): {self.total_emails_matched}")
+        print("=" * 70)
+
+
+# ----------------------------------------------------------------------
+# Keyword / approval-logic / word-list helpers
+# ----------------------------------------------------------------------
+def words_from_text(text):
+    """
+    Split extracted text into a clean list of words (from the uploaded
+    reference script). Used as a normalization pass before keyword
+    matching on attachment content, so matching is based on the
+    actual words present rather than raw substring search alone.
+    """
+    if not text:
+        return []
+    return WORD_SPLIT_PATTERN.findall(text)
+
+
+def find_keywords(text):
+    """Return list of configured keywords found in text (case-insensitive)."""
+    if not text:
+        return []
+    found = []
+    for kw, pattern in KEYWORD_PATTERNS:
+        if pattern.search(text):
+            found.append(kw)
+    return found
+
+
+def find_keywords_in_words(word_list):
+    """
+    Same as find_keywords(), but operates on a pre-split word list by
+    rejoining it into a single searchable string first. This lets
+    multi-word keywords (e.g. "Time Card Status") still be detected
+    even though the source was tokenized, while guaranteeing the
+    match is grounded in the actual extracted words.
+    """
+    if not word_list:
+        return []
+    rejoined = " ".join(word_list)
+    return find_keywords(rejoined)
+
+
+def matches_approval_logic(text):
+    """
+    STRICT logic: approved_pattern AND subject_pattern both present.
+    Used for BODY matching (and informational subject reporting).
+    """
+    if not text:
+        return False
+    return bool(approved_pattern.search(text)) and bool(subject_pattern.search(text))
+
+
+def matches_any_keyword(word_list):
+    """
+    LOOSE logic: at least ONE keyword from KEYWORDS present in the
+    attachment's word list. Used for ATTACHMENT matching.
+    """
+    return len(find_keywords_in_words(word_list)) > 0
+
+
+# ----------------------------------------------------------------------
+# Per-format text extraction functions
+# ----------------------------------------------------------------------
+def extract_pdf_text(filepath):
+    if pdfplumber is None:
+        return ""
+    text_chunks = []
+    try:
+        with pdfplumber.open(filepath) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text_chunks.append(page_text)
+    except Exception:
+        traceback.print_exc()
+    return "\n".join(text_chunks)
+
+
+def extract_docx_text(filepath):
+    text_chunks = []
+    try:
+        if docx is not None:
+            document = docx.Document(filepath)
+            for para in document.paragraphs:
+                if para.text:
+                    text_chunks.append(para.text)
+            for table in document.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        if cell.text:
+                            text_chunks.append(cell.text)
+            if text_chunks:
+                return "\n".join(text_chunks)
+    except Exception:
+        traceback.print_exc()
+
+    try:
+        if docx2txt is not None:
+            return docx2txt.process(filepath) or ""
+    except Exception:
+        traceback.print_exc()
+
+    return "\n".join(text_chunks)
+
+
+def extract_doc_text(filepath):
+    try:
+        if docx2txt is not None:
+            result = docx2txt.process(filepath)
+            if result:
+                return result
+    except Exception:
+        pass
+
+    try:
+        with open(filepath, "rb") as f:
+            raw = f.read()
+        decoded = raw.decode("latin-1", errors="ignore")
+        return re.sub(r"[^\x20-\x7E\n\r\t]+", " ", decoded)
+    except Exception:
+        traceback.print_exc()
+        return ""
+
+
+def extract_excel_text(filepath, ext):
+    text_chunks = []
+    try:
+        if ext == ".xlsx" and openpyxl is not None:
+            wb = openpyxl.load_workbook(filepath, data_only=True, read_only=True)
+            for sheet in wb.worksheets:
+                for row in sheet.iter_rows(values_only=True):
+                    for cell in row:
+                        if cell is not None:
+                            text_chunks.append(str(cell))
+            wb.close()
+        elif ext == ".xls" and xlrd is not None:
+            wb = xlrd.open_workbook(filepath)
+            for sheet in wb.sheets():
+                for row_idx in range(sheet.nrows):
+                    for cell in sheet.row(row_idx):
+                        if cell.value not in (None, ""):
+                            text_chunks.append(str(cell.value))
+    except Exception:
+        traceback.print_exc()
+    return "\n".join(text_chunks)
+
+
+def extract_powerpoint_text(filepath, ext):
+    text_chunks = []
+    try:
+        if ext == ".pptx" and Presentation is not None:
+            prs = Presentation(filepath)
+            for slide in prs.slides:
+                for shape in slide.shapes:
+                    if hasattr(shape, "text") and shape.text:
+                        text_chunks.append(shape.text)
+        elif ext == ".ppt":
+            with open(filepath, "rb") as f:
+                raw = f.read()
+            decoded = raw.decode("latin-1", errors="ignore")
+            text_chunks.append(re.sub(r"[^\x20-\x7E\n\r\t]+", " ", decoded))
+    except Exception:
+        traceback.print_exc()
+    return "\n".join(text_chunks)
+
+
+def extract_msg_text(filepath):
+    if extract_msg is None:
+        return ""
+    text_chunks = []
+    try:
+        msg = extract_msg.Message(filepath)
+        if msg.subject:
+            text_chunks.append(msg.subject)
+        if msg.body:
+            text_chunks.append(msg.body)
+        msg.close()
+    except Exception:
+        traceback.print_exc()
+    return "\n".join(text_chunks)
+
+
+def extract_odf_text(filepath):
+    if odf_load is None or odf_text is None:
+        return ""
+    text_chunks = []
+    try:
+        doc = odf_load(filepath)
+        for element in doc.getElementsByType(odf_text.P):
+            text_chunks.append(str(element))
+    except Exception:
+        traceback.print_exc()
+    return "\n".join(text_chunks)
+
+
+def extract_html_text(filepath):
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            raw_html = f.read()
+        if BeautifulSoup is not None:
+            soup = BeautifulSoup(raw_html, "lxml")
+            return soup.get_text(separator="\n")
+        return re.sub(r"<[^>]+>", " ", raw_html)
+    except Exception:
+        traceback.print_exc()
+        return ""
+
+
+def extract_xml_text(filepath):
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            raw_xml = f.read()
+        if BeautifulSoup is not None:
+            soup = BeautifulSoup(raw_xml, "xml")
+            return soup.get_text(separator="\n")
+        return re.sub(r"<[^>]+>", " ", raw_xml)
+    except Exception:
+        traceback.print_exc()
+        return ""
+
+
+def extract_rtf_text(filepath):
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            raw_rtf = f.read()
+        if rtf_to_text is not None:
+            return rtf_to_text(raw_rtf)
+        return raw_rtf
+    except Exception:
+        traceback.print_exc()
+        return ""
+
+
+def extract_plain_text(filepath):
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except Exception:
+        traceback.print_exc()
+        return ""
+
+
+def extract_csv_text(filepath):
+    """From the uploaded script: dedicated CSV extraction via csv module."""
+    import csv
+    text_chunks = []
+    try:
+        with open(filepath, newline="", encoding="utf-8", errors="ignore") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                text_chunks.append(" ".join(row))
+    except Exception:
+        traceback.print_exc()
+    return "\n".join(text_chunks)
+
+
+def extract_zip_text(filepath):
+    text_chunks = []
+    temp_extract_dir = tempfile.mkdtemp(prefix="zip_extract_")
+    try:
+        with zipfile.ZipFile(filepath, "r") as zf:
+            for member in zf.namelist():
+                try:
+                    extracted_path = zf.extract(member, temp_extract_dir)
+                    if os.path.isdir(extracted_path):
+                        continue
+                    member_text = extract_text_from_file(extracted_path)
+                    if member_text:
+                        text_chunks.append(member_text)
+                except Exception:
+                    traceback.print_exc()
+    except Exception:
+        traceback.print_exc()
+    finally:
+        shutil.rmtree(temp_extract_dir, ignore_errors=True)
+    return "\n".join(text_chunks)
+
+
+def extract_text_from_file(filepath):
+    """Detect file type by extension and dispatch to the right extractor."""
+    ext = os.path.splitext(filepath)[1].lower()
+    try:
+        if ext == ".pdf":
+            return extract_pdf_text(filepath)
+        elif ext == ".docx":
+            return extract_docx_text(filepath)
+        elif ext == ".doc":
+            return extract_doc_text(filepath)
+        elif ext == ".xlsx":
+            return extract_excel_text(filepath, ext)
+        elif ext == ".xls":
+            return extract_excel_text(filepath, ext)
+        elif ext == ".pptx":
+            return extract_powerpoint_text(filepath, ext)
+        elif ext == ".ppt":
+            return extract_powerpoint_text(filepath, ext)
+        elif ext == ".csv":
+            return extract_csv_text(filepath)
+        elif ext in (".txt", ".log"):
+            return extract_plain_text(filepath)
+        elif ext in (".html", ".htm"):
+            return extract_html_text(filepath)
+        elif ext == ".xml":
+            return extract_xml_text(filepath)
+        elif ext == ".rtf":
+            return extract_rtf_text(filepath)
+        elif ext == ".msg":
+            return extract_msg_text(filepath)
+        elif ext == ".zip":
+            return extract_zip_text(filepath)
+        elif ext in (".odt", ".ods", ".odp"):
+            return extract_odf_text(filepath)
+        else:
+            return ""
+    except Exception:
+        traceback.print_exc()
+        return ""
+
+
+# ----------------------------------------------------------------------
+# Attachment processing
+# ----------------------------------------------------------------------
+def process_attachment(attachment, temp_dir, counters):
+    """
+    Save one attachment to disk, extract its text, split it into a
+    clean word list (words_from_text), and check whether that word
+    list contains AT LEAST ONE of the KEYWORDS (loose match -- this
+    is what decides an attachment-based email match). Returns a
+    result dict; deletes the temp file before returning.
+    """
+    result = {
+        "filename": None,
+        "filetype": None,
+        "keywords_found": [],
+        "text": "",
+        "word_count": 0,
+        "matches_keyword": False,   # True if ANY keyword found
+    }
+
+    filename = None
+    saved_path = None
+    try:
+        filename = attachment.FileName
+        ext = os.path.splitext(filename)[1].lower()
+        safe_name = f"{abs(hash(filename))}_{filename}"
+        saved_path = os.path.join(temp_dir, safe_name)
+
+        attachment.SaveAsFile(saved_path)
+        counters.total_attachments_scanned += 1
+
+        text = extract_text_from_file(saved_path)
+
+        # Normalize via word-list split (from the uploaded reference script)
+        word_list = words_from_text(text)
+        keywords_found = find_keywords_in_words(word_list)
+
+        result["filename"] = filename
+        result["filetype"] = ext if ext else "(unknown)"
+        result["keywords_found"] = keywords_found
+        result["text"] = text
+        result["word_count"] = len(word_list)
+        result["matches_keyword"] = len(keywords_found) > 0
+
+        if result["matches_keyword"]:
+            counters.total_matching_attachments += 1
+
+        if DEBUG:
+            print(f"        [DEBUG] Attachment '{filename}' -> "
+                  f"words={result['word_count']} | "
+                  f"keywords={keywords_found} | "
+                  f"matches_keyword={result['matches_keyword']}")
+
+    except Exception:
+        traceback.print_exc()
+    finally:
+        if saved_path and os.path.exists(saved_path):
+            try:
+                os.remove(saved_path)
+            except Exception:
+                traceback.print_exc()
+
+    return result
+
+
+# ----------------------------------------------------------------------
+# Email processing
+# ----------------------------------------------------------------------
+def process_email(item, temp_dir, counters):
+    """
+    Process a single MailItem. Every attachment is opened and scanned
+    regardless of subject content.
+
+    MATCH RULE:
+      - Subject alone NEVER triggers a match (informational only).
+      - BODY triggers a match only via the STRICT logic
+        (approved_pattern AND subject_pattern both present).
+      - ATTACHMENT triggers a match if its word list contains AT
+        LEAST ONE keyword from KEYWORDS (loose match).
+    """
+    counters.total_emails += 1
+
+    try:
+        if item.UnRead:
+            counters.unread_emails += 1
+        else:
+            counters.read_emails += 1
+    except Exception:
+        traceback.print_exc()
+
+    subject = getattr(item, "Subject", "") or ""
+
+    # Subject checks -- INFO/DEBUG/counters only, never affects match.
+    has_approved = bool(approved_pattern.search(subject))
+    if has_approved:
+        counters.subjects_with_approved += 1
+
+    has_subject_pattern = bool(subject_pattern.search(subject))
+    subject_would_have_matched = has_approved and has_subject_pattern
+    if subject_would_have_matched:
+        counters.subjects_matching_logic += 1
+
+    if DEBUG:
+        print(f"[DEBUG] Subject: '{subject}' | approved={has_approved} | "
+              f"pattern={has_subject_pattern} | "
+              f"(subject alone does NOT trigger match)")
+
+    try:
+        sender = item.SenderName
+    except Exception:
+        sender = "(unknown sender)"
+
+    try:
+        received = item.ReceivedTime
+    except Exception:
+        received = "(unknown date)"
+
+    try:
+        body = item.Body or ""
+    except Exception:
+        body = ""
+
+    body_keywords = find_keywords(body)
+    found_in_body = len(body_keywords) > 0
+    if found_in_body:
+        counters.emails_with_body_keywords += 1
+
+    # --- BODY match uses the STRICT approval logic ---
+    body_approval_match = matches_approval_logic(body)
+
+    if DEBUG:
+        print(f"        [DEBUG] Body strict approval_logic_match={body_approval_match}")
+
+    subject_keywords = find_keywords(subject)
+
+    # --- ALWAYS open every attachment ---
+    attachment_results = []
+    found_in_attachment = False
+    attachment_keyword_match = False
+    try:
+        attachments = item.Attachments
+        if DEBUG:
+            print(f"        [DEBUG] Attachment count: {attachments.Count}")
+        for i in range(1, attachments.Count + 1):
+            attachment = attachments.Item(i)
+            att_result = process_attachment(attachment, temp_dir, counters)
+            if att_result["keywords_found"]:
+                found_in_attachment = True
+            if att_result["matches_keyword"]:
+                attachment_keyword_match = True
+            attachment_results.append(att_result)
+    except Exception:
+        traceback.print_exc()
+
+    if found_in_attachment:
+        counters.emails_with_attachment_keywords += 1
+
+    if attachment_keyword_match:
+        counters.emails_with_matching_attachment += 1
+
+    # --- FINAL MATCH DECISION: body (strict) OR attachment (loose keyword) ---
+    is_matched = body_approval_match or attachment_keyword_match
+    if not is_matched:
+        return  # not a match -- skip reporting
+
+    counters.total_emails_matched += 1
+    if body_approval_match:
+        counters.emails_matched_via_body += 1
+    if attachment_keyword_match:
+        counters.emails_matched_via_attachment += 1
+
+    # --- Print the matched subject clearly ---
+    print(f"\n>>> MATCHED EMAIL SUBJECT: {subject}")
+
+    print("-" * 70)
+    print(f"Subject:          {subject}")
+    print(f"Sender:           {sender}")
+    print(f"Received:         {received}")
+    print(f"Matched via:      "
+          f"{'BODY (strict logic)' if body_approval_match else ''}"
+          f"{' + ' if body_approval_match and attachment_keyword_match else ''}"
+          f"{'ATTACHMENT (keyword match)' if attachment_keyword_match else ''}")
+    print(f"(Subject alone matched approval logic: {subject_would_have_matched} "
+          f"-- informational only, did not cause this match)")
+
+    locations = []
+    if subject_keywords:
+        locations.append(f"Subject ({', '.join(subject_keywords)})")
+    if found_in_body:
+        locations.append(f"Body ({', '.join(body_keywords)})")
+    for att in attachment_results:
+        if att["keywords_found"]:
+            locations.append(
+                f"Attachment '{att['filename']}' [{att['filetype']}] "
+                f"({', '.join(att['keywords_found'])})"
+            )
+
+    if locations:
+        print("Keywords found in:")
+        for loc in locations:
+            print(f"    - {loc}")
+    else:
+        print("Keywords found in: (none)")
+
+    # --- Attachments processed summary ---
+    if attachment_results:
+        print("Attachments processed:")
+        for att in attachment_results:
+            flag = " <-- MATCHED (keyword)" if att["matches_keyword"] else ""
+            print(f"    - {att['filename']} ({att['filetype']}, {att['word_count']} words){flag}")
+    else:
+        print("Attachments processed: (none)")
+
+    # --- Full breakdown: every attachment name + every keyword found in it ---
+    print("Attachment name -> keywords found (detailed):")
+    if attachment_results:
+        for att in attachment_results:
+            name = att["filename"] if att["filename"] else "(unknown filename)"
+            if att["keywords_found"]:
+                kw_list = ", ".join(att["keywords_found"])
             else:
-                read += 1
+                kw_list = "(no keywords found)"
+            print(f"    - {name}: {kw_list}")
+    else:
+        print("    (no attachments on this email)")
 
-            subject = item.Subject or ""
+    print("-" * 70)
 
-            if approved_pattern.search(subject):
-                approved_count += 1
 
-                if subject_pattern.search(subject):
-                    matching_emails.append(item)
+# ----------------------------------------------------------------------
+# Main entry point
+# ----------------------------------------------------------------------
+def get_outlook_folder(namespace, folder_name="Inbox"):
+    """
+    Connect helper adapted from the uploaded reference script: returns
+    the Inbox by default, or looks up a named subfolder under Inbox.
+    """
+    inbox = namespace.GetDefaultFolder(OL_FOLDER_INBOX)
+    if folder_name.lower() == "inbox":
+        return inbox
+    for folder in inbox.Folders:
+        if folder.Name.lower() == folder_name.lower():
+            return folder
+    raise ValueError(f"Folder '{folder_name}' not found under Inbox.")
 
-        except Exception as e:
-            print(f"Error: {e}")
 
-    if verbose:
-        print("\n========== RESULTS ==========")
-        print(f"Total Emails                : {total:,}")
-        print(f"Read Emails                 : {read:,}")
-        print(f"Unread Emails               : {unread:,}")
-        print(f"Subjects with 'Approved'    : {approved_count:,}")
-        print(f"Approved + Time Card/FW:FYI : {len(matching_emails):,}")
+def main():
+    counters = Counters()
 
-    return matching_emails
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        namespace = outlook.GetNamespace("MAPI")
+        inbox = get_outlook_folder(namespace, "Inbox")
+    except Exception as exc:
+        print(f"FATAL: Could not connect to Outlook: {exc}")
+        traceback.print_exc()
+        return
+
+    items = inbox.Items
+    temp_dir = tempfile.mkdtemp(prefix="outlook_scan_")
+
+    try:
+        # Single pass over the Inbox -- O(n).
+        for item in items:
+            try:
+                if getattr(item, "Class", None) != OL_MAIL_ITEM_CLASS:
+                    continue
+                process_email(item, temp_dir, counters)
+            except Exception:
+                traceback.print_exc()
+                continue
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    counters.report()
 
 
 if __name__ == "__main__":
-    results = get_approved_cards()
-    for email in results:
-        print(email.Subject)
+    main()
