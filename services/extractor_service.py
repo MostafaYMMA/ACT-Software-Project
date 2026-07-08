@@ -33,11 +33,11 @@ def extract(email):
     return entries
 
 
-def _extract_field(text, pattern):
-    match = re.search(pattern, text, re.IGNORECASE)
-    if match:
-        return match.group(1).strip()
-    return None
+# def _extract_field(text, pattern):
+#     match = re.search(pattern, text, re.IGNORECASE)
+#     if match:
+#         return match.group(1).strip()
+#     return None
 
 
 if __name__ == "__main__":
