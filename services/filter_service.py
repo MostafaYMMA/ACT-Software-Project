@@ -1,3 +1,4 @@
+import itertools
 import os
 import re
 import shutil
@@ -713,6 +714,7 @@ def process_email(item, temp_dir, counters):
                 "word_count": att["word_count"],
                 "keywords_found": att["keywords_found"],
                 "matches_keyword": att["matches_keyword"],
+                "text": att["text"],
             }
             for att in attachment_results
         ],
@@ -742,7 +744,7 @@ def get_outlook_folder(namespace, folder_name="Inbox"):
 # ----------------------------------------------------------------------
 # Public entry point: get_approved_cards()
 # ----------------------------------------------------------------------
-def get_approved_cards(folder_name="Inbox", print_report=True):
+def get_approved_cards(folder_name="Inbox", print_report=True, limit=None):
     """
     Connect to Outlook, scan the given folder (Inbox by default) using
     the same single-pass logic as main(), and return the list of
@@ -758,6 +760,8 @@ def get_approved_cards(folder_name="Inbox", print_report=True):
                      ("Inbox" itself, or a named subfolder).
         print_report: if True, prints the Counters summary at the end
                      (same output as main()).
+        limit: if set, only scan the `limit` most recently received
+                     emails instead of the whole folder.
 
     Returns:
         matching_emails: list of dicts, one per matched email, in the
@@ -777,11 +781,12 @@ def get_approved_cards(folder_name="Inbox", print_report=True):
         return matching_emails
 
     items = folder.Items
+    items.Sort("[ReceivedTime]", True)  # newest first, so limit takes the most recent
     temp_dir = tempfile.mkdtemp(prefix="outlook_scan_")
 
     try:
-        # Single pass over the folder -- O(n).
-        for item in items:
+        # Single pass over the folder (capped at `limit` if given) -- O(n).
+        for item in (itertools.islice(items, limit) if limit else items):
             try:
                 if getattr(item, "Class", None) != OL_MAIL_ITEM_CLASS:
                     continue
