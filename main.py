@@ -3,12 +3,13 @@ Entry point. Decides which screen to show first:
   - No accounts on this machine yet  -> AccountCreationPage
   - One or more accounts exist       -> SelectAccountPage (tap to log in)
 Then hands off to MainWindow once a user is chosen/created.
-
 This file is the only "traffic cop" - it doesn't contain any account
 logic (that's ui/athu.py) or any page layout (that's the rest of ui/).
 """
-
 import sys
+import os
+
+sys.path.append(os.path.join(os.path.dirname(__file__), "services"))
 
 from PySide6.QtWidgets import QApplication, QMainWindow
 
@@ -18,6 +19,33 @@ from ui.select_account_page import SelectAccountPage
 from ui.app import MainWindow
 from ui.theme import GLOBAL_STYLESHEET
 from ui.transition import FadeStackedWidget
+
+from filter_service import get_approved_cards
+from extractor_service import extract
+from storage_service import init_db, save_cards, export_to_csv
+
+
+def sync_cards():
+    """Pull approved timecard emails, extract entries, and persist them."""
+    init_db()
+
+    emails = get_approved_cards()
+    print(f"\nApproved emails found: {len(emails)}")
+
+    all_entries = []
+    for email in emails:
+        entries = extract(email)
+        print(f"  - '{email.Subject}' -> {len(entries)} entries")
+        all_entries.extend(entries)
+
+    print(f"\nTotal entries extracted: {len(all_entries)}")
+
+    if all_entries:
+        save_cards(all_entries)
+        print("Saved entries to database.")
+        export_to_csv()
+    else:
+        print("Nothing to save.")
 
 
 class RootWindow(QMainWindow):
@@ -61,10 +89,10 @@ class RootWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    sync_cards()
+
     app = QApplication(sys.argv)
     app.setStyleSheet(GLOBAL_STYLESHEET)
-
     window = RootWindow()
     window.show()
-
     sys.exit(app.exec())
