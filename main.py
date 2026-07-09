@@ -32,7 +32,7 @@ from ui.transition import FadeStackedWidget, zoom_in
 
 from filter_service import get_approved_cards
 from extractor_service import extract
-from storage_service import init_db, save_cards, export_to_csv
+from storage_service import init_db, save_cards, export_to_csv, export_invoice_lines_to_excel
 
 WELCOME_SPLASH_DURATION_MS = 900
 
@@ -65,6 +65,7 @@ def sync_cards(progress_callback=None):
         save_cards(all_entries)
         print("Saved entries to database.")
         export_to_csv()
+        export_invoice_lines_to_excel()
     else:
         print("Nothing to save.")
 
