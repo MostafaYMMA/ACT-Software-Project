@@ -65,6 +65,7 @@ class MainWindow(QWidget):
     def __init__(self, user_name):
         super().__init__()
         self.user_name = user_name
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"background-color: {COLOR_BG};")
 
         self._sidebar_visible = False
