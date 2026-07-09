@@ -34,6 +34,35 @@ _labor_time_same_line_pattern = re.compile(
 _labor_only_pattern = re.compile(r"Contractor Labor\s*-\s*([^\r\n]+)", re.IGNORECASE)
 _time_type_after_hours_pattern = re.compile(r"Hours\s*[\r\n]+\s*([^\r\n]+)", re.IGNORECASE)
 
+# Document-level fields (one per email/attachment, not per day). The name
+# has no label -- it's just whatever line sits right after "Time card".
+# Period/Person Number use \s+ rather than a fixed layout because plain
+# email bodies put each label and value on its own line, while PDFs
+# squeeze the labels onto one line and the values onto the next -- \s+
+# matches either a single space or a run of blank lines, so one pattern
+# covers both.
+_name_pattern = re.compile(r"Time card\s*[\r\n]+\s*([^\r\n]+)", re.IGNORECASE)
+_period_person_pattern = re.compile(
+    r"Period\s+Person Number\s+Time Card Status\s+"
+    r"(?P<period>\d{1,2}/\d{1,2}/\d{2,4}\s*-\s*\d{1,2}/\d{1,2}/\d{2,4})\s+"
+    r"(?P<person_number>\d+)",
+    re.IGNORECASE
+)
+
+
+def _header_fields(text):
+    """Pull the document-level name/period/person-number out of one text
+    blob (email body or attachment text). Returns None for any field not
+    found rather than failing the whole lookup."""
+    name_match = _name_pattern.search(text)
+    period_person_match = _period_person_pattern.search(text)
+
+    return {
+        "name": name_match.group(1).strip() if name_match else None,
+        "period": period_person_match.group("period").strip() if period_person_match else None,
+        "person_number": period_person_match.group("person_number").strip() if period_person_match else None,
+    }
+
 
 def _day_blocks(text):
     """Split text into (day, block_text) chunks, one per day header found."""
@@ -105,10 +134,14 @@ def extract(email):
 
     entries = []
     for text in texts:
+        header_fields = _header_fields(text)
         for day, block in _day_blocks(text):
             entry = _parse_block(day, block)
             if entry is None:
                 continue
+            entry["name"] = header_fields["name"]
+            entry["period"] = header_fields["period"]
+            entry["person_number"] = header_fields["person_number"]
             entry["subject"] = subject
             entry["sender"] = sender
             entry["received"] = received

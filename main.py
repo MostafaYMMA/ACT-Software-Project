@@ -25,7 +25,7 @@ from ui.transition import FadeStackedWidget
 
 from filter_service import get_approved_cards
 from extractor_service import extract
-from storage_service import init_db, save_cards, export_to_csv
+from storage_service import init_db, save_cards, export_to_csv, export_invoice_lines_to_excel
 
 
 def sync_cards():
@@ -48,6 +48,7 @@ def sync_cards():
         save_cards(all_entries)
         print("Saved entries to database.")
         export_to_csv()
+        export_invoice_lines_to_excel()
     else:
         print("Nothing to save.")
 
@@ -95,8 +96,8 @@ class RootWindow(QMainWindow):
 if __name__ == "__main__":
     sync_cards()
 
-    app = QApplication(sys.argv)
-    app.setStyleSheet(GLOBAL_STYLESHEET)
-    window = RootWindow()
-    window.show()
-    sys.exit(app.exec())
+    # app = QApplication(sys.argv)
+    # app.setStyleSheet(GLOBAL_STYLESHEET)
+    # window = RootWindow()
+    # window.show()
+    # sys.exit(app.exec())
