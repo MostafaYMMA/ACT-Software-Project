@@ -96,8 +96,8 @@ class RootWindow(QMainWindow):
 if __name__ == "__main__":
     sync_cards()
 
-    # app = QApplication(sys.argv)
-    # app.setStyleSheet(GLOBAL_STYLESHEET)
-    # window = RootWindow()
-    # window.show()
-    # sys.exit(app.exec())
+    app = QApplication(sys.argv)
+    app.setStyleSheet(GLOBAL_STYLESHEET)
+    window = RootWindow()
+    window.show()
+    sys.exit(app.exec())
