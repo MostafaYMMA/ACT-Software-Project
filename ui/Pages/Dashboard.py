@@ -1,16 +1,22 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QPushButton,
-    QTableWidget, QTableWidgetItem, QHeaderView,
+    QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 
 from ui.theme import COLOR_ACCENT, COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY, COLOR_BORDER
 
 
 class StatCard(QFrame):
+    clicked = Signal()
+
     def __init__(self, label, value, stripe_color):
         super().__init__()
-        self.setStyleSheet("background-color: #FBF3EC; border-radius: 6px;")
+        self._selected = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(84)
+        self.setStyleSheet("background-color: #ffffff; border-radius: 0px;")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -37,6 +43,41 @@ class StatCard(QFrame):
 
         layout.addLayout(inner)
         self.value_label = value_widget  # exposed so callers can update it later
+
+    def set_selected(self, selected):
+        self._selected = selected
+        self._apply_size()
+
+    def _apply_size(self):
+        parent = self.parentWidget()
+        if parent is None:
+            return
+
+        parent_width = max(1, parent.width())
+        if self._selected:
+            min_width = max(140, int(parent_width * 0.28))
+            max_width = max(min_width, int(parent_width * 0.38))
+        else:
+            min_width = max(120, int(parent_width * 0.18))
+            max_width = max(min_width, int(parent_width * 0.30))
+
+        self.setMinimumWidth(min_width)
+        self.setMaximumWidth(max_width)
+
+        if self._selected:
+            self.setStyleSheet(
+                "background-color: #FFF4E8; border: 1px solid #F0B36A; border-radius: 6px;"
+            )
+        else:
+            self.setStyleSheet("background-color: #FBF3EC; border-radius: 6px;")
+
+    def resizeEvent(self, event):
+        self._apply_size()
+        super().resizeEvent(event)
+
+    def mousePressEvent(self, event):
+        self.clicked.emit()
+        super().mousePressEvent(event)
 
     def set_value(self, value):
         self.value_label.setText(str(value))
@@ -67,17 +108,17 @@ class DashboardPage(QWidget):
         stats_row = QHBoxLayout()
         stats_row.setSpacing(12)
         stat_defs = [
-            ("total", "Total emails", COLOR_ACCENT),
-            ("read", "Read emails", "#639922"),
-            ("unread", "Unread emails", "#B4B2A9"),
-            ("approved_count", "Approved subjects", "#0F6E56"),
-            ("matching_count", "Approved + Time card/FW:FYI", "#D85A30"),
+            ("approve", "Approved Mails", "#4CAF50"),
+            ("bending", "Bending Mails", "#5F5F5F"),
+            ("reject", "Rejected Mails", "#f44336"),
         ]
         self.stat_cards = {}
         for key, label, stripe_color in stat_defs:
             card = StatCard(label, "0", stripe_color)
+            card.clicked.connect(lambda checked=False, card_key=key: self.select_stat_card(card_key))
             self.stat_cards[key] = card
             stats_row.addWidget(card)
+        self.select_stat_card("approve")
         layout.addLayout(stats_row)
 
         # Matching subjects table
@@ -101,6 +142,10 @@ class DashboardPage(QWidget):
             }}
         """)
         layout.addWidget(self.table, stretch=1)
+
+    def select_stat_card(self, selected_key):
+        for key, card in self.stat_cards.items():
+            card.set_selected(key == selected_key)
 
     def scan_inbox(self):
         # TODO: wire real Outlook scanning logic here later (will live in a
