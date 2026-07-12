@@ -187,6 +187,45 @@ def get_stale_status_counts(min_age_hours):
         conn.close()
 
 
+def get_stale_records(min_age_hours):
+    """
+    Like get_stale_status_counts, but returns the actual Pending/Rejected
+    rows (not just counts), each tagged with "status" and "age_hours".
+    Backs the Late tab's "pending/rejected for X days/weeks" list.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        now = datetime.now()
+        results = []
+        for status_label in ("Pending", "Rejected"):
+            table_name = STATUS_TABLES[status_label]
+            if conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
+            ).fetchone() is None:
+                continue
+            cursor = conn.execute(f"""
+                SELECT subject, sender, "Project Number", "Project Name", "Task Name",
+                       "Date", "Qty", received
+                FROM "{table_name}"
+            """)
+            columns = [desc[0] for desc in cursor.description]
+            for row in cursor.fetchall():
+                record = dict(zip(columns, row))
+                parsed = _parse_received(record.get("received"))
+                if parsed is None:
+                    continue
+                age_hours = (now - parsed).total_seconds() / 3600
+                if age_hours >= min_age_hours:
+                    record["status"] = status_label
+                    record["age_hours"] = age_hours
+                    results.append(record)
+
+        results.sort(key=lambda r: r["age_hours"], reverse=True)
+        return results
+    finally:
+        conn.close()
+
+
 def _create_timecards_table(conn, table_name):
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS "{table_name}" (

@@ -8,8 +8,8 @@ Layout:
   - Sidebar: hidden by default, overlays the content area when the
     mouse hovers near the hamburger icon (or the sidebar itself),
     slides away on mouse-leave after a short delay.
-  - Content area: stacked pages (Dashboard/Scan/Records/History/Calendar/
-    Settings), switched via the sidebar, with a fade transition between them.
+  - Content area: stacked pages (Dashboard/Records/History/Late/Settings),
+    switched via the sidebar, with a fade transition between them.
 """
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame
@@ -24,7 +24,7 @@ from ui.notification_settings import notification_settings
 from ui.Pages.Dashboard import DashboardPage
 from ui.Pages.History import HistoryPage
 from ui.Pages.Records import RecordsPage
-from ui.Pages.placeholder import PlaceholderPage
+from ui.Pages.Late import LatePage
 from ui.Pages.Settings import SettingsPage
 from storage_service import get_stale_status_counts
 
@@ -109,10 +109,9 @@ class MainWindow(QWidget):
         self.stack = FadeStackedWidget(content_area)
         self.pages = {
             "Dashboard": DashboardPage(),
-            "Scan": PlaceholderPage("Scan Inbox"),
             "Records": RecordsPage(),
             "History": HistoryPage(),
-            "Calendar": PlaceholderPage("Calendar"),
+            "Late": LatePage(),
             "Settings": SettingsPage(),
         }
         for page in self.pages.values():
@@ -121,16 +120,16 @@ class MainWindow(QWidget):
         # icon glyphs are plain Unicode symbols (no extra dependency needed).
         # For icons closer to a proper icon set, the "qtawesome" pip package
         # is a natural upgrade later - say the word.
-        # All non-semantic icons (Dashboard/Records/History/Calendar) are
+        # All non-semantic icons (Dashboard/Records/History) are
         # deliberately drawn from the same Geometric Shapes block so they
         # share the same visual weight - mixing that with color emoji
-        # (e.g. a calendar pictograph) reads as inconsistent in the sidebar.
+        # reads as inconsistent in the sidebar. Late reuses the banner's
+        # warning glyph since it's the same "needs attention" concept.
         nav_items = [
             ("\u25A3", "Dashboard", "Dashboard"),
-            ("\u2709", "Scan Inbox", "Scan"),
             ("\u25A4", "Records", "Records"),
             ("\u21BA", "Export History", "History"),
-            ("\u25A6", "Calendar", "Calendar"),
+            ("\u26A0", "Late", "Late"),
             ("\u2699", "Settings", "Settings"),
         ]
         self.sidebar = Sidebar(content_area, nav_items, self._on_nav_select)
@@ -260,7 +259,6 @@ class MainWindow(QWidget):
             self.notification_banner.hide()
             return
 
-        self._last_stale_counts = counts
         threshold_text = self._format_threshold(notification_settings.threshold_hours)
         message = (
             f"{total} request{'s' if total != 1 else ''} waiting over {threshold_text} "
@@ -276,7 +274,4 @@ class MainWindow(QWidget):
         return f"{int(hours)} hour{'s' if int(hours) != 1 else ''}"
 
     def _on_notification_view(self):
-        counts = getattr(self, "_last_stale_counts", {})
-        preferred = "pending" if counts.get("pending", 0) > 0 else "reject"
-        self.show_page("Dashboard")
-        self.pages["Dashboard"].select_stat_card(preferred)
+        self.show_page("Late")
