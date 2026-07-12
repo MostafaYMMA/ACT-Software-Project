@@ -8,21 +8,19 @@ Layout:
   - Sidebar: hidden by default, overlays the content area when the
     mouse hovers near the hamburger icon (or the sidebar itself),
     slides away on mouse-leave after a short delay.
-  - Content area: stacked pages (Dashboard/Scan/Records/History/Settings),
-    switched via the sidebar, with a fade transition between them.
+  - Content area: stacked pages (Dashboard/Scan/Records/History/Calendar/
+    Settings), switched via the sidebar, with a fade transition between them.
 """
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QEvent
 
-from ui.theme import (
-    COLOR_BG, COLOR_ACCENT, COLOR_ACCENT_DARK, COLOR_ACCENT_LIGHT,
-    COLOR_TEXT_PRIMARY, COLOR_TEXT_ON_ACCENT, COLOR_BORDER,
-)
+from ui.theme import COLOR_ACCENT, COLOR_ACCENT_LIGHT, COLOR_TEXT_PRIMARY, COLOR_TEXT_ON_ACCENT, COLOR_BORDER
 from ui.transition import FadeStackedWidget
 from ui.Pages.Dashboard import DashboardPage
 from ui.Pages.History import HistoryPage
 from ui.Pages.placeholder import PlaceholderPage
+from ui.Pages.Settings import SettingsPage
 
 SIDEBAR_WIDTH = 150
 TOP_BAR_HEIGHT = 56
@@ -32,12 +30,14 @@ SIDEBAR_ANIM_MS = 200
 
 class Sidebar(QFrame):
     """Solid-orange nav drawer. Positioned/animated by MainWindow, not by
-    a layout, since it needs to overlay the content area rather than push it."""
+    a layout, since it needs to overlay the content area rather than push it.
+    Colors come from the global stylesheet (see ui/theme.py #sidebar /
+    #navButton selectors) so light/dark mode recolors this live."""
 
     def __init__(self, parent, nav_items, on_select):
         super().__init__(parent)
+        self.setObjectName("sidebar")
         self.setFixedWidth(SIDEBAR_WIDTH)
-        self.setStyleSheet(f"background-color: {COLOR_ACCENT}; border: none;")
         self.on_select = on_select
         self.buttons = {}
 
@@ -45,16 +45,10 @@ class Sidebar(QFrame):
         layout.setContentsMargins(0, 24, 0, 0)
         layout.setSpacing(2)
 
-        for label, key in nav_items:
-            btn = QPushButton(label)
+        for icon, label, key in nav_items:
+            btn = QPushButton(f"{icon}   {label}")
+            btn.setObjectName("navButton")
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    text-align: left; padding: 12px 24px; border: none;
-                    color: {COLOR_TEXT_ON_ACCENT}; background: transparent; font-size: 16px;
-                }}
-                QPushButton:hover {{ background-color: {COLOR_ACCENT_DARK}; }}
-            """)
             btn.clicked.connect(lambda checked=False, k=key: self.on_select(k))
             layout.addWidget(btn)
             self.buttons[key] = btn
@@ -66,8 +60,8 @@ class MainWindow(QWidget):
     def __init__(self, user_name):
         super().__init__()
         self.user_name = user_name
+        self.setObjectName("mainWindow")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet(f"background-color: {COLOR_BG};")
 
         self._sidebar_visible = False
         self.sidebar = None  # set in _build_ui; must exist before any events can fire
@@ -101,18 +95,23 @@ class MainWindow(QWidget):
             "Dashboard": DashboardPage(),
             "Scan": PlaceholderPage("Scan Inbox"),
             "Records": PlaceholderPage("Records"),
-            "History": HistoryPage(),
-            "Settings": PlaceholderPage("Settings"),
+            "History": PlaceholderPage("Export History"),
+            "Calendar": PlaceholderPage("Calendar"),
+            "Settings": SettingsPage(),
         }
         for page in self.pages.values():
             self.stack.addWidget(page)
 
+        # icon glyphs are plain Unicode symbols (no extra dependency needed).
+        # For icons closer to a proper icon set, the "qtawesome" pip package
+        # is a natural upgrade later - say the word.
         nav_items = [
-            ("Dashboard", "Dashboard"),
-            ("Scan Inbox", "Scan"),
-            ("Records", "Records"),
-            ("Export History", "History"),
-            ("Settings", "Settings"),
+            ("\u25A3", "Dashboard", "Dashboard"),
+            ("\u2709", "Scan Inbox", "Scan"),
+            ("\u25A4", "Records", "Records"),
+            ("\u21BA", "Export History", "History"),
+            ("\U0001F5D3", "Calendar", "Calendar"),
+            ("\u2699", "Settings", "Settings"),
         ]
         self.sidebar = Sidebar(content_area, nav_items, self._on_nav_select)
         self.sidebar.installEventFilter(self)
@@ -126,8 +125,8 @@ class MainWindow(QWidget):
 
     def _build_top_bar(self):
         top_bar = QFrame()
+        top_bar.setObjectName("topBar")
         top_bar.setFixedHeight(TOP_BAR_HEIGHT)
-        top_bar.setStyleSheet("background-color: white;")
 
         top_layout = QHBoxLayout(top_bar)
         top_layout.setContentsMargins(16, 0, 16, 0)
