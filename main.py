@@ -27,7 +27,7 @@ from ui.account_page import AccountCreationPage
 from ui.select_account_page import SelectAccountPage
 from ui.splash_page import SplashPage
 from ui.app import MainWindow
-from ui.theme import GLOBAL_STYLESHEET
+from ui.theme_manager import theme_manager
 from ui.transition import FadeStackedWidget, zoom_in
 
 from filter_service import get_approved_cards
@@ -153,7 +153,15 @@ class RootWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setStyleSheet(GLOBAL_STYLESHEET)
+
+    # Apply your global stylesheet
+    app.setStyleSheet(theme_manager.stylesheet())
+
+    # Create the main window
     window = RootWindow()
-    window.show()
+
+    # Open the window maximized
+    window.showMaximized()
+
+    # Start the application
     sys.exit(app.exec())
