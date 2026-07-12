@@ -1,7 +1,8 @@
 """
-Settings page: light/dark toggle, plus the stale pending/rejected
-notification controls (enable/disable + how many hours old counts as
-"stale", both persisted via ui/notification_settings.py).
+Settings page: light/dark toggle, plus the stale-threshold controls
+(enable/disable + how many hours old counts as "late", both persisted
+via ui/notification_settings.py). That threshold drives both the
+banner in ui/app.py and the Late tab (ui/Pages/Late.py).
 """
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QComboBox, QFrame
@@ -55,11 +56,10 @@ class SettingsPage(QWidget):
         apply_live_style(divider, lambda c: f"background-color: {c['BORDER']};")
         layout.addWidget(divider)
 
-        # -- Notifications -------------------------------------------------
-        notifications_label = QLabel("Notifications")
-        apply_live_style(notifications_label, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 11px; font-weight: 700;")
-        layout.addWidget(notifications_label)
-
+        # -- Stale pending/rejected threshold -----------------------------
+        # No section header here on purpose -- this threshold isn't
+        # notification-specific anymore, it also defines what counts as
+        # "late" on the Late tab (see ui/Pages/Late.py).
         notify_row = QHBoxLayout()
         notify_row.setSpacing(10)
 
