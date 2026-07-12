@@ -126,6 +126,7 @@ def extract(email):
     subject = email.get("subject") or ""
     sender = email.get("sender") or ""
     received = str(mail_item.ReceivedTime)
+    status = email.get("status")
 
     texts = [mail_item.Body or ""]
     for att in email.get("attachments", []):
@@ -145,6 +146,7 @@ def extract(email):
             entry["subject"] = subject
             entry["sender"] = sender
             entry["received"] = received
+            entry["status"] = status
             entries.append(entry)
 
     return entries
