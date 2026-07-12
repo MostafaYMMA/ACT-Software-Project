@@ -47,6 +47,52 @@ STATUS_TABLES = {
 }
 
 
+def get_status_project_counts():
+    """Return row counts for approved, pending, and rejected records."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        counts = {}
+        for label, table_name in STATUS_TABLES.items():
+            if conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,),
+            ).fetchone() is None:
+                counts[label.lower()] = 0
+                continue
+
+            row = conn.execute(
+                f'SELECT COUNT(*) FROM "{table_name}"'
+            ).fetchone()
+            counts[label.lower()] = row[0] or 0
+
+        return {
+            "approve": counts.get("approved", 0),
+            "pending": counts.get("pending", 0),
+            "reject": counts.get("rejected", 0),
+        }
+    finally:
+        conn.close()
+
+
+def get_status_rows(status_key):
+    """Return rows for the selected status table as dictionaries."""
+    status_labels = {"approve": "Approved", "pending": "Pending", "reject": "Rejected"}
+    table_name = STATUS_TABLES.get(status_labels.get(status_key, "Approved"))
+    if table_name is None:
+        return []
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cursor = conn.execute(
+            f'SELECT subject, "Project Number", "Project Name", "Task Name", "Date", "Qty" '
+            f'FROM "{table_name}" ORDER BY "Date" ASC, subject ASC'
+        )
+        columns = [desc[0] for desc in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
 def _create_timecards_table(conn, table_name):
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS "{table_name}" (
