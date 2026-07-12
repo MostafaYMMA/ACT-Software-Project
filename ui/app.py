@@ -13,21 +13,26 @@ Layout:
 """
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame
-from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QEvent
+from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QEvent, Signal
 
 from ui.theme_manager import theme_manager
 from ui.theme_utils import apply_live_style
 from ui.nav_button import NavButton
 from ui.transition import FadeStackedWidget
+from ui.notification_banner import NotificationBanner
+from ui.notification_settings import notification_settings
 from ui.Pages.Dashboard import DashboardPage
 from ui.Pages.History import HistoryPage
+from ui.Pages.Records import RecordsPage
 from ui.Pages.placeholder import PlaceholderPage
 from ui.Pages.Settings import SettingsPage
+from storage_service import get_stale_status_counts
 
 SIDEBAR_WIDTH = 150
 TOP_BAR_HEIGHT = 56
 HOVER_HIDE_DELAY_MS = 250
 SIDEBAR_ANIM_MS = 200
+NOTIFICATION_POLL_MS = 5 * 60 * 1000  # continuous background check, every 5 minutes
 
 
 class Sidebar(QFrame):
@@ -57,6 +62,8 @@ class Sidebar(QFrame):
 
 
 class MainWindow(QWidget):
+    switch_account_requested = Signal()
+
     def __init__(self, user_name):
         super().__init__()
         self.user_name = user_name
@@ -70,6 +77,11 @@ class MainWindow(QWidget):
         self._hide_timer.timeout.connect(self._hide_sidebar)
 
         self._build_ui()
+
+        self._notify_timer = QTimer(self)
+        self._notify_timer.timeout.connect(self._check_notifications)
+        self._notify_timer.start(NOTIFICATION_POLL_MS)
+        self._check_notifications()
 
     # -----------------------------------------------------------------
     # Layout
@@ -86,6 +98,10 @@ class MainWindow(QWidget):
         apply_live_style(separator, lambda c: f"background-color: {c['BORDER']};")
         root_layout.addWidget(separator)
 
+        self.notification_banner = NotificationBanner(self)
+        self.notification_banner.view_requested.connect(self._on_notification_view)
+        root_layout.addWidget(self.notification_banner)
+
         content_area = QWidget()
         root_layout.addWidget(content_area, stretch=1)
         self._content_area = content_area
@@ -94,8 +110,8 @@ class MainWindow(QWidget):
         self.pages = {
             "Dashboard": DashboardPage(),
             "Scan": PlaceholderPage("Scan Inbox"),
-            "Records": PlaceholderPage("Records"),
-            "History": PlaceholderPage("Export History"),
+            "Records": RecordsPage(),
+            "History": HistoryPage(),
             "Calendar": PlaceholderPage("Calendar"),
             "Settings": SettingsPage(),
         }
@@ -105,17 +121,17 @@ class MainWindow(QWidget):
         # icon glyphs are plain Unicode symbols (no extra dependency needed).
         # For icons closer to a proper icon set, the "qtawesome" pip package
         # is a natural upgrade later - say the word.
-        # \uFE0E forces "text" (monochrome/flat) presentation instead of
-        # the default full-color emoji glyph some fonts use for these two
-        # in particular - without it, Calendar/Settings look visually
-        # inconsistent with the rest of the flat sidebar icons.
+        # All non-semantic icons (Dashboard/Records/History/Calendar) are
+        # deliberately drawn from the same Geometric Shapes block so they
+        # share the same visual weight - mixing that with color emoji
+        # (e.g. a calendar pictograph) reads as inconsistent in the sidebar.
         nav_items = [
             ("\u25A3", "Dashboard", "Dashboard"),
             ("\u2709", "Scan Inbox", "Scan"),
             ("\u25A4", "Records", "Records"),
             ("\u21BA", "Export History", "History"),
-            ("\U0001F5D3\uFE0E", "Calendar", "Calendar"),
-            ("\u2699\uFE0E", "Settings", "Settings"),
+            ("\u25A6", "Calendar", "Calendar"),
+            ("\u2699", "Settings", "Settings"),
         ]
         self.sidebar = Sidebar(content_area, nav_items, self._on_nav_select)
         self.sidebar.installEventFilter(self)
@@ -169,6 +185,13 @@ class MainWindow(QWidget):
         top_layout.addWidget(welcome)
 
         top_layout.addStretch()
+
+        switch_account_btn = QPushButton("⇄ Switch Account")
+        switch_account_btn.setObjectName("secondaryButton")
+        switch_account_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        switch_account_btn.clicked.connect(self.switch_account_requested.emit)
+        top_layout.addWidget(switch_account_btn)
+
         return top_bar
 
     def _initials(self):
@@ -222,3 +245,38 @@ class MainWindow(QWidget):
 
     def show_page(self, key):
         self.stack.setCurrentWidget(self.pages[key])
+
+    # -----------------------------------------------------------------
+    # Stale pending/rejected notifications
+    # -----------------------------------------------------------------
+    def _check_notifications(self):
+        if not notification_settings.enabled:
+            self.notification_banner.hide()
+            return
+
+        counts = get_stale_status_counts(notification_settings.threshold_hours)
+        total = counts.get("total", 0)
+        if total <= 0:
+            self.notification_banner.hide()
+            return
+
+        self._last_stale_counts = counts
+        threshold_text = self._format_threshold(notification_settings.threshold_hours)
+        message = (
+            f"{total} request{'s' if total != 1 else ''} waiting over {threshold_text} "
+            f"(pending: {counts.get('pending', 0)}, rejected: {counts.get('rejected', 0)})"
+        )
+        self.notification_banner.show_message(message)
+
+    @staticmethod
+    def _format_threshold(hours):
+        if hours >= 24 and hours % 24 == 0:
+            days = int(hours // 24)
+            return f"{days} day{'s' if days != 1 else ''}"
+        return f"{int(hours)} hour{'s' if int(hours) != 1 else ''}"
+
+    def _on_notification_view(self):
+        counts = getattr(self, "_last_stale_counts", {})
+        preferred = "pending" if counts.get("pending", 0) > 0 else "reject"
+        self.show_page("Dashboard")
+        self.pages["Dashboard"].select_stat_card(preferred)

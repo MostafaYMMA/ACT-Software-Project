@@ -34,6 +34,8 @@ class NavButton(QFrame):
         layout.setSpacing(10)
 
         self.icon_label = QLabel(icon)
+        self.icon_label.setFixedWidth(22)
+        self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.icon_label.setStyleSheet(f"background: transparent; font-size: {ICON_BASE_PT}pt;")
         layout.addWidget(self.icon_label)
 

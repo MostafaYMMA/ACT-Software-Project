@@ -2,11 +2,22 @@ import itertools
 import os
 import re
 import shutil
+import sys
 import tempfile
 import traceback
 import zipfile
 
 import win32com.client
+
+# Some real subjects/bodies contain characters (emoji, etc.) outside the
+# console's default codepage (cp1252 on Windows) -- without this, the
+# [DEBUG] print of such a subject raises UnicodeEncodeError, which the
+# per-item try/except in get_approved_cards() catches by skipping that
+# email entirely (silent data loss). main.py already does this same
+# reconfigure when the app is launched normally; repeated here so this
+# module is safe even when run/imported some other way.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # ----------------------------------------------------------------------
 # Optional third-party extraction libraries (each wrapped so a missing
@@ -651,6 +662,18 @@ def process_email(item, temp_dir, counters):
         counters.emails_matched_via_attachment += 1
 
     status = detect_status(subject, body)
+    if status is None:
+        # Some matched emails (e.g. forwarded invoices) carry the actual
+        # Approved/Pending/Rejected word only inside a matching
+        # attachment's own text, not in the email's own subject/body --
+        # detect_status() can't see that on its own. Without this
+        # fallback, extract() would tag every entry from that email
+        # status=None and save_cards() would silently drop all of them.
+        for att in attachment_results:
+            if att.get("keywords_found"):
+                status = detect_status("", att.get("text") or "")
+                if status:
+                    break
 
     matched_via = []
     if body_approval_match:

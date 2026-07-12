@@ -2,12 +2,15 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy,
 )
-from PySide6.QtCore import Qt, Signal, QThread, QObject
+from PySide6.QtCore import Qt, Signal, QThread, QObject, QPropertyAnimation, QEasingCurve, Property
 
 from ui.theme_manager import theme_manager
 from ui.theme_utils import apply_live_style
+from ui.loading_overlay import LoadingOverlay
 from sync_service import sync_cards
 from storage_service import get_status_project_counts, get_status_rows
+
+CARD_ANIM_MS = 220
 
 
 class StatCard(QFrame):
@@ -16,10 +19,20 @@ class StatCard(QFrame):
     def __init__(self, label, value, stripe_color):
         super().__init__()
         self._selected = False
+        # Named so the selected-state QSS below can be scoped to
+        # "QFrame#statCard" specifically -- an unscoped setStyleSheet()
+        # call on a widget with children cascades to every descendant
+        # (label_widget, value_widget, even the stripe), which is why the
+        # label/value text used to render inside its own little bordered
+        # box instead of just the card as a whole.
+        self.setObjectName("statCard")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setFixedHeight(84)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._anim_start_widths = (0, 0)
+        self._anim_end_widths = (0, 0)
+        self._size_progress = 1.0
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -54,35 +67,72 @@ class StatCard(QFrame):
 
     def set_selected(self, selected):
         self._selected = selected
-        self._apply_size()
+        self._apply_size(animate=True)
 
-    def _apply_size(self):
+    def _target_widths(self):
         parent = self.parentWidget()
-        if parent is None:
-            return
-
-        parent_width = max(1, parent.width())
+        parent_width = max(1, parent.width()) if parent else 300
         if self._selected:
             min_width = max(140, int(parent_width * 0.28))
             max_width = max(min_width, int(parent_width * 0.38))
         else:
             min_width = max(120, int(parent_width * 0.18))
             max_width = max(min_width, int(parent_width * 0.30))
+        return min_width, max_width
 
-        self.setMinimumWidth(min_width)
-        self.setMaximumWidth(max_width)
+    # -- animatable property: drives minimumWidth AND maximumWidth from a
+    # single 0..1 progress value, interpolating both from the widths
+    # captured when the animation started to the new target widths. Doing
+    # it this way (one property, one setter) guarantees both are always
+    # updated together in the same tick -- two independent
+    # QPropertyAnimations on minimumWidth/maximumWidth could drift out of
+    # lockstep for a frame and leave the widget in a min > max state,
+    # which is what caused the stray un-styled gap behind the card text.
+    def _get_size_progress(self):
+        return self._size_progress
+
+    def _set_size_progress(self, value):
+        self._size_progress = value
+        start_min, start_max = self._anim_start_widths
+        end_min, end_max = self._anim_end_widths
+        self.setMinimumWidth(int(start_min + (end_min - start_min) * value))
+        self.setMaximumWidth(int(start_max + (end_max - start_max) * value))
+
+    size_progress = Property(float, _get_size_progress, _set_size_progress)
+
+    def _apply_size(self, animate=False):
+        parent = self.parentWidget()
+        if parent is None:
+            return
+
+        min_width, max_width = self._target_widths()
+
+        if animate:
+            self._anim_start_widths = (self.minimumWidth(), self.maximumWidth())
+            self._anim_end_widths = (min_width, max_width)
+
+            anim = QPropertyAnimation(self, b"size_progress", self)
+            anim.setDuration(CARD_ANIM_MS)
+            anim.setStartValue(0.0)
+            anim.setEndValue(1.0)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+            self._size_anim = anim  # prevent garbage collection mid-animation
+        else:
+            self.setMinimumWidth(min_width)
+            self.setMaximumWidth(max_width)
 
         colors = theme_manager.colors()
         if self._selected:
             self.setStyleSheet(
-                f"background-color: {colors['ACCENT_LIGHT']}; "
-                f"border: 1px solid {colors['ACCENT']}; border-radius: 6px;"
+                f"QFrame#statCard {{ background-color: {colors['ACCENT_LIGHT']}; "
+                f"border: 1px solid {colors['ACCENT']}; border-radius: 6px; }}"
             )
         else:
-            self.setStyleSheet(f"background-color: {colors['SURFACE']}; border-radius: 6px;")
+            self.setStyleSheet(f"QFrame#statCard {{ background-color: {colors['SURFACE']}; border-radius: 6px; }}")
 
     def resizeEvent(self, event):
-        self._apply_size()
+        self._apply_size(animate=False)
         super().resizeEvent(event)
 
     def mousePressEvent(self, event):
@@ -100,6 +150,21 @@ class SyncWorker(QObject):
     def run(self):
         sync_cards(progress_callback=self.progress.emit)
         self.finished.emit()
+
+
+class RowsWorker(QObject):
+    """Fetches rows for one status off the GUI thread, so a slow query
+    (e.g. once the DB has grown) doesn't freeze the table swap - the
+    LoadingOverlay stays visible and animated for however long this
+    actually takes."""
+    finished = Signal(list)
+
+    def __init__(self, status_key):
+        super().__init__()
+        self.status_key = status_key
+
+    def run(self):
+        self.finished.emit(get_status_rows(self.status_key))
 
 
 class DashboardPage(QWidget):
@@ -147,6 +212,10 @@ class DashboardPage(QWidget):
         apply_live_style(self.table_title, lambda c: f"font-size: 13px; font-weight: 700; color: {c['TEXT_PRIMARY']};")
         layout.addWidget(self.table_title)
 
+        table_container = QWidget()
+        table_container_layout = QVBoxLayout(table_container)
+        table_container_layout.setContentsMargins(0, 0, 0, 0)
+
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(["Subject", "Project Number", "Project Name", "Task Name", "Date", "Qty"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
@@ -164,7 +233,11 @@ class DashboardPage(QWidget):
                 padding: 6px; border: none; font-weight: 700;
             }}
         """)
-        layout.addWidget(self.table, stretch=1)
+        table_container_layout.addWidget(self.table)
+        layout.addWidget(table_container, stretch=1)
+
+        self._rows_loading_overlay = LoadingOverlay(table_container, message="Loading records...")
+        table_container.resizeEvent = lambda event: self._rows_loading_overlay.reposition()
 
         self._set_empty_state()
 
@@ -173,6 +246,19 @@ class DashboardPage(QWidget):
             card.set_selected(key == selected_key)
         if hasattr(self, "table"):
             self._load_status_rows(selected_key)
+
+    def _is_rows_loading(self):
+        thread = getattr(self, "_rows_thread", None)
+        if thread is None:
+            return False
+        try:
+            return thread.isRunning()
+        except RuntimeError:
+            # The underlying C++ QThread was already deleted (deleteLater
+            # ran before this Python reference got cleared) -- treat that
+            # the same as "not loading" instead of crashing.
+            self._rows_thread = None
+            return False
 
     def _set_empty_state(self):
         for key in ("approve", "pending", "reject"):
@@ -193,14 +279,43 @@ class DashboardPage(QWidget):
             self.table_title.setText("No data yet")
             return
 
+        if self._is_rows_loading():
+            # A fetch for a previous selection is still in flight -- just
+            # remember the latest request; _on_rows_loaded kicks it off
+            # once the in-flight one finishes, so requests never overlap
+            # (mirrors scan_inbox disabling its button while it runs).
+            self._pending_status_key = status_key
+            return
+
+        self.table.setRowCount(0)
+        self._rows_loading_overlay.start("Loading records...")
+
+        self._rows_thread = QThread(self)
+        self._rows_worker = RowsWorker(status_key)
+        self._rows_worker.moveToThread(self._rows_thread)
+
+        self._rows_thread.started.connect(self._rows_worker.run)
+        self._rows_worker.finished.connect(lambda rows: self._on_rows_loaded(status_key, rows))
+        self._rows_worker.finished.connect(self._rows_thread.quit)
+        self._rows_thread.finished.connect(self._rows_thread.deleteLater)
+        self._rows_thread.finished.connect(self._clear_rows_thread_ref)
+
+        self._rows_thread.start()
+
+    def _clear_rows_thread_ref(self):
+        # Runs synchronously on the "finished" signal, before deleteLater's
+        # deferred deletion actually destroys the C++ object -- so this
+        # always beats the RuntimeError _is_rows_loading() guards against.
+        self._rows_thread = None
+
+    def _on_rows_loaded(self, status_key, rows):
         status_labels = {
             "approve": "Approved",
             "pending": "Pending",
             "reject": "Rejected",
         }
         title = status_labels.get(status_key, "Approved")
-        self.table.setRowCount(0)
-        rows = get_status_rows(status_key)
+
         self.table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             values = [
@@ -212,10 +327,18 @@ class DashboardPage(QWidget):
                 row.get("Qty") or "",
             ]
             for col_index, value in enumerate(values):
-                self.table.setItem(row_index, col_index, QTableWidgetItem(str(value)))
+                item = QTableWidgetItem(str(value))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(row_index, col_index, item)
 
+        self._rows_loading_overlay.stop()
         if hasattr(self, "table_title"):
             self.table_title.setText(f"{title} records")
+
+        pending_key = getattr(self, "_pending_status_key", None)
+        if pending_key is not None:
+            self._pending_status_key = None
+            self._load_status_rows(pending_key)
 
     def scan_inbox(self):
         self.scan_btn.setEnabled(False)
