@@ -80,12 +80,15 @@ QLabel {{
     border: none;
 }}
 
-QPushButton#navButton {{
-    text-align: left; padding: 12px 24px; border: none;
-    color: {colors['TEXT_ON_ACCENT']}; background: transparent; font-size: 16px;
+#navButton {{
+    border: none;
+    background: transparent;
 }}
-QPushButton#navButton:hover {{
+#navButton:hover {{
     background-color: {colors['ACCENT_DARK']};
+}}
+#navButton QLabel {{
+    color: {colors['TEXT_ON_ACCENT']};
 }}
 
 QLineEdit {{

@@ -4,7 +4,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal
 
-from ui.theme import COLOR_ACCENT, COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY, COLOR_BORDER
+from ui.theme_manager import theme_manager
+from ui.theme_utils import apply_live_style
 
 
 class StatCard(QFrame):
@@ -16,7 +17,7 @@ class StatCard(QFrame):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setFixedHeight(84)
-        self.setStyleSheet("background-color: #ffffff; border-radius: 0px;")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -34,15 +35,20 @@ class StatCard(QFrame):
         inner.setSpacing(2)
 
         label_widget = QLabel(label)
-        label_widget.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY}; font-size: 10px;")
+        apply_live_style(label_widget, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 10px;")
         inner.addWidget(label_widget)
 
         value_widget = QLabel(value)
-        value_widget.setStyleSheet(f"color: {COLOR_TEXT_PRIMARY}; font-size: 22px; font-weight: 700;")
+        apply_live_style(value_widget, lambda c: f"color: {c['TEXT_PRIMARY']}; font-size: 22px; font-weight: 700;")
         inner.addWidget(value_widget)
 
         layout.addLayout(inner)
         self.value_label = value_widget  # exposed so callers can update it later
+
+        # Selection styling depends on BOTH theme and selected-state, so it
+        # can't use the simple apply_live_style helper (that only accounts
+        # for theme). Re-run _apply_size on every theme change instead.
+        theme_manager.theme_changed.connect(lambda _mode: self._apply_size())
 
     def set_selected(self, selected):
         self._selected = selected
@@ -64,12 +70,14 @@ class StatCard(QFrame):
         self.setMinimumWidth(min_width)
         self.setMaximumWidth(max_width)
 
+        colors = theme_manager.colors()
         if self._selected:
             self.setStyleSheet(
-                "background-color: #FFF4E8; border: 1px solid #F0B36A; border-radius: 6px;"
+                f"background-color: {colors['ACCENT_LIGHT']}; "
+                f"border: 1px solid {colors['ACCENT']}; border-radius: 6px;"
             )
         else:
-            self.setStyleSheet("background-color: #FBF3EC; border-radius: 6px;")
+            self.setStyleSheet(f"background-color: {colors['SURFACE']}; border-radius: 6px;")
 
     def resizeEvent(self, event):
         self._apply_size()
@@ -93,7 +101,7 @@ class DashboardPage(QWidget):
         # Header row: page title + scan button
         header_row = QHBoxLayout()
         title = QLabel("Dashboard")
-        title.setStyleSheet(f"font-size: 18px; font-weight: 700; color: {COLOR_TEXT_PRIMARY};")
+        apply_live_style(title, lambda c: f"font-size: 18px; font-weight: 700; color: {c['TEXT_PRIMARY']};")
         header_row.addWidget(title)
         header_row.addStretch()
 
@@ -126,7 +134,7 @@ class DashboardPage(QWidget):
         # line, not the email body, so there's no consultant/project/period
         # data to show per row yet. That needs body-parsing logic first.
         table_title = QLabel("Matching subjects")
-        table_title.setStyleSheet(f"font-size: 13px; font-weight: 700; color: {COLOR_TEXT_PRIMARY};")
+        apply_live_style(table_title, lambda c: f"font-size: 13px; font-weight: 700; color: {c['TEXT_PRIMARY']};")
         layout.addWidget(table_title)
 
         self.table = QTableWidget(0, 1)
@@ -135,10 +143,14 @@ class DashboardPage(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setStyleSheet(f"""
-            QTableWidget {{ border: 1px solid {COLOR_BORDER}; background: white; }}
+        apply_live_style(self.table, lambda c: f"""
+            QTableWidget {{
+                border: 1px solid {c['BORDER']}; background: {c['BG']}; color: {c['TEXT_PRIMARY']};
+                gridline-color: {c['BORDER']};
+            }}
             QHeaderView::section {{
-                background-color: #FBF3EC; padding: 6px; border: none; font-weight: 700;
+                background-color: {c['SURFACE']}; color: {c['TEXT_PRIMARY']};
+                padding: 6px; border: none; font-weight: 700;
             }}
         """)
         layout.addWidget(self.table, stretch=1)
