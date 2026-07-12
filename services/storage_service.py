@@ -3,7 +3,18 @@ import csv
 import re
 from datetime import datetime
 
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Border, Side
+
 DB_PATH = "data/cards.db"
+
+_HEADER_FONT = Font(bold=True, size=13, color="000000")
+_HEADER_FILL = PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")
+_BODY_FONT = Font(color="000000")
+_THIN_BORDER = Border(
+    left=Side(style="thin"), right=Side(style="thin"),
+    top=Side(style="thin"), bottom=Side(style="thin"),
+)
 
 _DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
@@ -11,6 +22,22 @@ _PERIOD_PATTERN = re.compile(
     r"from\s+(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})",
     re.IGNORECASE
 )
+
+
+def _ensure_columns(conn, table, column_defs):
+    """
+    Adds any column in column_defs (list of "name TYPE" strings) that
+    doesn't already exist on `table`. Lets older databases created before
+    a schema change pick up new columns without losing existing rows.
+    """
+    existing = {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+    for column_def in column_defs:
+        if column_def.startswith('"'):
+            column_name = column_def[1:column_def.index('"', 1)]
+        else:
+            column_name = column_def.split()[0]
+        if column_name not in existing:
+            conn.execute(f'ALTER TABLE "{table}" ADD COLUMN {column_def}')
 
 
 def init_db():
@@ -26,6 +53,9 @@ def init_db():
             "Project Number" TEXT,
             "Project Name" TEXT,
             "Task Name" TEXT,
+            name TEXT,
+            period TEXT,
+            person_number TEXT,
             subject TEXT,
             sender TEXT,
             received TEXT,
@@ -44,11 +74,53 @@ def init_db():
             "Project Number" TEXT,
             "Project Name" TEXT,
             "Task Name" TEXT,
+            "Name" TEXT,
+            "Person Number" TEXT,
             subject TEXT,
             sender TEXT,
             received TEXT
         )
     """)
+    _ensure_columns(conn, "timecards", ["name TEXT", "period TEXT", "person_number TEXT"])
+    _ensure_columns(conn, "timecards_summary", ['"Name" TEXT', '"Person Number" TEXT'])
+
+    # invoice_lines used to be one row per (Project Number, Task Name,
+    # Period). It's now one row per raw timecard entry (day-level),
+    # identified internally via timecard_id -- an older-shape table (no
+    # timecard_id column) is renamed aside rather than dropped, so any
+    # manually-entered data isn't lost, then rebuilt fresh below.
+    existing_invoice_columns = {row[1] for row in conn.execute('PRAGMA table_info("invoice_lines")')}
+    if existing_invoice_columns and "timecard_id" not in existing_invoice_columns:
+        conn.execute("ALTER TABLE invoice_lines RENAME TO invoice_lines_period_level_backup")
+
+    # Invoicing worksheet: one row per raw timecard entry. Only the
+    # columns we can derive automatically are ever populated by sync code
+    # (see _sync_invoice_lines below) -- everything else here is filled
+    # in manually later and is never touched by a re-sync. timecard_id
+    # links back to timecards.id purely so re-syncing can tell which
+    # entries already have a row here, without touching any manual edits.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS invoice_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timecard_id INTEGER UNIQUE,
+            "Date" TEXT,
+            "Invoice Number" TEXT,
+            "Project Name" TEXT,
+            "Period" TEXT,
+            "Task Name" TEXT,
+            "Project Mgr" TEXT,
+            "PO" TEXT,
+            "SOW" TEXT,
+            "Line" TEXT,
+            "Type" TEXT,
+            "Project Number" TEXT,
+            "Consultant" TEXT,
+            "Qty" REAL,
+            "Sales Price" REAL,
+            "Total Amount" REAL GENERATED ALWAYS AS ("Qty" * "Sales Price")
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -97,6 +169,9 @@ def _to_row(entry: dict) -> tuple:
         entry.get("project_code"),
         entry.get("project_name"),
         entry.get("task"),
+        entry.get("name"),
+        entry.get("period"),
+        entry.get("person_number"),
         entry.get("subject"),
         entry.get("sender"),
         entry.get("received"),
@@ -133,9 +208,11 @@ def _rebuild_summary(conn):
             except (TypeError, ValueError):
                 pass
 
+        period = _join_distinct(r["period"] for r in group) or _parse_period(subject)
+
         merged_rows.append((
             ", ".join(days),
-            _parse_period(subject),
+            period,
             dates[0] if dates else None,
             _join_distinct(r["labor_type"] for r in group),
             _join_distinct(r["time_type"] for r in group),
@@ -143,6 +220,8 @@ def _rebuild_summary(conn):
             project_number,
             _join_distinct(r["Project Name"] for r in group),
             task_name,
+            _join_distinct(r["name"] for r in group),
+            _join_distinct(r["person_number"] for r in group),
             subject,
             sender,
             _join_distinct(r["received"] for r in group),
@@ -151,21 +230,58 @@ def _rebuild_summary(conn):
     conn.execute("DELETE FROM timecards_summary")
     conn.executemany("""
         INSERT INTO timecards_summary
-        (day, "Period", "Date", labor_type, time_type, "Qty", "Project Number", "Project Name", "Task Name", subject, sender, received)
+        (day, "Period", "Date", labor_type, time_type, "Qty", "Project Number", "Project Name", "Task Name", "Name", "Person Number", subject, sender, received)
         VALUES
-        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, merged_rows)
+
+
+def _sync_invoice_lines(conn):
+    """
+    Adds one invoice_lines row per raw timecards entry, for any entry not
+    already linked (via timecard_id). Only ever INSERTs new rows (OR
+    IGNORE on the timecard_id UNIQUE key) -- an existing row, including
+    any Invoice Number/Sales Price/etc you've filled in by hand, is never
+    touched or overwritten by a later sync. "Date" is the day the email
+    itself was received (not the timecard's work-day).
+    """
+    rows = conn.execute("""
+        SELECT id, "Project Name", period, "Task Name", "Project Number", "Qty", received
+        FROM timecards
+    """).fetchall()
+
+    prepared = [
+        (timecard_id, received[:10] if received else None, project_name, period, task_name, project_number, qty)
+        for timecard_id, project_name, period, task_name, project_number, qty, received in rows
+    ]
+
+    conn.executemany("""
+        INSERT OR IGNORE INTO invoice_lines
+        (timecard_id, "Date", "Project Name", "Period", "Task Name", "Project Number", "Qty")
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, prepared)
 
 
 def save_card(entry: dict):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
-        INSERT OR REPLACE INTO timecards
-        (day, "Date", labor_type, time_type, "Qty", "Project Number", "Project Name", "Task Name", subject, sender, received)
+        INSERT INTO timecards
+        (day, "Date", labor_type, time_type, "Qty", "Project Number", "Project Name", "Task Name", name, period, person_number, subject, sender, received)
         VALUES
-        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(day, "Project Number", "Task Name", subject, sender) DO UPDATE SET
+            "Date" = excluded."Date",
+            labor_type = excluded.labor_type,
+            time_type = excluded.time_type,
+            "Qty" = excluded."Qty",
+            "Project Name" = excluded."Project Name",
+            name = excluded.name,
+            period = excluded.period,
+            person_number = excluded.person_number,
+            received = excluded.received
     """, _to_row(entry))
     _rebuild_summary(conn)
+    _sync_invoice_lines(conn)
     conn.commit()
     conn.close()
 
@@ -175,12 +291,23 @@ def save_cards(entries: list):
 
     conn = sqlite3.connect(DB_PATH)
     conn.executemany("""
-        INSERT OR REPLACE INTO timecards
-        (day, "Date", labor_type, time_type, "Qty", "Project Number", "Project Name", "Task Name", subject, sender, received)
+        INSERT INTO timecards
+        (day, "Date", labor_type, time_type, "Qty", "Project Number", "Project Name", "Task Name", name, period, person_number, subject, sender, received)
         VALUES
-        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(day, "Project Number", "Task Name", subject, sender) DO UPDATE SET
+            "Date" = excluded."Date",
+            labor_type = excluded.labor_type,
+            time_type = excluded.time_type,
+            "Qty" = excluded."Qty",
+            "Project Name" = excluded."Project Name",
+            name = excluded.name,
+            period = excluded.period,
+            person_number = excluded.person_number,
+            received = excluded.received
     """, prepared)
     _rebuild_summary(conn)
+    _sync_invoice_lines(conn)
     conn.commit()
     conn.close()
 
@@ -196,6 +323,50 @@ def export_to_csv(output_path="output.csv"):
         writer.writerows(cursor.fetchall())
 
     conn.close()
+    print(f"Exported to {output_path}")
+
+
+def export_invoice_lines_to_excel(output_path="invoice_lines.xlsx"):
+    """
+    Exports invoice_lines to a real formatted .xlsx (not .csv - a CSV is
+    plain text and can't hold fonts/colors/borders at all). Header row is
+    bold, larger, light-blue-filled; every cell in the table gets a thin
+    border and black text.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.execute("""
+        SELECT "Date", "Invoice Number", "Project Name", "Period", "Task Name", "Project Mgr",
+               "PO", "SOW", "Line", "Type", "Project Number", "Consultant", "Qty", "Sales Price",
+               "Total Amount"
+        FROM invoice_lines
+        ORDER BY "Date" ASC
+    """)
+    columns = [desc[0] for desc in cursor.description]
+    rows = cursor.fetchall()
+    conn.close()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Invoice Lines"
+
+    ws.append(columns)
+    for cell in ws[1]:
+        cell.font = _HEADER_FONT
+        cell.fill = _HEADER_FILL
+        cell.border = _THIN_BORDER
+
+    for i, row in enumerate(rows):
+        ws.append(row)
+        for cell in ws[ws.max_row]:
+            cell.font = _BODY_FONT
+            cell.border = _THIN_BORDER
+        if i < len(rows) - 1:
+            ws.append([])  # blank separator row between records - no styling
+
+    for i, column_name in enumerate(columns, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = max(len(column_name) + 2, 12)
+
+    wb.save(output_path)
     print(f"Exported to {output_path}")
 
 
