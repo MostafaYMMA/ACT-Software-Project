@@ -15,7 +15,9 @@ Layout:
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QEvent
 
-from ui.theme import COLOR_ACCENT, COLOR_ACCENT_LIGHT, COLOR_TEXT_PRIMARY, COLOR_TEXT_ON_ACCENT, COLOR_BORDER
+from ui.theme_manager import theme_manager
+from ui.theme_utils import apply_live_style
+from ui.nav_button import NavButton
 from ui.transition import FadeStackedWidget
 from ui.Pages.Dashboard import DashboardPage
 from ui.Pages.History import HistoryPage
@@ -46,10 +48,8 @@ class Sidebar(QFrame):
         layout.setSpacing(2)
 
         for icon, label, key in nav_items:
-            btn = QPushButton(f"{icon}   {label}")
-            btn.setObjectName("navButton")
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.clicked.connect(lambda checked=False, k=key: self.on_select(k))
+            btn = NavButton(icon, label)
+            btn.clicked.connect(lambda k=key: self.on_select(k))
             layout.addWidget(btn)
             self.buttons[key] = btn
 
@@ -83,7 +83,7 @@ class MainWindow(QWidget):
 
         separator = QFrame()
         separator.setFixedHeight(1)
-        separator.setStyleSheet(f"background-color: {COLOR_BORDER};")
+        apply_live_style(separator, lambda c: f"background-color: {c['BORDER']};")
         root_layout.addWidget(separator)
 
         content_area = QWidget()
@@ -105,13 +105,17 @@ class MainWindow(QWidget):
         # icon glyphs are plain Unicode symbols (no extra dependency needed).
         # For icons closer to a proper icon set, the "qtawesome" pip package
         # is a natural upgrade later - say the word.
+        # \uFE0E forces "text" (monochrome/flat) presentation instead of
+        # the default full-color emoji glyph some fonts use for these two
+        # in particular - without it, Calendar/Settings look visually
+        # inconsistent with the rest of the flat sidebar icons.
         nav_items = [
             ("\u25A3", "Dashboard", "Dashboard"),
             ("\u2709", "Scan Inbox", "Scan"),
             ("\u25A4", "Records", "Records"),
             ("\u21BA", "Export History", "History"),
-            ("\U0001F5D3", "Calendar", "Calendar"),
-            ("\u2699", "Settings", "Settings"),
+            ("\U0001F5D3\uFE0E", "Calendar", "Calendar"),
+            ("\u2699\uFE0E", "Settings", "Settings"),
         ]
         self.sidebar = Sidebar(content_area, nav_items, self._on_nav_select)
         self.sidebar.installEventFilter(self)
@@ -135,11 +139,11 @@ class MainWindow(QWidget):
         self.hamburger_btn = QPushButton("\u2630")
         self.hamburger_btn.setFixedSize(36, 36)
         self.hamburger_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.hamburger_btn.setStyleSheet(f"""
+        apply_live_style(self.hamburger_btn, lambda c: f"""
             QPushButton {{
-                border: none; font-size: 18px; color: {COLOR_ACCENT}; background: transparent;
+                border: none; font-size: 18px; color: {c['ACCENT']}; background: transparent;
             }}
-            QPushButton:hover {{ background-color: {COLOR_ACCENT_LIGHT}; border-radius: 6px; }}
+            QPushButton:hover {{ background-color: {c['ACCENT_LIGHT']}; border-radius: 6px; }}
         """)
         self.hamburger_btn.installEventFilter(self)
         top_layout.addWidget(self.hamburger_btn)
@@ -148,15 +152,20 @@ class MainWindow(QWidget):
         avatar = QLabel(self._initials())
         avatar.setFixedSize(32, 32)
         avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        avatar.setStyleSheet(
-            f"background-color: {COLOR_ACCENT}; color: {COLOR_TEXT_ON_ACCENT}; "
+        # ACCENT and TEXT_ON_ACCENT happen to be identical in both palettes
+        # right now, but going through theme_manager keeps this correct
+        # even if that ever changes.
+        apply_live_style(avatar, lambda c: (
+            f"background-color: {c['ACCENT']}; color: {c['TEXT_ON_ACCENT']}; "
             f"border-radius: 16px; font-weight: 700; font-size: 12px;"
-        )
+        ))
         top_layout.addWidget(avatar)
         top_layout.addSpacing(10)
 
         welcome = QLabel(f"Welcome, {self.user_name}")
-        welcome.setStyleSheet(f"font-size: 15px; font-weight: 700; color: {COLOR_TEXT_PRIMARY};")
+        apply_live_style(welcome, lambda c: (
+            f"font-size: 15px; font-weight: 700; color: {c['TEXT_PRIMARY']};"
+        ))
         top_layout.addWidget(welcome)
 
         top_layout.addStretch()
