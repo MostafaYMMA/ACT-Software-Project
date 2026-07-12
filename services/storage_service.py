@@ -7,7 +7,8 @@ from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Border, Side
 
-DB_PATH = "data/cards.db"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.path.join(BASE_DIR, "data", "cards.db")
 
 _HEADER_FONT = Font(bold=True, size=13, color="000000")
 _HEADER_FILL = PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")
@@ -246,6 +247,7 @@ def _migrate_drop_subject_from_unique(conn, table_name):
 
 
 def init_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
 
     # timecards used to hold approved entries only (that was the only
@@ -334,6 +336,11 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+
+# Ensure the database exists and all expected tables are present as soon as
+# the storage layer is imported.
+init_db()
 
 
 def _record_export(conn, name: str):
