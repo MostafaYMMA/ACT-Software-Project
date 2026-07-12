@@ -1,8 +1,7 @@
 """
 Entry point. Flow on every launch:
-  1. Boot splash ("OSMO", big white text on orange) - shown immediately,
-     while sync_cards runs in the background.
-  2. Once sync finishes:
+  1. Boot splash ("OSMO", big white text on orange) - shown immediately.
+  2. The app then routes to account creation or account selection:
        - No accounts yet on this machine -> AccountCreationPage
        - One or more accounts exist      -> SelectAccountPage
   3. Once an account is created OR selected -> brief "Welcome back"
@@ -20,7 +19,7 @@ if hasattr(sys.stdout, "reconfigure"):
 sys.path.append(os.path.join(os.path.dirname(__file__), "services"))
 
 from PySide6.QtWidgets import QApplication, QMainWindow
-from PySide6.QtCore import QThread, QObject, Signal, QTimer
+from PySide6.QtCore import QTimer
 
 from ui.athu import accounts_exist
 from ui.account_page import AccountCreationPage
@@ -30,56 +29,7 @@ from ui.app import MainWindow
 from ui.theme_manager import theme_manager
 from ui.transition import FadeStackedWidget, zoom_in
 
-from filter_service import get_approved_cards
-from extractor_service import extract
-from storage_service import init_db, save_cards, export_to_csv, export_invoice_lines_to_excel
-
 WELCOME_SPLASH_DURATION_MS = 900
-
-
-def sync_cards(progress_callback=None):
-    """Pull approved timecard emails, extract entries, and persist them.
-    progress_callback, if given, is called with short status strings so
-    the boot splash can show what's currently happening."""
-    def report(msg):
-        print(msg)
-        if progress_callback:
-            progress_callback(msg)
-
-    init_db()
-
-    report("Checking inbox for approved timecards...")
-    emails = get_approved_cards(limit=100)
-    report(f"Approved emails found: {len(emails)}")
-
-    all_entries = []
-    for email in emails:
-        entries = extract(email)
-        print(f"  - '{email['subject']}' -> {len(entries)} entries")
-        all_entries.extend(entries)
-
-    report(f"Total entries extracted: {len(all_entries)}")
-
-    if all_entries:
-        report("Saving entries...")
-        save_cards(all_entries)
-        print("Saved entries to database.")
-        export_to_csv()
-        export_invoice_lines_to_excel()
-    else:
-        print("Nothing to save.")
-
-
-class SyncWorker(QObject):
-    """Runs sync_cards() on a background thread so the boot splash's
-    spinner can keep animating and its message can update while it runs,
-    instead of the whole app freezing until it's done."""
-    progress = Signal(str)
-    finished = Signal()
-
-    def run(self):
-        sync_cards(progress_callback=self.progress.emit)
-        self.finished.emit()
 
 
 class RootWindow(QMainWindow):
@@ -110,19 +60,7 @@ class RootWindow(QMainWindow):
 
         self.stack.setCurrentWidget(self.boot_splash)
         self.boot_splash.start_loading("Loading...")
-        self._start_background_sync()
-
-    def _start_background_sync(self):
-        self._sync_thread = QThread(self)
-        self._sync_worker = SyncWorker()
-        self._sync_worker.moveToThread(self._sync_thread)
-
-        self._sync_thread.started.connect(self._sync_worker.run)
-        self._sync_worker.progress.connect(self.boot_splash.set_message)
-        self._sync_worker.finished.connect(self._on_sync_finished)
-        self._sync_worker.finished.connect(self._sync_thread.quit)
-
-        self._sync_thread.start()
+        self._on_sync_finished()
 
     def _on_sync_finished(self):
         self.boot_splash.stop_loading()
