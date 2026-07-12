@@ -1,17 +1,18 @@
 """
 Select-account page - shown on every launch after the very first account
-exists. Tapping a tile logs straight in (no password re-entry, per the
-agreed "switch users" style flow). An "Add account" tile is always shown
-alongside existing accounts so more can be created later.
+exists. Selecting an existing account requires re-entering that account's
+password before login continues.
 """
 
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QGridLayout, QLabel, QFrame
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QGridLayout, QLabel, QFrame, QLineEdit, QPushButton,
+)
 from PySide6.QtCore import Qt, Signal
 
-from ui.athu import list_accounts
+from ui.athu import list_accounts, verify_password
 from ui.theme import (
     COLOR_BG, COLOR_ACCENT, COLOR_ACCENT_LIGHT, COLOR_TEXT_PRIMARY,
-    COLOR_TEXT_ON_ACCENT, COLOR_BORDER,
+    COLOR_TEXT_ON_ACCENT, COLOR_BORDER, COLOR_ERROR,
 )
 
 TILE_SIZE = (140, 160)
@@ -81,6 +82,7 @@ class SelectAccountPage(QWidget):
         self._outer.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._outer.setSpacing(20)
         self._grid_container = None
+        self._pending_username = None
         self._build_ui()
 
     def _build_ui(self):
@@ -88,6 +90,39 @@ class SelectAccountPage(QWidget):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet(f"font-size: 20px; font-weight: 700; color: {COLOR_TEXT_PRIMARY};")
         self._outer.addWidget(title)
+
+        self._password_card = QFrame()
+        self._password_card.setFixedWidth(320)
+        password_layout = QVBoxLayout(self._password_card)
+        password_layout.setSpacing(8)
+
+        self._password_label = QLabel("Enter password to continue")
+        self._password_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._password_label.setStyleSheet(f"color: {COLOR_TEXT_PRIMARY}; font-size: 13px;")
+        password_layout.addWidget(self._password_label)
+
+        self._password_input = QLineEdit()
+        self._password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._password_input.setPlaceholderText("Password")
+        self._password_input.returnPressed.connect(self._confirm_password)
+        password_layout.addWidget(self._password_input)
+
+        self._password_error = QLabel("")
+        self._password_error.setStyleSheet(f"color: {COLOR_ERROR}; font-size: 11px;")
+        self._password_error.setWordWrap(True)
+        self._password_error.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        password_layout.addWidget(self._password_error)
+
+        self._confirm_password_btn = QPushButton("Continue")
+        self._confirm_password_btn.clicked.connect(self._confirm_password)
+        password_layout.addWidget(self._confirm_password_btn)
+
+        self._cancel_password_btn = QPushButton("Back")
+        self._cancel_password_btn.clicked.connect(self._cancel_password)
+        password_layout.addWidget(self._cancel_password_btn)
+
+        self._password_card.hide()
+        self._outer.addWidget(self._password_card)
         # Grid is intentionally NOT built here - showEvent() builds it fresh
         # every time this page is shown, so it's never stale or duplicated.
 
@@ -103,7 +138,7 @@ class SelectAccountPage(QWidget):
         accounts = list_accounts()
         for i, account in enumerate(accounts):
             tile = AccountTile(account.username)
-            tile.clicked.connect(self.account_selected.emit)
+            tile.clicked.connect(self._on_tile_clicked)
             grid.addWidget(tile, i // COLUMNS, i % COLUMNS)
 
         add_tile = AccountTile("", is_add_tile=True)
@@ -112,8 +147,49 @@ class SelectAccountPage(QWidget):
 
         self._outer.addWidget(self._grid_container, alignment=Qt.AlignmentFlag.AlignCenter)
 
+    def _on_tile_clicked(self, username):
+        # Every tile click - even for an account the user just used a
+        # moment ago - must re-prove the password before continuing.
+        self._pending_username = username
+        self._password_label.setText(f"Enter password for {username}")
+        self._password_input.clear()
+        self._password_error.setText("")
+        self._password_card.show()
+        self._password_input.setFocus()
+
+        if self._grid_container is not None:
+            self._grid_container.hide()
+
+    def _confirm_password(self):
+        if not self._pending_username:
+            return
+
+        password = self._password_input.text()
+        if verify_password(self._pending_username, password):
+            username = self._pending_username
+            self._reset_password_state()
+            self.account_selected.emit(username)
+        else:
+            self._password_error.setText("Incorrect password. Try again.")
+            self._password_input.clear()
+            self._password_input.setFocus()
+
+    def _cancel_password(self):
+        self._reset_password_state()
+        if self._grid_container is not None:
+            self._grid_container.show()
+
+    def _reset_password_state(self):
+        self._pending_username = None
+        self._password_input.clear()
+        self._password_error.setText("")
+        self._password_card.hide()
+
     def showEvent(self, event):
         # Refresh the tile list every time this page is shown, so a
         # freshly-added account actually appears without restarting the app.
+        # Also make sure no stale password prompt carries over from a
+        # previous visit to this page.
+        self._reset_password_state()
         self._rebuild_grid()
         super().showEvent(event)

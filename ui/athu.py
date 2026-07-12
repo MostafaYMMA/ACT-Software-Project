@@ -69,6 +69,17 @@ def save_account(username, password):
     _write_accounts(accounts)
 
 
+def verify_password(username, password):
+    """Return True when the provided password matches the stored hash."""
+    for account in list_accounts():
+        if account.username.lower() != username.lower():
+            continue
+        salt, expected_hash = account.salt, account.password_hash
+        _, actual_hash = _hash_password(password, salt=salt)
+        return actual_hash == expected_hash
+    return False
+
+
 def _write_accounts(accounts):
     os.makedirs(CONFIG_DIR, exist_ok=True)
     with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
