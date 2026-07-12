@@ -20,6 +20,7 @@ from ui.theme_utils import apply_live_style
 from ui.nav_button import NavButton
 from ui.transition import FadeStackedWidget
 from ui.Pages.Dashboard import DashboardPage
+from ui.Pages.History import HistoryPage
 from ui.Pages.placeholder import PlaceholderPage
 from ui.Pages.Settings import SettingsPage
 

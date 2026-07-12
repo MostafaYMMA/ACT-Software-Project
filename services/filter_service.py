@@ -71,7 +71,7 @@ except ImportError:
 
 # --- Strict approval/timecard logic -- used ONLY for BODY matching
 #     (and for informational subject reporting). DO NOT MODIFY. ---
-approved_pattern = re.compile(r"\bapproved\b", re.IGNORECASE)
+approved_pattern = re.compile(r"\b(?:approved|pending|rejected)\b", re.IGNORECASE)
 
 subject_pattern = re.compile(
     r"\btime(?:\s+|-)?card\b|^\s*FW:\s*FYI:?",
@@ -198,6 +198,20 @@ def matches_any_keyword(word_list):
     attachment's word list. Used for ATTACHMENT matching.
     """
     return len(find_keywords_in_words(word_list)) > 0
+
+
+def detect_status(subject, body):
+    """
+    Which of approved/pending/rejected this email actually is. Subject
+    is checked first (e.g. "...Were Approved"), body is the fallback.
+    Returns "Approved" / "Pending" / "Rejected", or None if neither
+    text contains one of those words.
+    """
+    for source in (subject, body):
+        match = approved_pattern.search(source or "")
+        if match:
+            return match.group(0).capitalize()
+    return None
 
 
 # ----------------------------------------------------------------------
@@ -636,6 +650,8 @@ def process_email(item, temp_dir, counters):
     if attachment_keyword_match:
         counters.emails_matched_via_attachment += 1
 
+    status = detect_status(subject, body)
+
     matched_via = []
     if body_approval_match:
         matched_via.append("BODY (strict logic)")
@@ -701,6 +717,7 @@ def process_email(item, temp_dir, counters):
         "subject": subject,
         "sender": sender,
         "received": received,
+        "status": status,                    # "Approved" / "Pending" / "Rejected" / None
         "matched_via": matched_via,          # e.g. ["BODY (strict logic)"]
         "matched_via_body": body_approval_match,
         "matched_via_attachment": attachment_keyword_match,

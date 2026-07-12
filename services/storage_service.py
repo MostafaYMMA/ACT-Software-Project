@@ -1,5 +1,6 @@
 import sqlite3
 import csv
+import os
 import re
 from datetime import datetime
 
@@ -40,10 +41,16 @@ def _ensure_columns(conn, table, column_defs):
             conn.execute(f'ALTER TABLE "{table}" ADD COLUMN {column_def}')
 
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS timecards (
+STATUS_TABLES = {
+    "Approved": "timecards_approved",
+    "Pending": "timecards_pending",
+    "Rejected": "timecards_rejected",
+}
+
+
+def _create_timecards_table(conn, table_name):
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS "{table_name}" (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             day TEXT,
             "Date" TEXT,
@@ -59,9 +66,67 @@ def init_db():
             subject TEXT,
             sender TEXT,
             received TEXT,
-            UNIQUE(day, "Project Number", "Task Name", subject, sender)
+            UNIQUE(day, "Project Number", "Task Name", sender)
         )
     """)
+
+
+_OLD_UNIQUE_CLAUSE = 'UNIQUE(day, "Project Number", "Task Name", subject, sender)'
+
+
+def _migrate_drop_subject_from_unique(conn, table_name):
+    """
+    subject used to be part of what makes a timecard row "the same" as
+    another. It no longer is (see UNIQUE clause above) -- an existing
+    table built under the old constraint is rebuilt here rather than
+    left behind, so duplicates by the new (day, Project Number, Task
+    Name, sender) key actually get collapsed instead of silently
+    persisting side-by-side under the stale schema.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
+    ).fetchone()
+    if row is None or _OLD_UNIQUE_CLAUSE not in row[0]:
+        return  # table doesn't exist yet, or already on the new schema
+
+    backup_name = f"{table_name}_subject_key_backup"
+    conn.execute(f'ALTER TABLE "{table_name}" RENAME TO "{backup_name}"')
+    _create_timecards_table(conn, table_name)
+    # INSERT OR REPLACE, ordered oldest id first, so when two old rows now
+    # collide on the new key, the one from the more recent sync (higher id)
+    # is the one that survives.
+    conn.execute(f"""
+        INSERT OR REPLACE INTO "{table_name}"
+        (id, day, "Date", labor_type, time_type, "Qty", "Project Number", "Project Name",
+         "Task Name", name, period, person_number, subject, sender, received)
+        SELECT id, day, "Date", labor_type, time_type, "Qty", "Project Number", "Project Name",
+               "Task Name", name, period, person_number, subject, sender, received
+        FROM "{backup_name}"
+        ORDER BY id ASC
+    """)
+    conn.execute(f'DROP TABLE "{backup_name}"')
+
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+
+    # timecards used to hold approved entries only (that was the only
+    # status ever fetched). It's renamed aside into timecards_approved so
+    # existing data isn't lost, now that pending/rejected get their own
+    # tables too.
+    existing_tables = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    if "timecards" in existing_tables and "timecards_approved" not in existing_tables:
+        conn.execute("ALTER TABLE timecards RENAME TO timecards_approved")
+
+    for table_name in STATUS_TABLES.values():
+        _migrate_drop_subject_from_unique(conn, table_name)
+        _create_timecards_table(conn, table_name)
+        _ensure_columns(conn, table_name, ["name TEXT", "period TEXT", "person_number TEXT"])
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS timecards_summary (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,7 +146,6 @@ def init_db():
             received TEXT
         )
     """)
-    _ensure_columns(conn, "timecards", ["name TEXT", "period TEXT", "person_number TEXT"])
     _ensure_columns(conn, "timecards_summary", ['"Name" TEXT', '"Person Number" TEXT'])
 
     # invoice_lines used to be one row per (Project Number, Task Name,
@@ -93,12 +157,13 @@ def init_db():
     if existing_invoice_columns and "timecard_id" not in existing_invoice_columns:
         conn.execute("ALTER TABLE invoice_lines RENAME TO invoice_lines_period_level_backup")
 
-    # Invoicing worksheet: one row per raw timecard entry. Only the
-    # columns we can derive automatically are ever populated by sync code
-    # (see _sync_invoice_lines below) -- everything else here is filled
-    # in manually later and is never touched by a re-sync. timecard_id
-    # links back to timecards.id purely so re-syncing can tell which
-    # entries already have a row here, without touching any manual edits.
+    # Invoicing worksheet: one row per raw timecard entry (approved only).
+    # Only the columns we can derive automatically are ever populated by
+    # sync code (see _sync_invoice_lines below) -- everything else here is
+    # filled in manually later and is never touched by a re-sync.
+    # timecard_id links back to timecards_approved.id purely so
+    # re-syncing can tell which entries already have a row here, without
+    # touching any manual edits.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS invoice_lines (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,8 +186,33 @@ def init_db():
         )
     """)
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS export_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            date TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
+
+
+def _record_export(conn, name: str):
+    conn.execute(
+        "INSERT INTO export_history (name, date) VALUES (?, ?)",
+        (name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+
+
+def get_export_history():
+    """Returns (name, date) rows for every export ever done, newest first."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT name, date FROM export_history ORDER BY date DESC, id DESC"
+    ).fetchall()
+    conn.close()
+    return rows
 
 
 def _parse_date(day_text: str) -> str:
@@ -181,10 +271,11 @@ def _to_row(entry: dict) -> tuple:
 def _rebuild_summary(conn):
     """
     Recomputes timecards_summary from scratch out of the raw per-day
-    timecards table. Merge key: sender + subject + Project Number + Task Name
-    (i.e. same weekly timecard email, same project, same task).
+    timecards_approved table (summary/export stays approved-only). Merge
+    key: sender + subject + Project Number + Task Name (i.e. same weekly
+    timecard email, same project, same task).
     """
-    cursor = conn.execute('SELECT * FROM timecards')
+    cursor = conn.execute('SELECT * FROM timecards_approved')
     columns = [desc[0] for desc in cursor.description]
     rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
 
@@ -238,16 +329,17 @@ def _rebuild_summary(conn):
 
 def _sync_invoice_lines(conn):
     """
-    Adds one invoice_lines row per raw timecards entry, for any entry not
-    already linked (via timecard_id). Only ever INSERTs new rows (OR
-    IGNORE on the timecard_id UNIQUE key) -- an existing row, including
-    any Invoice Number/Sales Price/etc you've filled in by hand, is never
-    touched or overwritten by a later sync. "Date" is the day the email
-    itself was received (not the timecard's work-day).
+    Adds one invoice_lines row per raw timecards_approved entry (invoicing
+    is approved-only), for any entry not already linked (via timecard_id).
+    Only ever INSERTs new rows (OR IGNORE on the timecard_id UNIQUE key)
+    -- an existing row, including any Invoice Number/Sales Price/etc
+    you've filled in by hand, is never touched or overwritten by a later
+    sync. "Date" is the day the email itself was received (not the
+    timecard's work-day).
     """
     rows = conn.execute("""
         SELECT id, "Project Name", period, "Task Name", "Project Number", "Qty", received
-        FROM timecards
+        FROM timecards_approved
     """).fetchall()
 
     prepared = [
@@ -262,14 +354,13 @@ def _sync_invoice_lines(conn):
     """, prepared)
 
 
-def save_card(entry: dict):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        INSERT INTO timecards
+def _upsert_timecards(conn, table_name, rows):
+    conn.executemany(f"""
+        INSERT INTO "{table_name}"
         (day, "Date", labor_type, time_type, "Qty", "Project Number", "Project Name", "Task Name", name, period, person_number, subject, sender, received)
         VALUES
         (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(day, "Project Number", "Task Name", subject, sender) DO UPDATE SET
+        ON CONFLICT(day, "Project Number", "Task Name", sender) DO UPDATE SET
             "Date" = excluded."Date",
             labor_type = excluded.labor_type,
             time_type = excluded.time_type,
@@ -278,34 +369,42 @@ def save_card(entry: dict):
             name = excluded.name,
             period = excluded.period,
             person_number = excluded.person_number,
+            subject = excluded.subject,
             received = excluded.received
-    """, _to_row(entry))
-    _rebuild_summary(conn)
-    _sync_invoice_lines(conn)
-    conn.commit()
-    conn.close()
+    """, rows)
+
+
+def _group_by_status_table(entries):
+    """
+    Buckets entries by their target table (timecards_approved/_pending/
+    _rejected) based on entry["status"]. Entries with a missing or
+    unrecognized status are dropped -- there's no table to route them to.
+    """
+    grouped = {}
+    skipped = 0
+    for entry in entries:
+        table_name = STATUS_TABLES.get(entry.get("status"))
+        if table_name is None:
+            skipped += 1
+            continue
+        grouped.setdefault(table_name, []).append(_to_row(entry))
+    if skipped:
+        print(f"Skipped {skipped} entr{'y' if skipped == 1 else 'ies'} with unrecognized/missing status.")
+    return grouped
+
+
+def save_card(entry: dict):
+    save_cards([entry])
 
 
 def save_cards(entries: list):
-    prepared = [_to_row(entry) for entry in entries]
+    grouped = _group_by_status_table(entries)
+    if not grouped:
+        return
 
     conn = sqlite3.connect(DB_PATH)
-    conn.executemany("""
-        INSERT INTO timecards
-        (day, "Date", labor_type, time_type, "Qty", "Project Number", "Project Name", "Task Name", name, period, person_number, subject, sender, received)
-        VALUES
-        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(day, "Project Number", "Task Name", subject, sender) DO UPDATE SET
-            "Date" = excluded."Date",
-            labor_type = excluded.labor_type,
-            time_type = excluded.time_type,
-            "Qty" = excluded."Qty",
-            "Project Name" = excluded."Project Name",
-            name = excluded.name,
-            period = excluded.period,
-            person_number = excluded.person_number,
-            received = excluded.received
-    """, prepared)
+    for table_name, rows in grouped.items():
+        _upsert_timecards(conn, table_name, rows)
     _rebuild_summary(conn)
     _sync_invoice_lines(conn)
     conn.commit()
@@ -343,7 +442,6 @@ def export_invoice_lines_to_excel(output_path="invoice_lines.xlsx"):
     """)
     columns = [desc[0] for desc in cursor.description]
     rows = cursor.fetchall()
-    conn.close()
 
     wb = Workbook()
     ws = wb.active
@@ -367,6 +465,9 @@ def export_invoice_lines_to_excel(output_path="invoice_lines.xlsx"):
         ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = max(len(column_name) + 2, 12)
 
     wb.save(output_path)
+    _record_export(conn, os.path.basename(output_path))
+    conn.commit()
+    conn.close()
     print(f"Exported to {output_path}")
 
 
