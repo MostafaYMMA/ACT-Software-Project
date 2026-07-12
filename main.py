@@ -28,6 +28,7 @@ from ui.splash_page import SplashPage
 from ui.app import MainWindow
 from ui.theme_manager import theme_manager
 from ui.transition import FadeStackedWidget, zoom_in
+from storage_service import init_db
 
 WELCOME_SPLASH_DURATION_MS = 900
 
@@ -35,6 +36,13 @@ WELCOME_SPLASH_DURATION_MS = 900
 class RootWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        # Must happen before ANY page gets built (Dashboard/History/Records
+        # /the notification banner all query the DB directly) -- previously
+        # this only ran inside sync_cards(), i.e. after the user clicked
+        # "Scan Inbox", so a fresh/deleted database file crashed the app on
+        # launch the moment a page queried a table that didn't exist yet.
+        init_db()
+
         self.setWindowTitle("Timecard app")
         self.resize(1050, 650)
 
