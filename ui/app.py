@@ -23,7 +23,7 @@ from ui.transition import FadeStackedWidget
 from ui.Pages.Dashboard import DashboardPage
 from ui.Pages.placeholder import PlaceholderPage
 
-SIDEBAR_WIDTH = 220
+SIDEBAR_WIDTH = 150
 TOP_BAR_HEIGHT = 56
 HOVER_HIDE_DELAY_MS = 250
 SIDEBAR_ANIM_MS = 200
@@ -50,7 +50,7 @@ class Sidebar(QFrame):
             btn.setStyleSheet(f"""
                 QPushButton {{
                     text-align: left; padding: 12px 24px; border: none;
-                    color: {COLOR_TEXT_ON_ACCENT}; background: transparent; font-size: 13px;
+                    color: {COLOR_TEXT_ON_ACCENT}; background: transparent; font-size: 16px;
                 }}
                 QPushButton:hover {{ background-color: {COLOR_ACCENT_DARK}; }}
             """)
