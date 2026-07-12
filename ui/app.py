@@ -21,6 +21,7 @@ from ui.theme import (
 )
 from ui.transition import FadeStackedWidget
 from ui.Pages.Dashboard import DashboardPage
+from ui.Pages.History import HistoryPage
 from ui.Pages.placeholder import PlaceholderPage
 
 SIDEBAR_WIDTH = 150
@@ -100,7 +101,7 @@ class MainWindow(QWidget):
             "Dashboard": DashboardPage(),
             "Scan": PlaceholderPage("Scan Inbox"),
             "Records": PlaceholderPage("Records"),
-            "History": PlaceholderPage("Export History"),
+            "History": HistoryPage(),
             "Settings": PlaceholderPage("Settings"),
         }
         for page in self.pages.values():
