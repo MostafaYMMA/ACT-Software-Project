@@ -94,6 +94,98 @@ def get_status_rows(status_key):
         conn.close()
 
 
+def search_records(query=""):
+    """
+    Searches subject/sender/Project Number/Project Name/Task Name/name/
+    person_number across all three status tables. An empty query returns
+    everything. Each result dict is tagged with "status" (Approved/
+    Pending/Rejected) so callers can show where a match currently stands.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        results = []
+        term = query.strip()
+        like = f"%{term}%"
+        for status_label, table_name in STATUS_TABLES.items():
+            if conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
+            ).fetchone() is None:
+                continue
+
+            if term:
+                cursor = conn.execute(f"""
+                    SELECT subject, sender, "Project Number", "Project Name", "Task Name",
+                           "Date", "Qty", name, person_number
+                    FROM "{table_name}"
+                    WHERE subject LIKE ? OR sender LIKE ? OR "Project Number" LIKE ?
+                       OR "Project Name" LIKE ? OR "Task Name" LIKE ? OR name LIKE ?
+                       OR person_number LIKE ?
+                """, (like, like, like, like, like, like, like))
+            else:
+                cursor = conn.execute(f"""
+                    SELECT subject, sender, "Project Number", "Project Name", "Task Name",
+                           "Date", "Qty", name, person_number
+                    FROM "{table_name}"
+                """)
+
+            columns = [desc[0] for desc in cursor.description]
+            for row in cursor.fetchall():
+                record = dict(zip(columns, row))
+                record["status"] = status_label
+                results.append(record)
+
+        results.sort(key=lambda r: r.get("Date") or "", reverse=True)
+        return results
+    finally:
+        conn.close()
+
+
+def _parse_received(value):
+    """Best-effort parse of the "received" column back into a naive
+    datetime, tolerant of the various formats it may have been stored in
+    (see _to_row -- it comes straight from Outlook's item.ReceivedTime)."""
+    if not value:
+        return None
+    text = str(value)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            parsed = datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+def get_stale_status_counts(min_age_hours):
+    """
+    Counts Pending/Rejected rows whose "received" timestamp is at least
+    min_age_hours in the past. Backs the Settings-configurable "N
+    requests pending/rejected for X time" notification banner.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        now = datetime.now()
+        counts = {"pending": 0, "rejected": 0}
+        for status_label in ("Pending", "Rejected"):
+            table_name = STATUS_TABLES[status_label]
+            if conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
+            ).fetchone() is None:
+                continue
+            for (received,) in conn.execute(f'SELECT received FROM "{table_name}"'):
+                parsed = _parse_received(received)
+                if parsed is None:
+                    continue
+                age_hours = (now - parsed).total_seconds() / 3600
+                if age_hours >= min_age_hours:
+                    counts[status_label.lower()] += 1
+        counts["total"] = counts["pending"] + counts["rejected"]
+        return counts
+    finally:
+        conn.close()
+
+
 def _create_timecards_table(conn, table_name):
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS "{table_name}" (
@@ -400,7 +492,37 @@ def _sync_invoice_lines(conn):
     """, prepared)
 
 
+def _dedupe_latest_per_key(rows):
+    """
+    Collapses rows sharing the same (day, Project Number, Task Name,
+    sender) key -- the table's UNIQUE constraint -- down to the one with
+    the latest "received" timestamp.
+
+    Without this, a batch handed to executemany() can contain the same
+    logical entry twice (e.g. a stale duplicate/resend alongside the
+    real one): ON CONFLICT DO UPDATE applies rows in list order, so
+    whichever one is LAST in the list wins. Since emails are scanned
+    newest-received-first (see filter_service.get_approved_cards), an
+    OLDER duplicate ends up later in the batch and silently overwrites a
+    NEWER entry's data -- which is exactly backwards.
+    """
+    best = {}
+    for row in rows:
+        key = (row[0], row[5], row[7], row[12])  # day, Project Number, Task Name, sender
+        received = row[13]
+        existing = best.get(key)
+        if existing is None:
+            best[key] = row
+            continue
+        new_parsed = _parse_received(received)
+        existing_parsed = _parse_received(existing[13])
+        if new_parsed and (existing_parsed is None or new_parsed > existing_parsed):
+            best[key] = row
+    return list(best.values())
+
+
 def _upsert_timecards(conn, table_name, rows):
+    rows = _dedupe_latest_per_key(rows)
     conn.executemany(f"""
         INSERT INTO "{table_name}"
         (day, "Date", labor_type, time_type, "Qty", "Project Number", "Project Name", "Task Name", name, period, person_number, subject, sender, received)

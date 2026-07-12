@@ -9,27 +9,46 @@ Two ways to use it:
     over itself while that work runs.
   - Spinner: just the spinning icon by itself, e.g. embedded directly
     in the splash screen without needing a full overlay.
+
+Both recolor live with the app's light/dark theme via theme_manager.
 """
 
-from PySide6.QtWidgets import QWidget, QVBoxLayout
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QPainter, QPen, QColor
 
-from ui.theme import COLOR_ACCENT, COLOR_TEXT_PRIMARY
-from PySide6.QtWidgets import QLabel
+from ui.theme_manager import theme_manager
+from ui.theme_utils import apply_live_style
+
+
+def _rgba(hex_color, alpha):
+    hex_color = hex_color.lstrip("#")
+    r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+    return f"rgba({r}, {g}, {b}, {alpha})"
 
 
 class Spinner(QWidget):
-    """A rotating arc. Call start()/stop() to animate it."""
+    """A rotating arc. Call start()/stop() to animate it.
 
-    def __init__(self, parent=None, size=32, color=COLOR_ACCENT, thickness=3):
+    color: fixed override (e.g. the splash screen always wants white,
+    regardless of theme, since it sits on a solid-orange background).
+    Leave it unset to track the current theme's accent color live."""
+
+    def __init__(self, parent=None, size=32, thickness=3, color=None):
         super().__init__(parent)
         self.setFixedSize(size, size)
         self._angle = 0
-        self._color = QColor(color)
         self._thickness = thickness
+        self._fixed_color = color
+        self._color = QColor(color if color else theme_manager.colors()["ACCENT"])
+        if color is None:
+            theme_manager.theme_changed.connect(self._on_theme_changed)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
+
+    def _on_theme_changed(self, _mode):
+        self._color = QColor(theme_manager.colors()["ACCENT"])
+        self.update()
 
     def start(self):
         self._timer.start(16)  # ~60fps
@@ -58,21 +77,20 @@ class LoadingOverlay(QWidget):
     stop() to hide it. The parent is responsible for calling
     reposition() on resize so the overlay keeps covering it fully."""
 
-    def __init__(self, parent, message="Loading...",
-                 spinner_color=COLOR_ACCENT, bg="rgba(255, 255, 255, 215)"):
+    def __init__(self, parent, message="Loading..."):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet(f"background-color: {bg};")
+        apply_live_style(self, lambda c: f"background-color: {_rgba(c['BG'], 215)};")
 
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.setSpacing(10)
 
-        self.spinner = Spinner(self, size=34, color=spinner_color)
+        self.spinner = Spinner(self, size=34)
         layout.addWidget(self.spinner, alignment=Qt.AlignmentFlag.AlignHCenter)
 
         self.message_label = QLabel(message)
-        self.message_label.setStyleSheet(f"color: {COLOR_TEXT_PRIMARY}; font-size: 12px;")
+        apply_live_style(self.message_label, lambda c: f"color: {c['TEXT_PRIMARY']}; font-size: 12px;")
         self.message_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.message_label)
 

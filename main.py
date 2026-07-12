@@ -58,6 +58,8 @@ class RootWindow(QMainWindow):
         self.select_page.add_account_requested.connect(self._show_account_creation)
         self.stack.addWidget(self.select_page)
 
+        self._current_main_widget = None
+
         self.stack.setCurrentWidget(self.boot_splash)
         self.boot_splash.start_loading("Loading...")
         self._on_sync_finished()
@@ -84,9 +86,18 @@ class RootWindow(QMainWindow):
 
     def _enter_main_app(self, username):
         main_widget = MainWindow(username)
+        main_widget.switch_account_requested.connect(self._on_switch_account_requested)
         self.stack.addWidget(main_widget)
         self.stack.setCurrentWidget(main_widget)  # fade (from FadeStackedWidget)
         zoom_in(main_widget)  # layered on top, specifically for "arriving" into the account
+        self._current_main_widget = main_widget
+
+    def _on_switch_account_requested(self):
+        self.stack.setCurrentWidget(self.select_page)
+        if self._current_main_widget is not None:
+            self.stack.removeWidget(self._current_main_widget)
+            self._current_main_widget.deleteLater()
+            self._current_main_widget = None
 
 
 if __name__ == "__main__":

@@ -17,18 +17,30 @@ day_header_pattern = re.compile(r"(?P<day>[A-Za-z]+,\s*\d{1,2}\s+[A-Za-z]+)")
 # parsed as a second, duplicate pass over the same days.
 _summary_cutoff_pattern = re.compile(r"Calculated Time by Project", re.IGNORECASE)
 
-_hours_pattern = re.compile(r"([\d.]+)\s*Hours", re.IGNORECASE)
+
+# Two layouts both appear in the wild: plain-body/PDF text puts the
+# number first ("8.00 Hours"), but some forwarded Time Card emails
+# reverse it ("Hours: 8.00"). Group 1 covers the first, group 2 the
+# second -- _parse_block below takes whichever one matched.
+_hours_pattern = re.compile(r"([\d.]+)\s*Hours\b|\bHours:\s*([\d.]+)", re.IGNORECASE)
 _project_pattern = re.compile(r"(\d{5,})\s*-\s*(.+?)\s*Task\b", re.IGNORECASE | re.DOTALL)
-_task_pattern = re.compile(r"Task\s+(.+)", re.IGNORECASE | re.DOTALL)
+
+# Non-greedy, stopping at the first blank line (or end of block): some
+# templates put a "________________________________" divider right
+# after the task name, still inside the same day's block -- a greedy
+# capture would swallow that divider into the task name too.
+_task_pattern = re.compile(r"Task\s+(.+?)(?=\r?\n\s*\r?\n|\Z)", re.IGNORECASE | re.DOTALL)
 
 # Plain-text email bodies keep "Contractor Labor - <labor> - <time type>"
 # together on one line, ahead of the hours (e.g. "Contractor Labor - ORCL
-# AE - Straight Time" ... "8.00 Hours"). PDF-extracted timecards split
-# them apart -- only "Contractor Labor - <labor>" appears before the
-# hours, and "<time type>" shows up on its own line straight after.
+# AE - Straight Time" ... "8.00 Hours", or the reversed "Hours: 8.00").
+# PDF-extracted timecards split them apart -- only "Contractor Labor -
+# <labor>" appears before the hours, and "<time type>" shows up on its
+# own line straight after (handled by the _labor_only_pattern fallback
+# below instead).
 _labor_time_same_line_pattern = re.compile(
     r"Contractor Labor\s*-\s*(?P<labor_type>\w+(?:\s+\w+)*?)\s*-\s*(?P<time_type>\w+(?:\s+\w+)*?)"
-    r"\s*[\d.]+\s*Hours",
+    r"\s*(?:[\d.]+\s*Hours\b|Hours:\s*[\d.]+)",
     re.IGNORECASE
 )
 _labor_only_pattern = re.compile(r"Contractor Labor\s*-\s*([^\r\n]+)", re.IGNORECASE)
@@ -106,7 +118,7 @@ def _parse_block(day, block):
         "day": day,
         "labor_type": labor_type,
         "time_type": time_type,
-        "hours": hours_match.group(1).strip(),
+        "hours": (hours_match.group(1) or hours_match.group(2)).strip(),
         "project_code": project_match.group(1).strip(),
         "project_name": project_name,
         "task": task_match.group(1).strip(),

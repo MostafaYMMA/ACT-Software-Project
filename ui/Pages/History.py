@@ -1,9 +1,9 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QTableWidget, QTableWidgetItem, QHeaderView,
 )
+from PySide6.QtCore import Qt
 
-
-from ui.theme import COLOR_TEXT_PRIMARY, COLOR_BORDER
+from ui.theme_utils import apply_live_style
 from storage_service import get_export_history
 
 
@@ -17,8 +17,7 @@ class HistoryPage(QWidget):
         layout.setSpacing(14)
 
         title = QLabel("Export History")
-
-        title.setStyleSheet(f"font-size: 18px; font-weight: 700; color: {COLOR_TEXT_PRIMARY};")
+        apply_live_style(title, lambda c: f"font-size: 18px; font-weight: 700; color: {c['TEXT_PRIMARY']};")
         layout.addWidget(title)
 
         self.table = QTableWidget(0, 2)
@@ -27,11 +26,15 @@ class HistoryPage(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-
-        self.table.setStyleSheet(f"""
-            QTableWidget {{ border: 1px solid {COLOR_BORDER}; background: white; }}
+        apply_live_style(self.table, lambda c: f"""
+            QTableWidget {{
+                border: 1px solid {c['BORDER']}; background: {c['BG']}; color: {c['TEXT_PRIMARY']};
+                gridline-color: {c['BORDER']};
+            }}
+            QTableWidget::item {{ color: {c['TEXT_PRIMARY']}; }}
             QHeaderView::section {{
-                background-color: #FBF3EC; padding: 6px; border: none; font-weight: 700;
+                background-color: {c['SURFACE']}; color: {c['TEXT_PRIMARY']};
+                padding: 6px; border: none; font-weight: 700;
             }}
         """)
         layout.addWidget(self.table, stretch=1)
@@ -42,8 +45,10 @@ class HistoryPage(QWidget):
         rows = get_export_history()
         self.table.setRowCount(len(rows))
         for row_index, (name, date) in enumerate(rows):
-            self.table.setItem(row_index, 0, QTableWidgetItem(name))
-            self.table.setItem(row_index, 1, QTableWidgetItem(date))
+            for col_index, value in enumerate((name, date)):
+                item = QTableWidgetItem(value)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(row_index, col_index, item)
 
     def showEvent(self, event):
         self.refresh()
