@@ -194,6 +194,31 @@ def init_db():
         )
     """)
 
+    # Backup of pending/rejected rows superseded by a later Approved copy
+    # of the same entry (see _supersede_with_approved) -- kept around so
+    # nothing is silently lost, purely for manual inspection/recovery.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS deleted_timecards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_table TEXT,
+            day TEXT,
+            "Date" TEXT,
+            labor_type TEXT,
+            time_type TEXT,
+            "Qty" TEXT,
+            "Project Number" TEXT,
+            "Project Name" TEXT,
+            "Task Name" TEXT,
+            name TEXT,
+            period TEXT,
+            person_number TEXT,
+            subject TEXT,
+            sender TEXT,
+            received TEXT,
+            deleted_at TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -374,6 +399,48 @@ def _upsert_timecards(conn, table_name, rows):
     """, rows)
 
 
+_SUPERSEDABLE_TABLES = ("timecards_pending", "timecards_rejected")
+
+
+def _supersede_with_approved(conn, approved_rows):
+    """
+    Approved is a terminal status for a given line item -- if an entry
+    that just arrived as Approved matches (same day/Project Number/Task
+    Name/sender AND same Qty/labor_type/time_type) a row already sitting
+    in timecards_pending or timecards_rejected, that row is now stale.
+    It's archived into deleted_timecards (so nothing is silently lost)
+    and removed from its source table.
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for row in approved_rows:
+        (day, _date, labor_type, time_type, qty, project_number, _project_name,
+         task_name, *_rest) = row
+        match_params = (day, project_number, task_name, row[12], qty, labor_type, time_type)
+        for source_table in _SUPERSEDABLE_TABLES:
+            matched = conn.execute(f"""
+                SELECT day, "Date", labor_type, time_type, "Qty", "Project Number",
+                       "Project Name", "Task Name", name, period, person_number,
+                       subject, sender, received
+                FROM "{source_table}"
+                WHERE day = ? AND "Project Number" = ? AND "Task Name" = ? AND sender = ?
+                  AND "Qty" = ? AND labor_type = ? AND time_type = ?
+            """, match_params).fetchall()
+            if not matched:
+                continue
+            conn.executemany(f"""
+                INSERT INTO deleted_timecards
+                (source_table, day, "Date", labor_type, time_type, "Qty", "Project Number",
+                 "Project Name", "Task Name", name, period, person_number, subject, sender,
+                 received, deleted_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [(source_table, *m, now) for m in matched])
+            conn.execute(f"""
+                DELETE FROM "{source_table}"
+                WHERE day = ? AND "Project Number" = ? AND "Task Name" = ? AND sender = ?
+                  AND "Qty" = ? AND labor_type = ? AND time_type = ?
+            """, match_params)
+
+
 def _group_by_status_table(entries):
     """
     Buckets entries by their target table (timecards_approved/_pending/
@@ -403,6 +470,9 @@ def save_cards(entries: list):
         return
 
     conn = sqlite3.connect(DB_PATH)
+    approved_rows = grouped.get(STATUS_TABLES["Approved"])
+    if approved_rows:
+        _supersede_with_approved(conn, approved_rows)
     for table_name, rows in grouped.items():
         _upsert_timecards(conn, table_name, rows)
     _rebuild_summary(conn)

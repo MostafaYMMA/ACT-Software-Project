@@ -95,7 +95,7 @@ class MainWindow(QWidget):
             "Dashboard": DashboardPage(),
             "Scan": PlaceholderPage("Scan Inbox"),
             "Records": PlaceholderPage("Records"),
-            "History": PlaceholderPage("Export History"),
+            "History": HistoryPage(),
             "Calendar": PlaceholderPage("Calendar"),
             "Settings": SettingsPage(),
         }
