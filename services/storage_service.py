@@ -1,5 +1,6 @@
 import sqlite3
 import csv
+import os
 import re
 from datetime import datetime
 
@@ -185,8 +186,33 @@ def init_db():
         )
     """)
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS export_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            date TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
+
+
+def _record_export(conn, name: str):
+    conn.execute(
+        "INSERT INTO export_history (name, date) VALUES (?, ?)",
+        (name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+
+
+def get_export_history():
+    """Returns (name, date) rows for every export ever done, newest first."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT name, date FROM export_history ORDER BY date DESC, id DESC"
+    ).fetchall()
+    conn.close()
+    return rows
 
 
 def _parse_date(day_text: str) -> str:
@@ -416,7 +442,6 @@ def export_invoice_lines_to_excel(output_path="invoice_lines.xlsx"):
     """)
     columns = [desc[0] for desc in cursor.description]
     rows = cursor.fetchall()
-    conn.close()
 
     wb = Workbook()
     ws = wb.active
@@ -440,6 +465,9 @@ def export_invoice_lines_to_excel(output_path="invoice_lines.xlsx"):
         ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = max(len(column_name) + 2, 12)
 
     wb.save(output_path)
+    _record_export(conn, os.path.basename(output_path))
+    conn.commit()
+    conn.close()
     print(f"Exported to {output_path}")
 
 

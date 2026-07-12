@@ -18,6 +18,7 @@ from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint,
 from ui.theme import COLOR_ACCENT, COLOR_ACCENT_LIGHT, COLOR_TEXT_PRIMARY, COLOR_TEXT_ON_ACCENT, COLOR_BORDER
 from ui.transition import FadeStackedWidget
 from ui.Pages.Dashboard import DashboardPage
+from ui.Pages.History import HistoryPage
 from ui.Pages.placeholder import PlaceholderPage
 from ui.Pages.Settings import SettingsPage
 
