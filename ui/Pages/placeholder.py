@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
 
-from ui.theme import COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY
+from ui.theme_utils import apply_live_style
 
 
 class PlaceholderPage(QWidget):
@@ -14,11 +14,11 @@ class PlaceholderPage(QWidget):
         layout.setContentsMargins(28, 20, 28, 20)
 
         title_label = QLabel(title)
-        title_label.setStyleSheet(f"font-size: 18px; font-weight: 700; color: {COLOR_TEXT_PRIMARY};")
+        apply_live_style(title_label, lambda c: f"font-size: 18px; font-weight: 700; color: {c['TEXT_PRIMARY']};")
         layout.addWidget(title_label)
 
         subtitle = QLabel("This page is not built yet.")
-        subtitle.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY}; font-size: 12px;")
+        apply_live_style(subtitle, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 12px;")
         layout.addWidget(subtitle)
 
         layout.addStretch()
