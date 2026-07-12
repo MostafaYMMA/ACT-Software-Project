@@ -49,7 +49,7 @@ def sync_cards(progress_callback=None):
     init_db()
 
     report("Checking inbox for approved timecards...")
-    emails = get_approved_cards(limit=20)
+    emails = get_approved_cards(limit=100)
     report(f"Approved emails found: {len(emails)}")
 
     all_entries = []
