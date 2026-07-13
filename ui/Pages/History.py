@@ -249,8 +249,6 @@ class HistoryPage(QWidget):
         self.table.setRowCount(len(rows))
         for row_index, (name, date_str) in enumerate(rows):
             for col_index, value in enumerate((name, date_str)):
-        for row_index, (name, date_str) in enumerate(rows):
-            for col_index, value in enumerate((name, date_str)):
                 item = QTableWidgetItem(value)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(row_index, col_index, item)

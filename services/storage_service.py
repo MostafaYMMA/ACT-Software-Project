@@ -441,14 +441,6 @@ def _received_date_only(received: str) -> str:
     invoice_lines' "Date" already works in _sync_invoice_lines below).
     """
     if not received:
-    Truncates the raw "received" timestamp (item.ReceivedTime, e.g.
-    '2026-07-03 09:14:22') down to just the date part, 'YYYY-MM-DD'.
-    Used as the "Date" column instead of the timecard's own work-day -
-    the record should be dated by when the email arrived, not by which
-    day of the timecard it happens to describe (matches how
-    invoice_lines' "Date" already works in _sync_invoice_lines below).
-    """
-    if not received:
         return None
     return str(received)[:10]
 
