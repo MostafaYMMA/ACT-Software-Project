@@ -25,7 +25,7 @@ Look:
 import os
 
 from PySide6.QtWidgets import QWidget, QLabel, QGraphicsOpacityEffect
-from PySide6.QtCore import Qt, QPoint, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup
+from PySide6.QtCore import Qt, QPoint, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup, QTimer
 from PySide6.QtGui import QPixmap
 
 from ui.theme_manager import theme_manager
@@ -35,9 +35,9 @@ from ui.loading_overlay import Spinner
 _ASSETS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
 _LOGO_PATH = os.path.join(_ASSETS_DIR, "logo.png")
 
-LOGO_TARGET_WIDTH = 260  # big, but not full-width-large
+LOGO_TARGET_WIDTH = 460  # bigger
 ANIM_DURATION_MS = 1800  # medium: ~1.5-2s
-REST_X_FRACTION = 0.62  # resting center-x as a fraction of window width (right of center)
+REST_X_FRACTION = 0.5  # resting center-x as a fraction of window width (dead center)
 REST_Y_FRACTION = 0.42  # resting center-y (leaves room for spinner/message below)
 
 
@@ -66,6 +66,7 @@ class BootLogoSplash(QWidget):
         self.message_label.hide()
 
         self._anim_group = None
+        self._slide_anim = None
         self._played_once = False
 
     @staticmethod
@@ -101,7 +102,14 @@ class BootLogoSplash(QWidget):
         self.message_label.setGeometry(0, below_y + self.spinner.height() + 10, self.width(), 20)
 
     def resizeEvent(self, event):
-        if self._anim_group is None or self._anim_group.state() != QPropertyAnimation.State.Running:
+        if self._slide_anim is not None and self._slide_anim.state() == QPropertyAnimation.State.Running:
+            # Window size changed mid-animation (e.g. the window maximizing
+            # right after boot, a moment after the entrance already
+            # started) - retarget the in-flight animation to the new
+            # correct resting spot instead of leaving it aimed at the old,
+            # smaller window's center.
+            self._slide_anim.setEndValue(self._end_pos())
+        else:
             self.logo_label.move(self._end_pos())
         self._reposition_static_widgets()
         super().resizeEvent(event)
@@ -112,7 +120,13 @@ class BootLogoSplash(QWidget):
     def showEvent(self, event):
         if not self._played_once:
             self._played_once = True
-            self._play_entrance()
+            # A zero-delay timer runs after any already-queued events (e.g.
+            # the window's maximize resize, if one is pending) - this makes
+            # it much more likely _play_entrance() computes its end
+            # position from the window's real final size on the first
+            # try, rather than relying solely on the resizeEvent retarget
+            # safety net above.
+            QTimer.singleShot(0, self._play_entrance)
         super().showEvent(event)
 
     def _play_entrance(self):
@@ -125,6 +139,7 @@ class BootLogoSplash(QWidget):
         slide.setStartValue(self._start_pos())
         slide.setEndValue(self._end_pos())
         slide.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._slide_anim = slide
 
         fade = QPropertyAnimation(self._opacity_effect, b"opacity", self)
         fade.setDuration(ANIM_DURATION_MS)

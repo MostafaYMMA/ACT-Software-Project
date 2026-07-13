@@ -1,6 +1,6 @@
 """
 Entry point. Flow on every launch:
-  1. Boot splash ("OSMO", big white text on orange) - shown immediately.
+  1. Boot splash (animated ACT logo) - shown immediately.
   2. The app then routes to account creation or account selection:
        - No accounts yet on this machine -> AccountCreationPage
        - One or more accounts exist      -> SelectAccountPage
@@ -10,6 +10,7 @@ Entry point. Flow on every launch:
 This file is the only "traffic cop" - it doesn't contain any account
 logic (that's ui/athu.py) or any page layout (that's the rest of ui/).
 """
+from PySide6.QtCore import QTimer
 import sys
 import os
 
@@ -25,6 +26,7 @@ from ui.athu import accounts_exist
 from ui.account_page import AccountCreationPage
 from ui.select_account_page import SelectAccountPage
 from ui.splash_page import SplashPage
+from ui.boot_logo_splash import BootLogoSplash
 from ui.app import MainWindow
 from ui.theme_manager import theme_manager
 from ui.transition import FadeStackedWidget, zoom_in
@@ -50,7 +52,7 @@ class RootWindow(QMainWindow):
         self.setCentralWidget(self.stack)
 
         # Boot splash - shown first, every launch, no exceptions.
-        self.boot_splash = SplashPage(title="OSMO", title_font_size=64)
+        self.boot_splash = BootLogoSplash()
         self.stack.addWidget(self.boot_splash)
 
         # Welcome splash - shown right after an account is picked/created.
@@ -70,7 +72,7 @@ class RootWindow(QMainWindow):
 
         self.stack.setCurrentWidget(self.boot_splash)
         self.boot_splash.start_loading("Loading...")
-        self._on_sync_finished()
+        QTimer.singleShot(2000, self._on_sync_finished)
 
     def _on_sync_finished(self):
         self.boot_splash.stop_loading()
