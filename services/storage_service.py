@@ -49,8 +49,14 @@ STATUS_TABLES = {
 }
 
 
-def get_status_project_counts():
-    """Return row counts for approved, pending, and rejected records."""
+def get_status_project_counts(start_date=None, end_date=None):
+    """
+    Return row counts for approved, pending, and rejected records. When
+    start_date/end_date are given, only rows whose "received" timestamp
+    falls within [start_date, end_date] are counted (see date_utils for
+    building these from a UI period choice) -- mirrors get_status_rows so
+    the Dashboard's stat cards and table always agree on the same window.
+    """
     conn = sqlite3.connect(DB_PATH)
     try:
         counts = {}
@@ -62,10 +68,14 @@ def get_status_project_counts():
                 counts[label.lower()] = 0
                 continue
 
-            row = conn.execute(
-                f'SELECT COUNT(*) FROM "{table_name}"'
-            ).fetchone()
-            counts[label.lower()] = row[0] or 0
+            if start_date is None and end_date is None:
+                row = conn.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()
+                counts[label.lower()] = row[0] or 0
+            else:
+                received_values = conn.execute(f'SELECT received FROM "{table_name}"').fetchall()
+                counts[label.lower()] = sum(
+                    1 for (received,) in received_values if _received_in_range(received, start_date, end_date)
+                )
 
         return {
             "approve": counts.get("approved", 0),
@@ -76,8 +86,12 @@ def get_status_project_counts():
         conn.close()
 
 
-def get_status_rows(status_key):
-    """Return rows for the selected status table as dictionaries."""
+def get_status_rows(status_key, start_date=None, end_date=None):
+    """
+    Return rows for the selected status table as dictionaries. When
+    start_date/end_date are given, only rows whose "received" timestamp
+    falls within [start_date, end_date] are returned.
+    """
     status_labels = {"approve": "Approved", "pending": "Pending", "reject": "Rejected"}
     table_name = STATUS_TABLES.get(status_labels.get(status_key, "Approved"))
     if table_name is None:
@@ -86,11 +100,14 @@ def get_status_rows(status_key):
     conn = sqlite3.connect(DB_PATH)
     try:
         cursor = conn.execute(
-            f'SELECT subject, "Project Number", "Project Name", "Task Name", "Date", "Qty" '
+            f'SELECT subject, "Project Number", "Project Name", "Task Name", "Date", "Qty", received '
             f'FROM "{table_name}" ORDER BY "Date" ASC, subject ASC'
         )
         columns = [desc[0] for desc in cursor.description]
-        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        if start_date is not None or end_date is not None:
+            rows = [row for row in rows if _received_in_range(row.get("received"), start_date, end_date)]
+        return rows
     finally:
         conn.close()
 
@@ -156,6 +173,21 @@ def _parse_received(value):
         except ValueError:
             return None
     return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+def _received_in_range(received_value, start_date, end_date):
+    """True if the stored "received" text falls within [start_date,
+    end_date] (either bound may be None for unbounded). A row whose
+    "received" can't be parsed is excluded once a range is in effect --
+    there's no timestamp to judge it by."""
+    parsed = _parse_received(received_value)
+    if parsed is None:
+        return False
+    if start_date is not None and parsed < start_date:
+        return False
+    if end_date is not None and parsed > end_date:
+        return False
+    return True
 
 
 def get_stale_status_counts(min_age_hours):
@@ -399,18 +431,26 @@ def get_export_history():
     return rows
 
 
-def _parse_date(day_text: str) -> str:
+def _received_date_only(received: str) -> str:
     """
-    Converts 'Monday, 29 Jun' -> '2026-06-29' (ISO format, sortable).
-    Assumes the current year since the email doesn't include one.
+    Truncates the raw "received" timestamp (item.ReceivedTime, e.g.
+    '2026-07-03 09:14:22') down to just the date part, 'YYYY-MM-DD'.
+    Used as the "Date" column instead of the timecard's own work-day -
+    the record should be dated by when the email arrived, not by which
+    day of the timecard it happens to describe (matches how
+    invoice_lines' "Date" already works in _sync_invoice_lines below).
     """
-    try:
-        cleaned = day_text.split(",")[1].strip()   # "29 Jun"
-        parsed = datetime.strptime(cleaned, "%d %b")
-        parsed = parsed.replace(year=datetime.now().year)
-        return parsed.strftime("%Y-%m-%d")
-    except Exception:
+    if not received:
+    Truncates the raw "received" timestamp (item.ReceivedTime, e.g.
+    '2026-07-03 09:14:22') down to just the date part, 'YYYY-MM-DD'.
+    Used as the "Date" column instead of the timecard's own work-day -
+    the record should be dated by when the email arrived, not by which
+    day of the timecard it happens to describe (matches how
+    invoice_lines' "Date" already works in _sync_invoice_lines below).
+    """
+    if not received:
         return None
+    return str(received)[:10]
 
 
 def _parse_period(subject: str) -> str:
@@ -436,7 +476,7 @@ def _join_distinct(values) -> str:
 def _to_row(entry: dict) -> tuple:
     return (
         entry.get("day"),
-        _parse_date(entry.get("day", "")),
+        _received_date_only(entry.get("received")),
         entry.get("labor_type"),
         entry.get("time_type"),
         entry.get("hours"),
@@ -637,6 +677,36 @@ def export_to_csv(output_path="output.csv"):
 
     conn.close()
     print(f"Exported to {output_path}")
+
+
+def export_summary_csv_range(start_date: str, end_date: str, output_path: str) -> int:
+    """
+    Exports timecards_summary rows whose "Date" (the email's received
+    date, since _to_row now sets it that way) falls within
+    [start_date, end_date] (inclusive, both 'YYYY-MM-DD' strings) to a
+    CSV at output_path. Backs the History page's "Export last month" /
+    "Export date range" buttons. Records the export in export_history,
+    same as the other export functions, so it shows up in that log too.
+    Returns the number of rows written.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.execute(
+        'SELECT * FROM timecards_summary WHERE "Date" >= ? AND "Date" <= ? ORDER BY "Date" ASC',
+        (start_date, end_date),
+    )
+    columns = [desc[0] for desc in cursor.description]
+    rows = cursor.fetchall()
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(columns)
+        writer.writerows(rows)
+
+    _record_export(conn, os.path.basename(output_path))
+    conn.commit()
+    conn.close()
+    print(f"Exported {len(rows)} row(s) ({start_date} to {end_date}) to {output_path}")
+    return len(rows)
 
 
 def export_invoice_lines_to_excel(output_path="invoice_lines.xlsx"):
