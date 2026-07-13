@@ -130,6 +130,39 @@ QPushButton#secondaryButton {{
 QPushButton#secondaryButton:hover {{
     background-color: {colors['ACCENT_LIGHT']};
 }}
+
+QPushButton#periodToggle {{
+    background-color: {colors['SURFACE']};
+    color: {colors['TEXT_PRIMARY']};
+    border: 1px solid {colors['BORDER']};
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 12px;
+}}
+QPushButton#periodToggle:hover {{
+    background-color: {colors['ACCENT_LIGHT']};
+}}
+QPushButton#periodToggle:checked {{
+    background-color: {colors['ACCENT_LIGHT']};
+    color: {colors['ACCENT']};
+    border: 1px solid {colors['ACCENT']};
+    font-weight: 700;
+}}
+
+QDateEdit {{
+    border: 1px solid {colors['BORDER']};
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 12px;
+    background: {colors['SURFACE']};
+    color: {colors['TEXT_PRIMARY']};
+}}
+QDateEdit:focus {{
+    border: 1px solid {colors['ACCENT']};
+}}
+QDateEdit:disabled {{
+    color: {colors['TEXT_SECONDARY']};
+}}
 """
 
 

@@ -1,14 +1,18 @@
+from datetime import datetime
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy,
+    QDateEdit, QButtonGroup,
 )
-from PySide6.QtCore import Qt, Signal, QThread, QObject, QPropertyAnimation, QEasingCurve, Property
+from PySide6.QtCore import Qt, Signal, QThread, QObject, QPropertyAnimation, QEasingCurve, Property, QDate
 
 from ui.theme_manager import theme_manager
 from ui.theme_utils import apply_live_style
 from ui.loading_overlay import LoadingOverlay
 from sync_service import sync_cards
 from storage_service import get_status_project_counts, get_status_rows
+from date_utils import get_this_month_range, get_custom_range
 
 CARD_ANIM_MS = 220
 
@@ -147,8 +151,13 @@ class SyncWorker(QObject):
     progress = Signal(str)
     finished = Signal()
 
+    def __init__(self, start_date=None, end_date=None):
+        super().__init__()
+        self.start_date = start_date
+        self.end_date = end_date
+
     def run(self):
-        sync_cards(progress_callback=self.progress.emit)
+        sync_cards(progress_callback=self.progress.emit, start_date=self.start_date, end_date=self.end_date)
         self.finished.emit()
 
 
@@ -159,12 +168,14 @@ class RowsWorker(QObject):
     actually takes."""
     finished = Signal(list)
 
-    def __init__(self, status_key):
+    def __init__(self, status_key, start_date=None, end_date=None):
         super().__init__()
         self.status_key = status_key
+        self.start_date = start_date
+        self.end_date = end_date
 
     def run(self):
-        self.finished.emit(get_status_rows(self.status_key))
+        self.finished.emit(get_status_rows(self.status_key, start_date=self.start_date, end_date=self.end_date))
 
 
 class DashboardPage(QWidget):
@@ -187,6 +198,78 @@ class DashboardPage(QWidget):
         self.scan_btn.clicked.connect(self.scan_inbox)
         header_row.addWidget(self.scan_btn)
         layout.addLayout(header_row)
+
+        # Period row: choose which "received on" window the next scan
+        # covers, before it runs. Two mutually exclusive modes -- This
+        # Month (one click) or a custom From/To range.
+        period_row = QHBoxLayout()
+        period_row.setSpacing(8)
+
+        period_label = QLabel("Scan period:")
+        apply_live_style(period_label, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 12px;")
+        period_row.addWidget(period_label)
+
+        self.this_month_btn = QPushButton("This Month")
+        self.this_month_btn.setObjectName("periodToggle")
+        self.this_month_btn.setCheckable(True)
+        self.this_month_btn.setChecked(True)
+        self.this_month_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        period_row.addWidget(self.this_month_btn)
+
+        self.custom_range_btn = QPushButton("Custom Range")
+        self.custom_range_btn.setObjectName("periodToggle")
+        self.custom_range_btn.setCheckable(True)
+        self.custom_range_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        period_row.addWidget(self.custom_range_btn)
+
+        self._period_group = QButtonGroup(self)
+        self._period_group.setExclusive(True)
+        self._period_group.addButton(self.this_month_btn)
+        self._period_group.addButton(self.custom_range_btn)
+
+        today = QDate.currentDate()
+        month_start = QDate(today.year(), today.month(), 1)
+
+        self.from_date_label = QLabel("From")
+        apply_live_style(self.from_date_label, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 12px;")
+        period_row.addWidget(self.from_date_label)
+
+        self.from_date_edit = QDateEdit(month_start)
+        self.from_date_edit.setCalendarPopup(True)
+        self.from_date_edit.setMaximumDate(today)
+        self.from_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.from_date_edit.setMinimumWidth(120)
+        period_row.addWidget(self.from_date_edit)
+
+        self.to_date_label = QLabel("To")
+        apply_live_style(self.to_date_label, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 12px;")
+        period_row.addWidget(self.to_date_label)
+
+        self.to_date_edit = QDateEdit(today)
+        self.to_date_edit.setCalendarPopup(True)
+        self.to_date_edit.setMaximumDate(today)
+        self.to_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.to_date_edit.setMinimumWidth(120)
+        period_row.addWidget(self.to_date_edit)
+
+        # Keep from <= to at all times, in either direction of edit.
+        self.from_date_edit.dateChanged.connect(self._on_from_date_changed)
+        self.to_date_edit.dateChanged.connect(self._on_to_date_changed)
+
+        self.custom_range_btn.toggled.connect(self._update_period_controls_enabled)
+        self._update_period_controls_enabled()
+
+        # The period picker doubles as a live filter on whatever's already
+        # in the DB, not just a gate on the next scan -- changing it
+        # re-queries immediately so the stat cards/table always reflect
+        # the currently selected window.
+        self.this_month_btn.toggled.connect(self._on_period_changed)
+        self.custom_range_btn.toggled.connect(self._on_period_changed)
+        self.from_date_edit.dateChanged.connect(self._on_period_changed)
+        self.to_date_edit.dateChanged.connect(self._on_period_changed)
+
+        period_row.addStretch()
+        layout.addLayout(period_row)
 
         # Stat cards - placeholder values, replaced once scan logic is wired later
         stats_row = QHBoxLayout()
@@ -241,10 +324,47 @@ class DashboardPage(QWidget):
 
         self._set_empty_state()
 
+    def _on_from_date_changed(self, qdate):
+        if qdate > self.to_date_edit.date():
+            self.to_date_edit.setDate(qdate)
+
+    def _on_to_date_changed(self, qdate):
+        if qdate < self.from_date_edit.date():
+            self.from_date_edit.setDate(qdate)
+
+    def _update_period_controls_enabled(self):
+        is_custom = self.custom_range_btn.isChecked()
+        for widget in (self.from_date_label, self.from_date_edit, self.to_date_label, self.to_date_edit):
+            widget.setEnabled(is_custom)
+
+    def _get_selected_period(self):
+        """Returns (start_date, end_date) datetimes for the currently
+        chosen scan period, per date_utils' rules."""
+        if self.custom_range_btn.isChecked():
+            from_qdate = self.from_date_edit.date()
+            to_qdate = self.to_date_edit.date()
+            start = datetime(from_qdate.year(), from_qdate.month(), from_qdate.day())
+            end = datetime(to_qdate.year(), to_qdate.month(), to_qdate.day())
+            return get_custom_range(start, end)
+        return get_this_month_range()
+
     def select_stat_card(self, selected_key):
+        self._selected_status_key = selected_key
         for key, card in self.stat_cards.items():
             card.set_selected(key == selected_key)
         if hasattr(self, "table"):
+            self._load_status_rows(selected_key)
+
+    def _on_period_changed(self, *_args):
+        # Fires while the widgets are still being constructed (initial
+        # setChecked calls, etc.) and on every keystroke/clamp of the date
+        # editors -- only act once there's actually data on screen to
+        # refilter.
+        if not getattr(self, "_has_scanned", False):
+            return
+        self._refresh_stat_cards()
+        selected_key = getattr(self, "_selected_status_key", None)
+        if selected_key is not None:
             self._load_status_rows(selected_key)
 
     def _is_rows_loading(self):
@@ -268,7 +388,8 @@ class DashboardPage(QWidget):
         self.table_title.setText("No data yet")
 
     def _refresh_stat_cards(self):
-        counts = get_status_project_counts()
+        start_date, end_date = self._get_selected_period()
+        counts = get_status_project_counts(start_date=start_date, end_date=end_date)
         for key in ("approve", "pending", "reject"):
             if key in self.stat_cards:
                 self.stat_cards[key].set_value(counts.get(key, 0))
@@ -290,8 +411,9 @@ class DashboardPage(QWidget):
         self.table.setRowCount(0)
         self._rows_loading_overlay.start("Loading records...")
 
+        start_date, end_date = self._get_selected_period()
         self._rows_thread = QThread(self)
-        self._rows_worker = RowsWorker(status_key)
+        self._rows_worker = RowsWorker(status_key, start_date, end_date)
         self._rows_worker.moveToThread(self._rows_thread)
 
         self._rows_thread.started.connect(self._rows_worker.run)
@@ -346,8 +468,10 @@ class DashboardPage(QWidget):
         self._has_scanned = False
         self._set_empty_state()
 
+        start_date, end_date = self._get_selected_period()
+
         self._sync_thread = QThread(self)
-        self._sync_worker = SyncWorker()
+        self._sync_worker = SyncWorker(start_date, end_date)
         self._sync_worker.moveToThread(self._sync_thread)
 
         self._sync_thread.started.connect(self._sync_worker.run)

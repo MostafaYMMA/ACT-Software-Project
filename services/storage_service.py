@@ -49,8 +49,14 @@ STATUS_TABLES = {
 }
 
 
-def get_status_project_counts():
-    """Return row counts for approved, pending, and rejected records."""
+def get_status_project_counts(start_date=None, end_date=None):
+    """
+    Return row counts for approved, pending, and rejected records. When
+    start_date/end_date are given, only rows whose "received" timestamp
+    falls within [start_date, end_date] are counted (see date_utils for
+    building these from a UI period choice) -- mirrors get_status_rows so
+    the Dashboard's stat cards and table always agree on the same window.
+    """
     conn = sqlite3.connect(DB_PATH)
     try:
         counts = {}
@@ -62,10 +68,14 @@ def get_status_project_counts():
                 counts[label.lower()] = 0
                 continue
 
-            row = conn.execute(
-                f'SELECT COUNT(*) FROM "{table_name}"'
-            ).fetchone()
-            counts[label.lower()] = row[0] or 0
+            if start_date is None and end_date is None:
+                row = conn.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()
+                counts[label.lower()] = row[0] or 0
+            else:
+                received_values = conn.execute(f'SELECT received FROM "{table_name}"').fetchall()
+                counts[label.lower()] = sum(
+                    1 for (received,) in received_values if _received_in_range(received, start_date, end_date)
+                )
 
         return {
             "approve": counts.get("approved", 0),
@@ -76,8 +86,12 @@ def get_status_project_counts():
         conn.close()
 
 
-def get_status_rows(status_key):
-    """Return rows for the selected status table as dictionaries."""
+def get_status_rows(status_key, start_date=None, end_date=None):
+    """
+    Return rows for the selected status table as dictionaries. When
+    start_date/end_date are given, only rows whose "received" timestamp
+    falls within [start_date, end_date] are returned.
+    """
     status_labels = {"approve": "Approved", "pending": "Pending", "reject": "Rejected"}
     table_name = STATUS_TABLES.get(status_labels.get(status_key, "Approved"))
     if table_name is None:
@@ -86,11 +100,14 @@ def get_status_rows(status_key):
     conn = sqlite3.connect(DB_PATH)
     try:
         cursor = conn.execute(
-            f'SELECT subject, "Project Number", "Project Name", "Task Name", "Date", "Qty" '
+            f'SELECT subject, "Project Number", "Project Name", "Task Name", "Date", "Qty", received '
             f'FROM "{table_name}" ORDER BY "Date" ASC, subject ASC'
         )
         columns = [desc[0] for desc in cursor.description]
-        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        if start_date is not None or end_date is not None:
+            rows = [row for row in rows if _received_in_range(row.get("received"), start_date, end_date)]
+        return rows
     finally:
         conn.close()
 
@@ -156,6 +173,21 @@ def _parse_received(value):
         except ValueError:
             return None
     return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+def _received_in_range(received_value, start_date, end_date):
+    """True if the stored "received" text falls within [start_date,
+    end_date] (either bound may be None for unbounded). A row whose
+    "received" can't be parsed is excluded once a range is in effect --
+    there's no timestamp to judge it by."""
+    parsed = _parse_received(received_value)
+    if parsed is None:
+        return False
+    if start_date is not None and parsed < start_date:
+        return False
+    if end_date is not None and parsed > end_date:
+        return False
+    return True
 
 
 def get_stale_status_counts(min_age_hours):
