@@ -3,8 +3,16 @@ from extractor_service import extract
 from storage_service import init_db, save_cards, export_to_csv, export_invoice_lines_to_excel
 
 
-def sync_cards(progress_callback=None):
-    """Pull approved timecard emails, extract entries, and persist them."""
+def sync_cards(progress_callback=None, start_date=None, end_date=None):
+    """
+    Pull approved timecard emails, extract entries, and persist them.
+
+    start_date/end_date (optional): restrict the scan to emails whose
+    Outlook "received on" time falls within [start_date, end_date]
+    (see date_utils for building these from a UI period choice). When
+    both are omitted, behavior is unchanged: the 100 most recently
+    received emails, no date restriction.
+    """
 
     def report(msg):
         print(msg)
@@ -13,8 +21,14 @@ def sync_cards(progress_callback=None):
 
     init_db()
 
+    has_range = start_date is not None or end_date is not None
+
     report("Checking inbox for approved timecards...")
-    emails = get_approved_cards(limit=100)
+    emails = get_approved_cards(
+        limit=None if has_range else 100,
+        start_date=start_date,
+        end_date=end_date,
+    )
     report(f"Approved emails found: {len(emails)}")
 
     all_entries = []

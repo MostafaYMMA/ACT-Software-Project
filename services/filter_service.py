@@ -784,7 +784,26 @@ def get_outlook_folder(namespace, folder_name="Inbox"):
 # ----------------------------------------------------------------------
 # Public entry point: get_approved_cards()
 # ----------------------------------------------------------------------
-def get_approved_cards(folder_name="Inbox", print_report=True, limit=None):
+def _received_time_naive(item):
+    """
+    Best-effort naive datetime.datetime for item.ReceivedTime, used to
+    compare against start_date/end_date ahead of the (much slower)
+    process_email() call. Outlook/pywin32 hands back ReceivedTime as a
+    tz-aware pywintypes.datetime whose tzinfo doesn't reflect an actual
+    conversion (it's local wall-clock time labeled as a fixed offset) --
+    dropping tzinfo here matches how storage_service._parse_received()
+    already treats the same value once it's stored as the "received"
+    column, so the two stay consistent.
+    """
+    try:
+        received = item.ReceivedTime
+    except Exception:
+        return None
+    return received.replace(tzinfo=None) if getattr(received, "tzinfo", None) is not None else received
+
+
+def get_approved_cards(folder_name="Inbox", print_report=True, limit=None,
+                        start_date=None, end_date=None):
     """
     Connect to Outlook, scan the given folder (Inbox by default) using
     the same single-pass logic as main(), and return the list of
@@ -801,7 +820,15 @@ def get_approved_cards(folder_name="Inbox", print_report=True, limit=None):
         print_report: if True, prints the Counters summary at the end
                      (same output as main()).
         limit: if set, only scan the `limit` most recently received
-                     emails instead of the whole folder.
+                     emails instead of the whole folder. Ignored for
+                     items outside [start_date, end_date] when those are
+                     given -- see below.
+        start_date/end_date: if given, only emails whose ReceivedTime
+                     falls within [start_date, end_date] (inclusive) are
+                     scanned/matched. Since the folder is sorted
+                     newest-first, an email older than start_date ends
+                     the scan immediately rather than counting against
+                     `limit`.
 
     Returns:
         matching_emails: list of dicts, one per matched email, in the
@@ -830,6 +857,16 @@ def get_approved_cards(folder_name="Inbox", print_report=True, limit=None):
             try:
                 if getattr(item, "Class", None) != OL_MAIL_ITEM_CLASS:
                     continue
+
+                if start_date is not None or end_date is not None:
+                    received_at = _received_time_naive(item)
+                    if received_at is None:
+                        continue
+                    if end_date is not None and received_at > end_date:
+                        continue  # newer than the window -- keep scanning
+                    if start_date is not None and received_at < start_date:
+                        break  # newest-first order: nothing after this is in range
+
                 matched_email = process_email(item, temp_dir, counters)
                 if matched_email is not None:
                     matching_emails.append(matched_email)
