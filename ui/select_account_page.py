@@ -10,9 +10,10 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 
 from ui.athu import list_accounts, verify_password
+from ui.profile_circle import ProfileCircle
 from ui.theme import (
     COLOR_BG, COLOR_ACCENT, COLOR_ACCENT_LIGHT, COLOR_TEXT_PRIMARY,
-    COLOR_TEXT_ON_ACCENT, COLOR_BORDER, COLOR_ERROR,
+    COLOR_BORDER, COLOR_ERROR,
 )
 
 TILE_SIZE = (140, 160)
@@ -35,15 +36,19 @@ class AccountTile(QFrame):
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.setSpacing(8)
 
-        avatar = QLabel("+" if self.is_add_tile else self._initials())
-        avatar.setFixedSize(64, 64)
-        avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        bg = COLOR_ACCENT_LIGHT if self.is_add_tile else COLOR_ACCENT
-        fg = COLOR_ACCENT if self.is_add_tile else COLOR_TEXT_ON_ACCENT
-        avatar.setStyleSheet(
-            f"background-color: {bg}; color: {fg}; border-radius: 32px; "
-            f"font-size: 22px; font-weight: 700;"
-        )
+        if self.is_add_tile:
+            avatar = QLabel("+")
+            avatar.setFixedSize(64, 64)
+            avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            avatar.setStyleSheet(
+                f"background-color: {COLOR_ACCENT_LIGHT}; color: {COLOR_ACCENT}; "
+                f"border-radius: 32px; font-size: 22px; font-weight: 700;"
+            )
+        else:
+            # Shows the account's chosen photo if one was set via the
+            # top-bar Avatar, otherwise falls back to initials - same
+            # shared widget/settings key as ui/avatar.py.
+            avatar = ProfileCircle(self.username, size=64)
         layout.addWidget(avatar, alignment=Qt.AlignmentFlag.AlignCenter)
 
         name_label = QLabel("Add account" if self.is_add_tile else self.username)
@@ -61,10 +66,6 @@ class AccountTile(QFrame):
                 border: 1px solid {COLOR_ACCENT};
             }}
         """)
-
-    def _initials(self):
-        parts = self.username.split()
-        return "".join(p[0] for p in parts[:2]).upper() or "?"
 
     def mousePressEvent(self, event):
         self.clicked.emit(self.username)
