@@ -431,18 +431,18 @@ def get_export_history():
     return rows
 
 
-def _parse_date(day_text: str) -> str:
+def _received_date_only(received: str) -> str:
     """
-    Converts 'Monday, 29 Jun' -> '2026-06-29' (ISO format, sortable).
-    Assumes the current year since the email doesn't include one.
+    Truncates the raw "received" timestamp (item.ReceivedTime, e.g.
+    '2026-07-03 09:14:22') down to just the date part, 'YYYY-MM-DD'.
+    Used as the "Date" column instead of the timecard's own work-day -
+    the record should be dated by when the email arrived, not by which
+    day of the timecard it happens to describe (matches how
+    invoice_lines' "Date" already works in _sync_invoice_lines below).
     """
-    try:
-        cleaned = day_text.split(",")[1].strip()   # "29 Jun"
-        parsed = datetime.strptime(cleaned, "%d %b")
-        parsed = parsed.replace(year=datetime.now().year)
-        return parsed.strftime("%Y-%m-%d")
-    except Exception:
+    if not received:
         return None
+    return str(received)[:10]
 
 
 def _parse_period(subject: str) -> str:
@@ -468,7 +468,7 @@ def _join_distinct(values) -> str:
 def _to_row(entry: dict) -> tuple:
     return (
         entry.get("day"),
-        _parse_date(entry.get("day", "")),
+        _received_date_only(entry.get("received")),
         entry.get("labor_type"),
         entry.get("time_type"),
         entry.get("hours"),
@@ -669,6 +669,35 @@ def export_to_csv(output_path="output.csv"):
 
     conn.close()
     print(f"Exported to {output_path}")
+
+
+def export_summary_csv_range(start_date: str, end_date: str, output_path: str) -> int:
+    """
+    Exports timecards_summary rows whose "Date" falls within
+    [start_date, end_date] (inclusive, both 'YYYY-MM-DD' strings) to a
+    CSV at output_path. Backs the History page's "Export last month" /
+    "Export date range" buttons. Records the export in export_history,
+    same as the other export functions, so it shows up in that list too.
+    Returns the number of rows written.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.execute(
+        'SELECT * FROM timecards_summary WHERE "Date" >= ? AND "Date" <= ? ORDER BY "Date" ASC',
+        (start_date, end_date),
+    )
+    columns = [desc[0] for desc in cursor.description]
+    rows = cursor.fetchall()
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(columns)
+        writer.writerows(rows)
+
+    _record_export(conn, os.path.basename(output_path))
+    conn.commit()
+    conn.close()
+    print(f"Exported {len(rows)} row(s) ({start_date} to {end_date}) to {output_path}")
+    return len(rows)
 
 
 def export_invoice_lines_to_excel(output_path="invoice_lines.xlsx"):

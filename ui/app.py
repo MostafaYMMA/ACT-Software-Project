@@ -18,6 +18,7 @@ from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint,
 from ui.theme_manager import theme_manager
 from ui.theme_utils import apply_live_style
 from ui.nav_button import NavButton
+from ui.avatar import Avatar
 from ui.transition import FadeStackedWidget
 from ui.notification_banner import NotificationBanner
 from ui.notification_settings import notification_settings
@@ -29,7 +30,7 @@ from ui.Pages.Settings import SettingsPage
 from storage_service import get_stale_status_counts
 
 SIDEBAR_WIDTH = 150
-TOP_BAR_HEIGHT = 56
+TOP_BAR_HEIGHT = 68
 HOVER_HIDE_DELAY_MS = 250
 SIDEBAR_ANIM_MS = 200
 NOTIFICATION_POLL_MS = 5 * 60 * 1000  # continuous background check, every 5 minutes
@@ -164,22 +165,15 @@ class MainWindow(QWidget):
         top_layout.addWidget(self.hamburger_btn)
         top_layout.addSpacing(12)
 
-        avatar = QLabel(self._initials())
-        avatar.setFixedSize(32, 32)
-        avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        # ACCENT and TEXT_ON_ACCENT happen to be identical in both palettes
-        # right now, but going through theme_manager keeps this correct
-        # even if that ever changes.
-        apply_live_style(avatar, lambda c: (
-            f"background-color: {c['ACCENT']}; color: {c['TEXT_ON_ACCENT']}; "
-            f"border-radius: 16px; font-weight: 700; font-size: 12px;"
-        ))
+        # Clickable avatar: click for View/Choose photo.../Remove photo.
+        # Falls back to initials on an orange circle if no photo is set.
+        avatar = Avatar(self.user_name, size=44)
         top_layout.addWidget(avatar)
-        top_layout.addSpacing(10)
+        top_layout.addSpacing(12)
 
         welcome = QLabel(f"Welcome, {self.user_name}")
         apply_live_style(welcome, lambda c: (
-            f"font-size: 15px; font-weight: 700; color: {c['TEXT_PRIMARY']};"
+            f"font-size: 20px; font-weight: 700; color: {c['TEXT_PRIMARY']};"
         ))
         top_layout.addWidget(welcome)
 
@@ -192,10 +186,6 @@ class MainWindow(QWidget):
         top_layout.addWidget(switch_account_btn)
 
         return top_bar
-
-    def _initials(self):
-        parts = self.user_name.split()
-        return "".join(p[0] for p in parts[:2]).upper() or "?"
 
     # -----------------------------------------------------------------
     # Sidebar positioning + hover show/hide
