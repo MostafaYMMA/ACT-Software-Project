@@ -673,16 +673,26 @@ def export_to_csv(output_path="output.csv"):
 
 def export_summary_csv_range(start_date: str, end_date: str, output_path: str) -> int:
     """
-    Exports timecards_summary rows whose "Date" falls within
+    Exports approved timecard rows whose "Date" falls within
     [start_date, end_date] (inclusive, both 'YYYY-MM-DD' strings) to a
     CSV at output_path. Backs the History page's "Export last month" /
     "Export date range" buttons. Records the export in export_history,
     same as the other export functions, so it shows up in that list too.
     Returns the number of rows written.
+
+    Reads timecards_approved rather than timecards_summary so the export
+    keeps one row per day, exactly like the Dashboard's records table
+    (see get_status_rows) -- the summary table merges a whole timecard
+    email into a single row with the days joined and Qty summed. The
+    leading columns are the Dashboard's, in its order; the rest follow so
+    no field is dropped.
     """
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.execute(
-        'SELECT * FROM timecards_summary WHERE "Date" >= ? AND "Date" <= ? ORDER BY "Date" ASC',
+        'SELECT subject, "Project Number", "Project Name", "Task Name", "Date", "Qty", '
+        'day, period, labor_type, time_type, name, person_number, sender, received '
+        'FROM timecards_approved WHERE "Date" >= ? AND "Date" <= ? '
+        'ORDER BY "Date" ASC, subject ASC',
         (start_date, end_date),
     )
     columns = [desc[0] for desc in cursor.description]

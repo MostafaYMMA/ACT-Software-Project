@@ -1,3 +1,9 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# generated exports / local database
+invoice_lines.csv
+invoice_lines.xlsx
+output.csv
+data/cards.db
