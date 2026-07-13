@@ -10,11 +10,19 @@ from PySide6.QtCore import Qt, Signal, QThread, QObject, QPropertyAnimation, QEa
 from ui.theme_manager import theme_manager
 from ui.theme_utils import apply_live_style
 from ui.loading_overlay import LoadingOverlay
+from ui.table_utils import order_columns, configure_grid, set_header_labels, fit_columns
 from sync_service import sync_cards
-from storage_service import get_status_project_counts, get_status_rows
+from storage_service import (
+    get_status_project_counts, get_status_rows, get_status_columns,
+    update_status_record_field,
+)
 from date_utils import get_this_month_range, get_custom_range
 
 CARD_ANIM_MS = 220
+
+# Columns whose edits only make sense as numbers -- a non-numeric entry is
+# rejected and the cell reverts to what the database holds.
+_NUMERIC_COLUMNS = {"rate", "Qty"}
 
 
 class StatCard(QFrame):
@@ -299,12 +307,18 @@ class DashboardPage(QWidget):
         table_container_layout = QVBoxLayout(table_container)
         table_container_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["Subject", "Project Number", "Project Name", "Task Name", "Date", "Qty"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table = QTableWidget(0, 0)
+        configure_grid(self.table)
+        # Double-click puts the cell in edit mode; _on_item_changed writes the
+        # edit back to the database (that's how rate gets set -- there's no
+        # other entry point for it).
+        self.table.setEditTriggers(QTableWidget.EditTrigger.DoubleClicked)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._populating_table = False
+        self._displayed_columns = []
+        self._displayed_rows = []
+        self._current_status_key = "approve"
+        self.table.itemChanged.connect(self._on_item_changed)
         apply_live_style(self.table, lambda c: f"""
             QTableWidget {{
                 border: 1px solid {c['BORDER']}; background: {c['BG']}; color: {c['TEXT_PRIMARY']};
@@ -320,9 +334,16 @@ class DashboardPage(QWidget):
         layout.addWidget(table_container, stretch=1)
 
         self._rows_loading_overlay = LoadingOverlay(table_container, message="Loading records...")
-        table_container.resizeEvent = lambda event: self._rows_loading_overlay.reposition()
+        table_container.resizeEvent = lambda event: self._on_table_container_resized()
 
         self._set_empty_state()
+
+    def _on_table_container_resized(self):
+        # Re-fill on every window resize, otherwise widening the window leaves
+        # a gap on the right and narrowing it hides columns that would still
+        # fit if they shrank back.
+        self._rows_loading_overlay.reposition()
+        self._fit_columns()
 
     def _on_from_date_changed(self, qdate):
         if qdate > self.to_date_edit.date():
@@ -385,6 +406,9 @@ class DashboardPage(QWidget):
             if key in self.stat_cards:
                 self.stat_cards[key].set_value("—")
         self.table.setRowCount(0)
+        self._displayed_rows = []
+        set_header_labels(self.table, self._columns_for([]))
+        self._fit_columns()
         self.table_title.setText("No data yet")
 
     def _refresh_stat_cards(self):
@@ -430,6 +454,16 @@ class DashboardPage(QWidget):
         # always beats the RuntimeError _is_rows_loading() guards against.
         self._rows_thread = None
 
+    def _columns_for(self, rows):
+        """Column keys to show, in display order (see order_columns). With no
+        rows to take keys from -- an empty table, before the first scan -- the
+        keys come from the DB schema instead, so the headings are the real
+        ones from the start."""
+        return order_columns(list(rows[0]) if rows else get_status_columns())
+
+    def _fit_columns(self):
+        fit_columns(self.table)
+
     def _on_rows_loaded(self, status_key, rows):
         status_labels = {
             "approve": "Approved",
@@ -438,20 +472,25 @@ class DashboardPage(QWidget):
         }
         title = status_labels.get(status_key, "Approved")
 
-        self.table.setRowCount(len(rows))
-        for row_index, row in enumerate(rows):
-            values = [
-                row.get("subject") or "",
-                row.get("Project Number") or "",
-                row.get("Project Name") or "",
-                row.get("Task Name") or "",
-                row.get("Date") or "",
-                row.get("Qty") or "",
-            ]
-            for col_index, value in enumerate(values):
-                item = QTableWidgetItem(str(value))
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.table.setItem(row_index, col_index, item)
+        columns = self._columns_for(rows)
+        self._displayed_columns = columns
+        self._displayed_rows = rows
+        self._current_status_key = status_key
+
+        self._populating_table = True
+        try:
+            set_header_labels(self.table, columns)
+            self.table.setRowCount(len(rows))
+            for row_index, row in enumerate(rows):
+                for col_index, column in enumerate(columns):
+                    value = row.get(column)
+                    item = QTableWidgetItem("" if value is None else str(value))
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    self.table.setItem(row_index, col_index, item)
+        finally:
+            self._populating_table = False
+
+        self._fit_columns()
 
         self._rows_loading_overlay.stop()
         if hasattr(self, "table_title"):
@@ -461,6 +500,46 @@ class DashboardPage(QWidget):
         if pending_key is not None:
             self._pending_status_key = None
             self._load_status_rows(pending_key)
+
+    def _on_item_changed(self, item):
+        """Persists a double-click cell edit to the database. Fires on every
+        setItem too, so the _populating_table guard filters those out. An edit
+        that can't be saved -- non-numeric rate/Qty, an unknown column, or a
+        DB rejection -- is rolled back in the cell so the grid never shows a
+        value the database doesn't hold."""
+        if self._populating_table:
+            return
+
+        row_index, col_index = item.row(), item.column()
+        if row_index >= len(self._displayed_rows) or col_index >= len(self._displayed_columns):
+            return
+
+        record = self._displayed_rows[row_index]
+        column = self._displayed_columns[col_index]
+        old_value = record.get(column)
+        new_value = item.text().strip()
+
+        def revert():
+            self._populating_table = True
+            try:
+                item.setText("" if old_value is None else str(old_value))
+            finally:
+                self._populating_table = False
+
+        if str(old_value or "") == new_value:
+            return
+
+        if column in _NUMERIC_COLUMNS:
+            try:
+                new_value = float(new_value) if new_value else 0.0
+            except ValueError:
+                revert()
+                return
+
+        if update_status_record_field(self._current_status_key, record.get("id"), column, new_value):
+            record[column] = new_value
+        else:
+            revert()
 
     def scan_inbox(self):
         self.scan_btn.setEnabled(False)

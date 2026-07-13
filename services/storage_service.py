@@ -86,22 +86,41 @@ def get_status_project_counts(start_date=None, end_date=None):
         conn.close()
 
 
+_STATUS_LABELS = {"approve": "Approved", "pending": "Pending", "reject": "Rejected"}
+
+
+def get_status_columns(status_key="approve"):
+    """
+    Returns the column names of a status table, in schema order, without
+    reading any rows. Lets the Dashboard show the full set of headings on
+    an empty table (before the first scan), where get_status_rows has no
+    row to take keys from.
+    """
+    table_name = STATUS_TABLES.get(_STATUS_LABELS.get(status_key, "Approved"))
+    if table_name is None:
+        return []
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        return [row[1] for row in conn.execute(f'PRAGMA table_info("{table_name}")')]
+    finally:
+        conn.close()
+
+
 def get_status_rows(status_key, start_date=None, end_date=None):
     """
     Return rows for the selected status table as dictionaries. When
     start_date/end_date are given, only rows whose "received" timestamp
     falls within [start_date, end_date] are returned.
     """
-    status_labels = {"approve": "Approved", "pending": "Pending", "reject": "Rejected"}
-    table_name = STATUS_TABLES.get(status_labels.get(status_key, "Approved"))
+    table_name = STATUS_TABLES.get(_STATUS_LABELS.get(status_key, "Approved"))
     if table_name is None:
         return []
 
     conn = sqlite3.connect(DB_PATH)
     try:
         cursor = conn.execute(
-            f'SELECT subject, "Project Number", "Project Name", "Task Name", "Date", "Qty", received '
-            f'FROM "{table_name}" ORDER BY "Date" ASC, subject ASC'
+            f'SELECT * FROM "{table_name}" ORDER BY "Date" ASC, subject ASC'
         )
         columns = [desc[0] for desc in cursor.description]
         rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
@@ -112,13 +131,33 @@ def get_status_rows(status_key, start_date=None, end_date=None):
         conn.close()
 
 
-def search_records(query=""):
+# Columns search_records is allowed to match against. Also the vocabulary the
+# Records page offers in its field picker -- keeping the list here means the
+# UI and the WHERE clause can't drift apart (and, since field names get
+# interpolated into SQL, acts as the whitelist that keeps arbitrary strings
+# out of the query).
+SEARCHABLE_FIELDS = [
+    "subject", "sender", "Project Number", "Project Name", "Task Name",
+    "name", "person_number",
+]
+
+
+def search_records(query="", fields=None):
     """
-    Searches subject/sender/Project Number/Project Name/Task Name/name/
-    person_number across all three status tables. An empty query returns
-    everything. Each result dict is tagged with "status" (Approved/
-    Pending/Rejected) so callers can show where a match currently stands.
+    Searches across all three status tables and returns full rows (every
+    column, SELECT *). An empty query returns everything. Each result dict
+    is tagged with "status" (Approved/Pending/Rejected) so callers can
+    show where a match currently stands.
+
+    fields limits which columns the query is matched against; it must be
+    a subset of SEARCHABLE_FIELDS (anything else is ignored). None or an
+    empty list means all of them -- the pre-field-picker behavior.
     """
+    if fields:
+        fields = [f for f in fields if f in SEARCHABLE_FIELDS]
+    if not fields:
+        fields = SEARCHABLE_FIELDS
+
     conn = sqlite3.connect(DB_PATH)
     try:
         results = []
@@ -131,20 +170,13 @@ def search_records(query=""):
                 continue
 
             if term:
-                cursor = conn.execute(f"""
-                    SELECT subject, sender, "Project Number", "Project Name", "Task Name",
-                           "Date", "Qty", name, person_number
-                    FROM "{table_name}"
-                    WHERE subject LIKE ? OR sender LIKE ? OR "Project Number" LIKE ?
-                       OR "Project Name" LIKE ? OR "Task Name" LIKE ? OR name LIKE ?
-                       OR person_number LIKE ?
-                """, (like, like, like, like, like, like, like))
+                where = " OR ".join(f'"{field}" LIKE ?' for field in fields)
+                cursor = conn.execute(
+                    f'SELECT * FROM "{table_name}" WHERE {where}',
+                    [like] * len(fields),
+                )
             else:
-                cursor = conn.execute(f"""
-                    SELECT subject, sender, "Project Number", "Project Name", "Task Name",
-                           "Date", "Qty", name, person_number
-                    FROM "{table_name}"
-                """)
+                cursor = conn.execute(f'SELECT * FROM "{table_name}"')
 
             columns = [desc[0] for desc in cursor.description]
             for row in cursor.fetchall():
@@ -154,6 +186,38 @@ def search_records(query=""):
 
         results.sort(key=lambda r: r.get("Date") or "", reverse=True)
         return results
+    finally:
+        conn.close()
+
+
+def update_status_record_field(status_key, record_id, column, value):
+    """
+    Writes one cell edit from the Dashboard grid back to the record's row
+    (identified by id) in the status table status_key maps to. The column
+    must actually exist on the table -- column names can't be bound as SQL
+    parameters, so this check is what keeps the interpolation safe -- and
+    "id" itself is refused. Returns True when a row was updated; False for
+    an unknown column/table, a missing id, or an edit the table's UNIQUE
+    constraint rejects (e.g. making a row a duplicate of another).
+    """
+    table_name = STATUS_TABLES.get(_STATUS_LABELS.get(status_key, "Approved"))
+    if table_name is None or column == "id":
+        return False
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        valid_columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{table_name}")')}
+        if column not in valid_columns:
+            return False
+        try:
+            cursor = conn.execute(
+                f'UPDATE "{table_name}" SET "{column}" = ? WHERE id = ?',
+                (value, record_id),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        conn.commit()
+        return cursor.rowcount > 0
     finally:
         conn.close()
 
@@ -276,6 +340,8 @@ def _create_timecards_table(conn, table_name):
             subject TEXT,
             sender TEXT,
             received TEXT,
+            is_exported INTEGER DEFAULT 0,
+            rate REAL DEFAULT 0,
             UNIQUE(day, "Project Number", "Task Name", sender)
         )
     """)
@@ -336,7 +402,15 @@ def init_db():
     for table_name in STATUS_TABLES.values():
         _migrate_drop_subject_from_unique(conn, table_name)
         _create_timecards_table(conn, table_name)
-        _ensure_columns(conn, table_name, ["name TEXT", "period TEXT", "person_number TEXT"])
+        # ADD COLUMN with a DEFAULT backfills existing rows with it, so
+        # records created before these columns existed start as
+        # not-exported / rate 0 rather than NULL. Neither column is in
+        # _upsert_timecards' ON CONFLICT update list, so a re-scan never
+        # resets an is_exported flag or a manually entered rate.
+        _ensure_columns(conn, table_name, [
+            "name TEXT", "period TEXT", "person_number TEXT",
+            "is_exported INTEGER DEFAULT 0", "rate REAL DEFAULT 0",
+        ])
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS timecards_summary (
@@ -686,23 +760,32 @@ def export_summary_csv_range(start_date: str, end_date: str, output_path: str) -
     email into a single row with the days joined and Qty summed. The
     leading columns are the Dashboard's, in its order; the rest follow so
     no field is dropped.
+
+    Every exported record gets its is_exported flag set to 1 (a no-op for
+    rows already flagged from an earlier export). The id is fetched only
+    for that flagging and is not written to the CSV; is_exported itself is
+    left out of the file too -- it's bookkeeping, not timecard data.
     """
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.execute(
-        'SELECT subject, "Project Number", "Project Name", "Task Name", "Date", "Qty", '
+        'SELECT id, subject, "Project Number", "Project Name", "Task Name", "Date", "Qty", rate, '
         'day, period, labor_type, time_type, name, person_number, sender, received '
         'FROM timecards_approved WHERE "Date" >= ? AND "Date" <= ? '
         'ORDER BY "Date" ASC, subject ASC',
         (start_date, end_date),
     )
-    columns = [desc[0] for desc in cursor.description]
+    columns = [desc[0] for desc in cursor.description][1:]  # drop id
     rows = cursor.fetchall()
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(columns)
-        writer.writerows(rows)
+        writer.writerows(row[1:] for row in rows)
 
+    conn.executemany(
+        "UPDATE timecards_approved SET is_exported = 1 WHERE id = ? AND is_exported != 1",
+        [(row[0],) for row in rows],
+    )
     _record_export(conn, os.path.basename(output_path))
     conn.commit()
     conn.close()
