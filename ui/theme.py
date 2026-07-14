@@ -14,32 +14,91 @@ code should instead do:
     colors["ACCENT"], colors["BG"], etc.
 """
 
-FONT_FAMILY = "Segoe UI"
+import os
+
+from PySide6.QtGui import QFontDatabase
+from PySide6.QtWidgets import QApplication
+
+FONT_FAMILY = "'Segoe UI', 'SF Pro Text', 'Helvetica Neue', Arial, sans-serif"
+
+# Used for every QLabel (titles, "Welcome", sidebar nav text, stat card
+# text) - see the QLabel rule in build_stylesheet(). Tables, buttons,
+# and inputs use different Qt widget types (QTableWidgetItem,
+# QPushButton, QLineEdit/QDateEdit), so they're untouched by this and
+# stay on FONT_FAMILY - dense data stays legible even though labels get
+# the display treatment.
+DISPLAY_FONT_FAMILY = "'Instrument Serif', serif"
+
+_DISPLAY_FONT_FILENAME = "InstrumentSerif-Italic.ttf"
+_font_load_attempted = False
+
+
+def _ensure_display_font_loaded():
+    """Registers the bundled display font the first time it's safe to do
+    so (QFontDatabase needs a live QApplication). Self-contained here so
+    no other file needs to import or call anything - if the app hasn't
+    been created yet (e.g. the GLOBAL_STYLESHEET line below, evaluated
+    at import time), this quietly no-ops and retries next call."""
+    global _font_load_attempted
+    if _font_load_attempted:
+        return
+    if QApplication.instance() is None:
+        return
+    font_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "assets", "fonts", _DISPLAY_FONT_FILENAME,
+    )
+    if os.path.exists(font_path):
+        QFontDatabase.addApplicationFont(font_path)
+    _font_load_attempted = True
+
+
+# Shared corner-radius scale, used consistently instead of the previous
+# ad-hoc mix of 6/8/10px values scattered through the stylesheet.
+RADIUS_SM = 6
+RADIUS_MD = 8
+RADIUS_LG = 10
 
 LIGHT = {
     "BG": "#FFFFFF",
     "SURFACE": "#F7F5F0",
-    "ACCENT": "#fc6a28",
-    "ACCENT_DARK": "#d9541a",
-    "ACCENT_LIGHT": "#FFE3D2",
+    "SURFACE_ALT": "#FBFAF7",
+    "ACCENT": "#FE5102",
+    "ACCENT_DARK": "#DA4602",
+    "ACCENT_LIGHT": "#FFDCCC",
+    "ACCENT_SOFT": "#FFF0EA",
     "TEXT_PRIMARY": "#1A1A1A",
     "TEXT_SECONDARY": "#6B6B66",
     "TEXT_ON_ACCENT": "#FFFFFF",
     "BORDER": "#F3D9C7",
+    "BORDER_STRONG": "#E8C4AA",
     "ERROR": "#C0392B",
+    "DISABLED_BG": "#F0EEE9",
+    "DISABLED_TEXT": "#B4B2AC",
+    "SCROLLBAR_TRACK": "#F7F5F0",
+    "SCROLLBAR_THUMB": "#E4DCD0",
+    "SCROLLBAR_THUMB_HOVER": "#D8CBB8",
 }
 
 DARK = {
     "BG": "#1E1E1E",
     "SURFACE": "#2A2A28",
-    "ACCENT": "#fc6a28",
-    "ACCENT_DARK": "#d9541a",
-    "ACCENT_LIGHT": "#3A2A20",
+    "SURFACE_ALT": "#252523",
+    "ACCENT": "#FE5102",
+    "ACCENT_DARK": "#DA4602",
+    "ACCENT_LIGHT": "#3A2416",
+    "ACCENT_SOFT": "#331F13",
     "TEXT_PRIMARY": "#F2F2F0",
     "TEXT_SECONDARY": "#B5B3AC",
     "TEXT_ON_ACCENT": "#FFFFFF",
     "BORDER": "#3A3A38",
+    "BORDER_STRONG": "#4A4A46",
     "ERROR": "#E57368",
+    "DISABLED_BG": "#242422",
+    "DISABLED_TEXT": "#6E6C66",
+    "SCROLLBAR_TRACK": "#2A2A28",
+    "SCROLLBAR_THUMB": "#454540",
+    "SCROLLBAR_THUMB_HOVER": "#54524B",
 }
 
 # Backward-compatible static (light) constants.
@@ -60,11 +119,29 @@ def build_stylesheet(colors):
     live the instant the app-level stylesheet changes - no rebuild needed."""
     return f"""
 QWidget {{
-    font-family: '{FONT_FAMILY}';
+    font-family: {FONT_FAMILY};
+    font-size: 13px;
 }}
 
 QLabel {{
     color: {colors['TEXT_PRIMARY']};
+}}
+
+/* Tag any title/header QLabel with setObjectName("pageTitle") to opt
+   it into the display serif - font-size/weight/color set per-label
+   are untouched, only the family + italic slant come from here. */
+#pageTitle {{
+    font-family: {DISPLAY_FONT_FAMILY};
+    font-style: italic;
+}}
+
+QToolTip {{
+    background-color: {colors['TEXT_PRIMARY']};
+    color: {colors['BG']};
+    border: none;
+    border-radius: {RADIUS_SM}px;
+    padding: 6px 10px;
+    font-size: 12px;
 }}
 
 #mainWindow {{
@@ -91,25 +168,43 @@ QLabel {{
     color: {colors['TEXT_ON_ACCENT']};
 }}
 
+/* ---------------------------------------------------------------- */
+/* Inputs                                                            */
+/* ---------------------------------------------------------------- */
+
 QLineEdit {{
     border: 1px solid {colors['BORDER']};
-    border-radius: 6px;
-    padding: 8px;
+    border-radius: {RADIUS_MD}px;
+    padding: 9px 12px;
     font-size: 13px;
     background: {colors['SURFACE']};
     color: {colors['TEXT_PRIMARY']};
+    selection-background-color: {colors['ACCENT_LIGHT']};
+    selection-color: {colors['TEXT_PRIMARY']};
+}}
+QLineEdit:hover {{
+    border: 1px solid {colors['BORDER_STRONG']};
 }}
 QLineEdit:focus {{
-    border: 1px solid {colors['ACCENT']};
+    border: 1.5px solid {colors['ACCENT']};
 }}
+QLineEdit:disabled {{
+    background: {colors['DISABLED_BG']};
+    color: {colors['DISABLED_TEXT']};
+    border: 1px solid {colors['BORDER']};
+}}
+
+/* ---------------------------------------------------------------- */
+/* Buttons                                                           */
+/* ---------------------------------------------------------------- */
 
 QPushButton#primaryButton {{
     background-color: {colors['ACCENT']};
     color: {colors['TEXT_ON_ACCENT']};
     border: none;
-    border-radius: 6px;
-    padding: 10px 16px;
-    font-weight: 700;
+    border-radius: {RADIUS_MD}px;
+    padding: 10px 18px;
+    font-weight: 600;
     font-size: 13px;
 }}
 QPushButton#primaryButton:hover {{
@@ -117,51 +212,167 @@ QPushButton#primaryButton:hover {{
 }}
 QPushButton#primaryButton:pressed {{
     background-color: {colors['ACCENT_DARK']};
+    padding-top: 11px;
+    padding-bottom: 9px;
+}}
+QPushButton#primaryButton:disabled {{
+    background-color: {colors['DISABLED_BG']};
+    color: {colors['DISABLED_TEXT']};
 }}
 
 QPushButton#secondaryButton {{
-    background-color: {colors['SURFACE']};
+    background-color: transparent;
     color: {colors['ACCENT']};
-    border: 1px solid {colors['ACCENT']};
-    border-radius: 6px;
+    border: 1.5px solid {colors['ACCENT']};
+    border-radius: {RADIUS_MD}px;
     padding: 8px 14px;
     font-size: 13px;
+    font-weight: 600;
 }}
 QPushButton#secondaryButton:hover {{
+    background-color: {colors['ACCENT_SOFT']};
+}}
+QPushButton#secondaryButton:pressed {{
     background-color: {colors['ACCENT_LIGHT']};
 }}
 
 QPushButton#periodToggle {{
     background-color: {colors['SURFACE']};
-    color: {colors['TEXT_PRIMARY']};
+    color: {colors['TEXT_SECONDARY']};
     border: 1px solid {colors['BORDER']};
-    border-radius: 6px;
-    padding: 6px 12px;
+    border-radius: {RADIUS_MD}px;
+    padding: 7px 14px;
     font-size: 12px;
+    font-weight: 500;
 }}
 QPushButton#periodToggle:hover {{
-    background-color: {colors['ACCENT_LIGHT']};
+    background-color: {colors['ACCENT_SOFT']};
+    color: {colors['TEXT_PRIMARY']};
 }}
 QPushButton#periodToggle:checked {{
-    background-color: {colors['ACCENT_LIGHT']};
+    background-color: {colors['ACCENT_SOFT']};
     color: {colors['ACCENT']};
     border: 1px solid {colors['ACCENT']};
     font-weight: 700;
 }}
 
+/* ---------------------------------------------------------------- */
+/* Date picker                                                       */
+/* ---------------------------------------------------------------- */
+
 QDateEdit {{
     border: 1px solid {colors['BORDER']};
-    border-radius: 6px;
-    padding: 6px 8px;
+    border-radius: {RADIUS_MD}px;
+    padding: 7px 10px;
     font-size: 12px;
     background: {colors['SURFACE']};
     color: {colors['TEXT_PRIMARY']};
 }}
+QDateEdit:hover {{
+    border: 1px solid {colors['BORDER_STRONG']};
+}}
 QDateEdit:focus {{
-    border: 1px solid {colors['ACCENT']};
+    border: 1.5px solid {colors['ACCENT']};
 }}
 QDateEdit:disabled {{
+    background: {colors['DISABLED_BG']};
+    color: {colors['DISABLED_TEXT']};
+    border: 1px solid {colors['BORDER']};
+}}
+QDateEdit::drop-down {{
+    border: none;
+    width: 22px;
+}}
+QDateEdit QAbstractItemView {{
+    background: {colors['BG']};
+    color: {colors['TEXT_PRIMARY']};
+    border: 1px solid {colors['BORDER']};
+    selection-background-color: {colors['ACCENT_LIGHT']};
+    selection-color: {colors['TEXT_PRIMARY']};
+    outline: none;
+}}
+
+/* ---------------------------------------------------------------- */
+/* Tables                                                            */
+/* ---------------------------------------------------------------- */
+
+QTableWidget {{
+    border: 1px solid {colors['BORDER']};
+    border-radius: {RADIUS_MD}px;
+    background: {colors['BG']};
+    color: {colors['TEXT_PRIMARY']};
+    gridline-color: {colors['BORDER']};
+    alternate-background-color: {colors['SURFACE_ALT']};
+    selection-background-color: {colors['ACCENT_SOFT']};
+    selection-color: {colors['TEXT_PRIMARY']};
+}}
+QTableWidget::item {{
+    color: {colors['TEXT_PRIMARY']};
+    padding: 6px 8px;
+    border: none;
+}}
+QTableWidget::item:selected {{
+    background-color: {colors['ACCENT_SOFT']};
+    color: {colors['TEXT_PRIMARY']};
+}}
+QHeaderView::section {{
+    background-color: {colors['SURFACE']};
     color: {colors['TEXT_SECONDARY']};
+    padding: 10px 8px;
+    border: none;
+    border-bottom: 1px solid {colors['BORDER']};
+    font-weight: 700;
+    font-size: 12px;
+}}
+QTableWidget QTableCornerButton::section {{
+    background-color: {colors['SURFACE']};
+    border: none;
+}}
+
+/* ---------------------------------------------------------------- */
+/* Scrollbars                                                        */
+/* ---------------------------------------------------------------- */
+
+QScrollBar:vertical {{
+    background: {colors['SCROLLBAR_TRACK']};
+    width: 10px;
+    margin: 0;
+    border-radius: 5px;
+}}
+QScrollBar::handle:vertical {{
+    background: {colors['SCROLLBAR_THUMB']};
+    border-radius: 5px;
+    min-height: 24px;
+}}
+QScrollBar::handle:vertical:hover {{
+    background: {colors['SCROLLBAR_THUMB_HOVER']};
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+    height: 0px;
+}}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+    background: transparent;
+}}
+
+QScrollBar:horizontal {{
+    background: {colors['SCROLLBAR_TRACK']};
+    height: 10px;
+    margin: 0;
+    border-radius: 5px;
+}}
+QScrollBar::handle:horizontal {{
+    background: {colors['SCROLLBAR_THUMB']};
+    border-radius: 5px;
+    min-width: 24px;
+}}
+QScrollBar::handle:horizontal:hover {{
+    background: {colors['SCROLLBAR_THUMB_HOVER']};
+}}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+    width: 0px;
+}}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+    background: transparent;
 }}
 """
 
