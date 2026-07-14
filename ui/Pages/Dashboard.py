@@ -15,7 +15,7 @@ from ui.table_utils import order_columns, configure_grid, set_header_labels, fit
 from sync_service import sync_cards
 from storage_service import (
     get_status_project_counts, get_status_rows, get_status_columns,
-    update_status_record_field,
+    update_status_record_field, PROJECT_TYPE_LABELS,
 )
 from date_utils import get_this_month_range, get_custom_range
 
@@ -193,14 +193,20 @@ class RowsWorker(QObject):
     actually takes."""
     finished = Signal(list)
 
-    def __init__(self, status_key, start_date=None, end_date=None):
+    def __init__(self, status_key, start_date=None, end_date=None, project_type=None):
         super().__init__()
         self.status_key = status_key
         self.start_date = start_date
         self.end_date = end_date
+        self.project_type = project_type
 
     def run(self):
-        self.finished.emit(get_status_rows(self.status_key, start_date=self.start_date, end_date=self.end_date))
+        self.finished.emit(get_status_rows(
+            self.status_key,
+            start_date=self.start_date,
+            end_date=self.end_date,
+            project_type=self.project_type,
+        ))
 
 
 class DashboardPage(QWidget):
@@ -295,6 +301,41 @@ class DashboardPage(QWidget):
 
         period_row.addStretch()
         layout.addLayout(period_row)
+
+        # Project-type row: which division's work the page is showing. Sits
+        # alongside the period picker as a second filter -- both narrow the
+        # SAME query, so the stat cards and the table below always describe
+        # one division within one date window.
+        type_row = QHBoxLayout()
+        type_row.setSpacing(8)
+
+        type_label = QLabel("Project type:")
+        apply_live_style(type_label, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 12px;")
+        type_row.addWidget(type_label)
+
+        # None is "all types" -- the same value storage_service takes for an
+        # unfiltered query, so it needs no special-casing downstream.
+        type_defs = [(None, "All")] + [
+            (project_type, label) for project_type, label in PROJECT_TYPE_LABELS.items()
+        ]
+        self._project_type_group = QButtonGroup(self)
+        self._project_type_group.setExclusive(True)
+        self._selected_project_type = None
+
+        for project_type, label in type_defs:
+            button = QPushButton(label)
+            button.setObjectName("periodToggle")  # same pill styling as the period toggles
+            button.setCheckable(True)
+            button.setChecked(project_type is None)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.toggled.connect(
+                lambda checked, value=project_type: self._on_project_type_changed(value) if checked else None
+            )
+            self._project_type_group.addButton(button)
+            type_row.addWidget(button)
+
+        type_row.addStretch()
+        layout.addLayout(type_row)
 
         # Stat cards - placeholder values, replaced once scan logic is wired later
         stats_row = QHBoxLayout()
@@ -393,6 +434,13 @@ class DashboardPage(QWidget):
         if hasattr(self, "table"):
             self._load_status_rows(selected_key)
 
+    def _on_project_type_changed(self, project_type):
+        self._selected_project_type = project_type
+        if not getattr(self, "_has_scanned", False):
+            return
+        self._refresh_stat_cards()
+        self._load_status_rows(getattr(self, "_selected_status_key", "approve"))
+
     def _on_period_changed(self, *_args):
         # Fires while the widgets are still being constructed (initial
         # setChecked calls, etc.) and on every keystroke/clamp of the date
@@ -430,7 +478,10 @@ class DashboardPage(QWidget):
 
     def _refresh_stat_cards(self):
         start_date, end_date = self._get_selected_period()
-        counts = get_status_project_counts(start_date=start_date, end_date=end_date)
+        counts = get_status_project_counts(
+            start_date=start_date, end_date=end_date,
+            project_type=self._selected_project_type,
+        )
         for key in ("approve", "pending", "reject"):
             if key in self.stat_cards:
                 self.stat_cards[key].set_value(counts.get(key, 0))
@@ -454,7 +505,7 @@ class DashboardPage(QWidget):
 
         start_date, end_date = self._get_selected_period()
         self._rows_thread = QThread(self)
-        self._rows_worker = RowsWorker(status_key, start_date, end_date)
+        self._rows_worker = RowsWorker(status_key, start_date, end_date, self._selected_project_type)
         self._rows_worker.moveToThread(self._rows_thread)
 
         self._rows_thread.started.connect(self._rows_worker.run)
@@ -511,7 +562,10 @@ class DashboardPage(QWidget):
 
         self._rows_loading_overlay.stop()
         if hasattr(self, "table_title"):
-            self.table_title.setText(f"{title} records")
+            type_label = PROJECT_TYPE_LABELS.get(self._selected_project_type)
+            self.table_title.setText(
+                f"{type_label} — {title} records" if type_label else f"{title} records"
+            )
 
         pending_key = getattr(self, "_pending_status_key", None)
         if pending_key is not None:

@@ -48,15 +48,63 @@ STATUS_TABLES = {
     "Rejected": "timecards_rejected",
 }
 
+# The business splits its work into two project types, told apart by the code
+# the project name starts with: "FB..." (FBGIU ...) is Food & Beverage, "HL..."
+# (HLGIU ...) is Hospitality. Each gets its own table (see
+# _rebuild_project_type_tables), holding the approved AND pending entries of
+# that type -- the two statuses that are still live work. Rejected entries
+# belong to neither: they were turned down, so they aren't part of either
+# division's book of work. A project named after neither code (e.g. "Global
+# Customer Support Platform Upgrade") belongs to no division and lands in
+# neither table.
+PROJECT_TYPE_TABLES = {
+    "beverage": "timecards_food_beverage",
+    "hospitality": "timecards_hospitality",
+}
+PROJECT_TYPE_PREFIXES = {
+    "beverage": "FB",
+    "hospitality": "HL",
+}
+PROJECT_TYPE_LABELS = {
+    "beverage": "Food & Beverage",
+    "hospitality": "Hospitality",
+}
+# Which status tables feed the project-type tables, and the value each
+# contributes to their "status" column.
+PROJECT_TYPE_SOURCE_STATUSES = ("Approved", "Pending")
 
-def get_status_project_counts(start_date=None, end_date=None):
+
+def _project_type_clause(project_type):
+    """
+    (sql_fragment, params) restricting a query to one project type, by the
+    code "Project Name" starts with -- case-insensitively, and tolerant of a
+    stray leading space. Returns ("", []) for None or an unknown type, i.e.
+    "all project types", so callers can splice it in unconditionally.
+    """
+    prefix = PROJECT_TYPE_PREFIXES.get(project_type)
+    if prefix is None:
+        return "", []
+    return (
+        f'UPPER(SUBSTR(TRIM("Project Name"), 1, {len(prefix)})) = ?',
+        [prefix.upper()],
+    )
+
+
+def get_status_project_counts(start_date=None, end_date=None, project_type=None):
     """
     Return row counts for approved, pending, and rejected records. When
     start_date/end_date are given, only rows whose "received" timestamp
     falls within [start_date, end_date] are counted (see date_utils for
     building these from a UI period choice) -- mirrors get_status_rows so
     the Dashboard's stat cards and table always agree on the same window.
+
+    project_type ("beverage"/"hospitality", or None for all) narrows the
+    count to one division, by the same project-name rule the project-type
+    tables are built on.
     """
+    where, params = _project_type_clause(project_type)
+    where_sql = f" WHERE {where}" if where else ""
+
     conn = sqlite3.connect(DB_PATH)
     try:
         counts = {}
@@ -69,10 +117,14 @@ def get_status_project_counts(start_date=None, end_date=None):
                 continue
 
             if start_date is None and end_date is None:
-                row = conn.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()
+                row = conn.execute(
+                    f'SELECT COUNT(*) FROM "{table_name}"{where_sql}', params
+                ).fetchone()
                 counts[label.lower()] = row[0] or 0
             else:
-                received_values = conn.execute(f'SELECT received FROM "{table_name}"').fetchall()
+                received_values = conn.execute(
+                    f'SELECT received FROM "{table_name}"{where_sql}', params
+                ).fetchall()
                 counts[label.lower()] = sum(
                     1 for (received,) in received_values if _received_in_range(received, start_date, end_date)
                 )
@@ -107,18 +159,60 @@ def get_status_columns(status_key="approve"):
         conn.close()
 
 
-def get_status_rows(status_key, start_date=None, end_date=None):
+def get_status_rows(status_key, start_date=None, end_date=None, project_type=None):
     """
     Return rows for the selected status table as dictionaries. When
     start_date/end_date are given, only rows whose "received" timestamp
     falls within [start_date, end_date] are returned.
+
+    project_type ("beverage"/"hospitality", or None for all) narrows the
+    rows to one division. For the Approved and Pending statuses that gives
+    exactly what sits in that division's project-type table; Rejected has
+    no such table (rejected work belongs to neither division's book), but
+    the same project-name rule still applies here so the Dashboard can
+    filter all three statuses consistently.
     """
     table_name = STATUS_TABLES.get(_STATUS_LABELS.get(status_key, "Approved"))
     if table_name is None:
         return []
 
+    where, params = _project_type_clause(project_type)
+    where_sql = f" WHERE {where}" if where else ""
+
     conn = sqlite3.connect(DB_PATH)
     try:
+        cursor = conn.execute(
+            f'SELECT * FROM "{table_name}"{where_sql} ORDER BY "Date" ASC, subject ASC',
+            params,
+        )
+        columns = [desc[0] for desc in cursor.description]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        if start_date is not None or end_date is not None:
+            rows = [row for row in rows if _received_in_range(row.get("received"), start_date, end_date)]
+        return rows
+    finally:
+        conn.close()
+
+
+def get_project_type_rows(project_type, start_date=None, end_date=None):
+    """
+    Rows straight out of one project-type table (timecards_food_beverage /
+    timecards_hospitality) -- approved and pending entries of that division
+    together, each carrying a "status" column saying which it is. Unlike
+    get_status_rows this reads the derived table itself, so it's the view
+    to use when the division, not the status, is what's being reported on.
+    """
+    table_name = PROJECT_TYPE_TABLES.get(project_type)
+    if table_name is None:
+        return []
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        if conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
+        ).fetchone() is None:
+            return []
+
         cursor = conn.execute(
             f'SELECT * FROM "{table_name}" ORDER BY "Date" ASC, subject ASC'
         )
@@ -225,6 +319,13 @@ def update_status_record_field(status_key, record_id, column, value):
                 )
         except sqlite3.IntegrityError:
             return False
+        if cursor.rowcount > 0:
+            # The division tables are copies of these rows -- a cell edit here
+            # (a rate typed in, or a "Project Name" corrected, which can move
+            # an entry from one division to the other or out of both) has to be
+            # carried into them now. Waiting for the next scan would leave them
+            # showing the pre-edit value in the meantime.
+            _rebuild_project_type_tables(conn)
         conn.commit()
         return cursor.rowcount > 0
     finally:
@@ -366,6 +467,93 @@ def _create_timecards_table(conn, table_name):
     """)
 
 
+def _create_project_type_table(conn, table_name):
+    # A division's book of live work: the approved and pending entries whose
+    # project name starts with that division's letter, copied out of the two
+    # status tables. status says which of the two an entry came from, and
+    # source_id is its id in that table (the pair is unique -- an entry exists
+    # in exactly one status table at a time, see _save_row).
+    #
+    # It's a copy, not a view, so a division can be queried, exported and
+    # reported on on its own. Nothing writes to it directly: it is emptied and
+    # rebuilt from the status tables on every save (_rebuild_project_type_tables),
+    # which is what keeps it from drifting out of step with them.
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS "{table_name}" (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id INTEGER,
+            status TEXT,
+            day TEXT,
+            "Date" TEXT,
+            labor_type TEXT,
+            time_type TEXT,
+            "Qty" TEXT,
+            "Project Number" TEXT,
+            "Project Name" TEXT,
+            "Task Name" TEXT,
+            name TEXT,
+            period TEXT,
+            person_number TEXT,
+            subject TEXT,
+            sender TEXT,
+            received TEXT,
+            received_month TEXT,
+            is_exported INTEGER DEFAULT 0,
+            rate REAL DEFAULT 0,
+            UNIQUE(status, source_id)
+        )
+    """)
+
+
+# The columns a project-type row carries over from its status table, in the
+# order both the INSERT and the SELECT below use.
+_PROJECT_TYPE_COPIED_COLUMNS = [
+    "day", '"Date"', "labor_type", "time_type", '"Qty"', '"Project Number"',
+    '"Project Name"', '"Task Name"', "name", "period", "person_number",
+    "subject", "sender", "received", "received_month", "is_exported", "rate",
+]
+
+
+def _rebuild_project_type_tables(conn):
+    """
+    Recomputes both project-type tables from scratch out of the Approved and
+    Pending status tables, routing each entry by the first letter of its
+    project name (B -> Food & Beverage, H -> Hospitality).
+
+    Rebuilt rather than appended to: an entry that changes status, gets its
+    project name corrected, or is dropped from its status table entirely
+    would otherwise leave a stale copy behind in the division tables. An
+    entry whose project name starts with neither letter belongs to no
+    division and simply appears in neither table.
+    """
+    for project_type, table_name in PROJECT_TYPE_TABLES.items():
+        # Same rule the Dashboard's project-type filter runs on, so the tables
+        # and the filtered views of the status tables can't disagree.
+        where, where_params = _project_type_clause(project_type)
+        conn.execute(f'DELETE FROM "{table_name}"')
+        for status_label in PROJECT_TYPE_SOURCE_STATUSES:
+            source_table = STATUS_TABLES[status_label]
+            # Only copy the columns the source actually has. A database created
+            # before a column was added to the status tables (received_month is
+            # the live case -- _ensure_columns never backfilled it) still has
+            # rows worth routing into a division; the missing column is simply
+            # left NULL here rather than failing the whole rebuild.
+            source_columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{source_table}")')}
+            copied = [
+                column for column in _PROJECT_TYPE_COPIED_COLUMNS
+                if column.strip('"') in source_columns
+            ]
+            if not copied:
+                continue
+            columns_sql = ", ".join(copied)
+            conn.execute(f"""
+                INSERT INTO "{table_name}" (source_id, status, {columns_sql})
+                SELECT id, ?, {columns_sql}
+                FROM "{source_table}"
+                WHERE {where}
+            """, [status_label, *where_params])
+
+
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -393,6 +581,9 @@ def init_db():
             "name TEXT", "period TEXT", "person_number TEXT",
             "is_exported INTEGER DEFAULT 0", "rate REAL DEFAULT 0",
         ])
+
+    for table_name in PROJECT_TYPE_TABLES.values():
+        _create_project_type_table(conn, table_name)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS timecards_summary (
@@ -460,6 +651,13 @@ def init_db():
             date TEXT
         )
     """)
+
+    # Backfill: the project-type tables are otherwise only written on a save,
+    # so on a database that already holds approved/pending records from before
+    # they existed they'd sit empty until the next scan. Rebuilding here fills
+    # them from what's already stored; on an up-to-date database it recomputes
+    # the same rows, which is harmless.
+    _rebuild_project_type_tables(conn)
 
     conn.commit()
     conn.close()
@@ -839,6 +1037,7 @@ def save_cards(entries: list):
             for row in rows:
                 _save_row(conn, table_name, row)
         _rebuild_summary(conn)
+        _rebuild_project_type_tables(conn)
         _sync_invoice_lines(conn)
         # Comment out the next line to KEEP the invoice line of an entry whose
         # approval was later revoked (it moved to Pending/Rejected), instead of
@@ -876,7 +1075,7 @@ def export_to_csv(output_path="output.csv"):
     print(f"Exported to {output_path}")
 
 
-def export_summary_csv_range(start_date: str, end_date: str, output_path: str) -> int:
+def export_summary_csv_range(start_date: str, end_date: str, output_path: str, project_type=None) -> int:
     """
     Exports approved timecard rows whose "Date" falls within
     [start_date, end_date] (inclusive, both 'YYYY-MM-DD' strings) to a
@@ -884,6 +1083,13 @@ def export_summary_csv_range(start_date: str, end_date: str, output_path: str) -
     "Export date range" buttons. Records the export in export_history,
     same as the other export functions, so it shows up in that list too.
     Returns the number of rows written.
+
+    project_type ("beverage"/"hospitality", or None for every project)
+    narrows the export to one division, by the same project-name rule the
+    project-type tables are built on -- so an export can cover just Food &
+    Beverage or just Hospitality. Only the rows actually written are
+    flagged is_exported, so exporting one division leaves the other's
+    entries still marked un-exported.
 
     Reads timecards_approved rather than timecards_summary so the export
     keeps one row per day, exactly like the Dashboard's records table
@@ -897,13 +1103,16 @@ def export_summary_csv_range(start_date: str, end_date: str, output_path: str) -
     for that flagging and is not written to the CSV; is_exported itself is
     left out of the file too -- it's bookkeeping, not timecard data.
     """
+    type_where, type_params = _project_type_clause(project_type)
+    type_sql = f" AND {type_where}" if type_where else ""
+
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.execute(
         'SELECT id, subject, "Project Number", "Project Name", "Task Name", "Date", "Qty", rate, '
         'day, period, labor_type, time_type, name, person_number, sender, received '
-        'FROM timecards_approved WHERE "Date" >= ? AND "Date" <= ? '
+        f'FROM timecards_approved WHERE "Date" >= ? AND "Date" <= ?{type_sql} '
         'ORDER BY "Date" ASC, subject ASC',
-        (start_date, end_date),
+        [start_date, end_date, *type_params],
     )
     columns = [desc[0] for desc in cursor.description][1:]  # drop id
     rows = cursor.fetchall()
