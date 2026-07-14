@@ -201,7 +201,7 @@ def update_status_record_field(status_key, record_id, column, value):
     constraint rejects (e.g. making a row a duplicate of another).
     """
     table_name = STATUS_TABLES.get(_STATUS_LABELS.get(status_key, "Approved"))
-    if table_name is None or column == "id":
+    if table_name is None or column in ("id", "received_month"):
         return False
 
     conn = sqlite3.connect(DB_PATH)
@@ -210,10 +210,19 @@ def update_status_record_field(status_key, record_id, column, value):
         if column not in valid_columns:
             return False
         try:
-            cursor = conn.execute(
-                f'UPDATE "{table_name}" SET "{column}" = ? WHERE id = ?',
-                (value, record_id),
-            )
+            if column == "received":
+                # received_month is derived from received and is half of what
+                # makes a row unique -- editing one without the other would
+                # leave the row keyed under a month it isn't in.
+                cursor = conn.execute(
+                    f'UPDATE "{table_name}" SET received = ?, received_month = ? WHERE id = ?',
+                    (value, _received_month(value), record_id),
+                )
+            else:
+                cursor = conn.execute(
+                    f'UPDATE "{table_name}" SET "{column}" = ? WHERE id = ?',
+                    (value, record_id),
+                )
         except sqlite3.IntegrityError:
             return False
         conn.commit()
@@ -323,6 +332,12 @@ def get_stale_records(min_age_hours):
 
 
 def _create_timecards_table(conn, table_name):
+    # What makes two entries the SAME entry: the same work day, on the same
+    # project and task, from the same person, received in the same month.
+    # received_month is in the key on purpose -- the same timecard received
+    # in a different month is a separate entry, not a duplicate to overwrite.
+    # It's a stored column rather than an expression because SQLite can't put
+    # substr(received, 1, 7) inside a table-level UNIQUE constraint.
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS "{table_name}" (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -340,47 +355,15 @@ def _create_timecards_table(conn, table_name):
             subject TEXT,
             sender TEXT,
             received TEXT,
+            received_month TEXT,
             is_exported INTEGER DEFAULT 0,
             rate REAL DEFAULT 0,
-            UNIQUE(day, "Project Number", "Task Name", sender)
+            ----UNIQUE(day, "Project Number", "Task Name", sender, received_month)
+            ----UNIQUE(day, "Project Number","Project Name",person_number ,"Task Name", received_month)
+            UNIQUE(day, "Project Number", "Task Name", person_number, received_month)
+
         )
     """)
-
-
-_OLD_UNIQUE_CLAUSE = 'UNIQUE(day, "Project Number", "Task Name", subject, sender)'
-
-
-def _migrate_drop_subject_from_unique(conn, table_name):
-    """
-    subject used to be part of what makes a timecard row "the same" as
-    another. It no longer is (see UNIQUE clause above) -- an existing
-    table built under the old constraint is rebuilt here rather than
-    left behind, so duplicates by the new (day, Project Number, Task
-    Name, sender) key actually get collapsed instead of silently
-    persisting side-by-side under the stale schema.
-    """
-    row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
-    ).fetchone()
-    if row is None or _OLD_UNIQUE_CLAUSE not in row[0]:
-        return  # table doesn't exist yet, or already on the new schema
-
-    backup_name = f"{table_name}_subject_key_backup"
-    conn.execute(f'ALTER TABLE "{table_name}" RENAME TO "{backup_name}"')
-    _create_timecards_table(conn, table_name)
-    # INSERT OR REPLACE, ordered oldest id first, so when two old rows now
-    # collide on the new key, the one from the more recent sync (higher id)
-    # is the one that survives.
-    conn.execute(f"""
-        INSERT OR REPLACE INTO "{table_name}"
-        (id, day, "Date", labor_type, time_type, "Qty", "Project Number", "Project Name",
-         "Task Name", name, period, person_number, subject, sender, received)
-        SELECT id, day, "Date", labor_type, time_type, "Qty", "Project Number", "Project Name",
-               "Task Name", name, period, person_number, subject, sender, received
-        FROM "{backup_name}"
-        ORDER BY id ASC
-    """)
-    conn.execute(f'DROP TABLE "{backup_name}"')
 
 
 def init_db():
@@ -400,12 +383,11 @@ def init_db():
         conn.execute("ALTER TABLE timecards RENAME TO timecards_approved")
 
     for table_name in STATUS_TABLES.values():
-        _migrate_drop_subject_from_unique(conn, table_name)
         _create_timecards_table(conn, table_name)
         # ADD COLUMN with a DEFAULT backfills existing rows with it, so
         # records created before these columns existed start as
         # not-exported / rate 0 rather than NULL. Neither column is in
-        # _upsert_timecards' ON CONFLICT update list, so a re-scan never
+        # _upsert_timecard's ON CONFLICT update list, so a re-scan never
         # resets an is_exported flag or a manually entered rate.
         _ensure_columns(conn, table_name, [
             "name TEXT", "period TEXT", "person_number TEXT",
@@ -539,6 +521,17 @@ def _join_distinct(values) -> str:
     return ", ".join(seen)
 
 
+def _received_month(received: str) -> str:
+    """
+    The 'YYYY-MM' the entry was received in, taken off the front of the raw
+    "received" timestamp. Half of what makes a row unique -- see
+    _create_timecards_table.
+    """
+    if not received:
+        return None
+    return str(received)[:7]
+
+
 def _to_row(entry: dict) -> tuple:
     return (
         entry.get("day"),
@@ -551,11 +544,34 @@ def _to_row(entry: dict) -> tuple:
         entry.get("task"),
         entry.get("name"),
         entry.get("period"),
-        entry.get("person_number"),
+        # Never NULL: person_number is part of the UNIQUE key, and SQLite
+        # counts every NULL as distinct from every other -- one missing
+        # person number would quietly exempt that row from the whole
+        # duplicate/transition rule (and "person_number = NULL" never
+        # matches in _find_existing either). The extractor returns None
+        # whenever a timecard uses the labelled "Person Number: 12345"
+        # layout instead of the bare header its regex expects, so this is
+        # a live case, not a theoretical one.
+        entry.get("person_number") or "",
         entry.get("subject"),
         entry.get("sender"),
         entry.get("received"),
+        _received_month(entry.get("received")),
     )
+
+
+def _row_key(row: tuple) -> tuple:
+    """
+    (day, Project Number, Task Name, person_number, received_month) out of a
+    _to_row tuple -- the status tables' UNIQUE key. It deliberately says
+    nothing about status, so it identifies the same entry across all three
+    of them.
+
+    The entry is keyed by WHOSE timecard it is (person_number), not by who
+    happened to send the email -- the same timecard forwarded by two people
+    is one entry, not two.
+    """
+    return (row[0], row[5], row[7], row[10], row[14])
 
 
 def _rebuild_summary(conn):
@@ -644,43 +660,85 @@ def _sync_invoice_lines(conn):
     """, prepared)
 
 
-def _dedupe_latest_per_key(rows):
+def _prune_invoice_lines(conn):
     """
-    Collapses rows sharing the same (day, Project Number, Task Name,
-    sender) key -- the table's UNIQUE constraint -- down to the one with
-    the latest "received" timestamp.
+    Drops invoice_lines whose timecard is no longer in timecards_approved.
+    An entry whose approval was revoked (it moved to Pending/Rejected -- see
+    _save_row) isn't billable, and leaving its line behind would both invoice
+    it anyway and double-bill it if it were approved again later: the
+    re-approval inserts a fresh timecards_approved row, so _sync_invoice_lines
+    would add a SECOND line beside the orphan.
+    """
+    conn.execute("""
+        DELETE FROM invoice_lines
+        WHERE timecard_id IS NOT NULL
+          AND timecard_id NOT IN (SELECT id FROM timecards_approved)
+    """)
 
-    Without this, a batch handed to executemany() can contain the same
-    logical entry twice (e.g. a stale duplicate/resend alongside the
-    real one): ON CONFLICT DO UPDATE applies rows in list order, so
-    whichever one is LAST in the list wins. Since emails are scanned
-    newest-received-first (see filter_service.get_approved_cards), an
-    OLDER duplicate ends up later in the batch and silently overwrites a
-    NEWER entry's data -- which is exactly backwards.
+
+def _dedupe_latest_across_statuses(grouped):
+    """
+    Collapses entries sharing the same _row_key down to the single
+    latest-received one, ACROSS the status tables they'd otherwise be
+    routed to. Takes and returns a {table_name: [row, ...]} mapping.
+
+    Within one table, a batch can contain the same logical entry twice (a
+    resend alongside the real one) and the last one written would win --
+    but emails are scanned newest-received-first (see filter_service), so
+    an OLDER duplicate lands later in the batch and would overwrite the
+    newer one, exactly backwards. Across tables, one scan can pick up both
+    a Pending email and the Approval that superseded it; only the later of
+    the two is the entry's current state, and letting both through would
+    leave a stale row in the other table.
     """
     best = {}
-    for row in rows:
-        key = (row[0], row[5], row[7], row[12])  # day, Project Number, Task Name, sender
-        received = row[13]
-        existing = best.get(key)
-        if existing is None:
-            best[key] = row
-            continue
-        new_parsed = _parse_received(received)
-        existing_parsed = _parse_received(existing[13])
-        if new_parsed and (existing_parsed is None or new_parsed > existing_parsed):
-            best[key] = row
-    return list(best.values())
+    for table_name, rows in grouped.items():
+        for row in rows:
+            key = _row_key(row)
+            existing = best.get(key)
+            if existing is None:
+                best[key] = (table_name, row)
+                continue
+            new_parsed = _parse_received(row[13])
+            existing_parsed = _parse_received(existing[1][13])
+            if new_parsed and (existing_parsed is None or new_parsed > existing_parsed):
+                best[key] = (table_name, row)
+
+    resolved = {}
+    for table_name, row in best.values():
+        resolved.setdefault(table_name, []).append(row)
+    return resolved
 
 
-def _upsert_timecards(conn, table_name, rows):
-    rows = _dedupe_latest_per_key(rows)
-    conn.executemany(f"""
+def _find_existing(conn, key):
+    """
+    Every stored row matching key, in whichever status table it sits.
+    Returns (table_name, id, received, rate, is_exported) tuples.
+    """
+    found = []
+    for table_name in STATUS_TABLES.values():
+        for row in conn.execute(f"""
+            SELECT id, received, rate, is_exported FROM "{table_name}"
+            WHERE day = ? AND "Project Number" = ? AND "Task Name" = ?
+              AND person_number = ? AND received_month = ?
+        """, key):
+            found.append((table_name, *row))
+    return found
+
+
+def _upsert_timecard(conn, table_name, row):
+    # The ON CONFLICT column list must name exactly the columns of the
+    # table's UNIQUE constraint (see _create_timecards_table) -- SQLite
+    # raises "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
+    # constraint" otherwise. The key columns are not in the DO UPDATE list
+    # (they're what was matched on); sender is, since it's no longer part of
+    # the key and a later forward of the same timecard should refresh it.
+    conn.execute(f"""
         INSERT INTO "{table_name}"
-        (day, "Date", labor_type, time_type, "Qty", "Project Number", "Project Name", "Task Name", name, period, person_number, subject, sender, received)
+        (day, "Date", labor_type, time_type, "Qty", "Project Number", "Project Name", "Task Name", name, period, person_number, subject, sender, received, received_month)
         VALUES
-        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(day, "Project Number", "Task Name", sender) DO UPDATE SET
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(day, "Project Number", "Task Name", person_number, received_month) DO UPDATE SET
             "Date" = excluded."Date",
             labor_type = excluded.labor_type,
             time_type = excluded.time_type,
@@ -688,10 +746,60 @@ def _upsert_timecards(conn, table_name, rows):
             "Project Name" = excluded."Project Name",
             name = excluded.name,
             period = excluded.period,
-            person_number = excluded.person_number,
             subject = excluded.subject,
+            sender = excluded.sender,
             received = excluded.received
-    """, rows)
+    """, row)
+
+
+def _save_row(conn, table_name, row):
+    """
+    Writes one entry into its status table, holding the rule that an entry
+    exists exactly once across the three of them: same day, project, task,
+    person_number and received-MONTH is the same entry, and the latest
+    "received" is its current state.
+
+    So an entry that changes status within a month -- Pending or Rejected
+    -> Approved, an approval later revoked, any direction -- is MOVED: the
+    row is deleted from the table it used to sit in and written to the new
+    one. An entry received in a DIFFERENT month is a different entry and
+    simply coexists; the month is part of the key, so it never collides.
+
+    A row already stored with a LATER "received" than the incoming one is
+    left alone and the incoming row dropped -- re-reading an old Pending
+    email must not undo the Approval that came after it.
+    """
+    key = _row_key(row)
+    incoming = _parse_received(row[13])
+    existing = _find_existing(conn, key)
+
+    for _table, _id, stored_received, _rate, _is_exported in existing:
+        stored = _parse_received(stored_received)
+        if stored is not None and (incoming is None or stored > incoming):
+            return
+
+    # A rate is typed in by hand and is_exported records that the entry went
+    # out in a file; neither is a property of the status it happened to be
+    # sitting under, so they ride along when the entry is moved.
+    carried_rate = 0.0
+    carried_is_exported = 0
+    for other_table, row_id, _received, rate, is_exported in existing:
+        if other_table == table_name:
+            continue  # same table: the upsert below updates it in place
+        carried_rate = carried_rate or (rate or 0)
+        carried_is_exported = max(carried_is_exported, is_exported or 0)
+        conn.execute(f'DELETE FROM "{other_table}" WHERE id = ?', (row_id,))
+
+    _upsert_timecard(conn, table_name, row)
+
+    if carried_rate or carried_is_exported:
+        conn.execute(f"""
+            UPDATE "{table_name}" SET
+                rate = CASE WHEN COALESCE(rate, 0) = 0 THEN ? ELSE rate END,
+                is_exported = CASE WHEN COALESCE(is_exported, 0) = 0 THEN ? ELSE is_exported END
+            WHERE day = ? AND "Project Number" = ? AND "Task Name" = ?
+              AND person_number = ? AND received_month = ?
+        """, (carried_rate, carried_is_exported, *key))
 
 
 def _group_by_status_table(entries):
@@ -718,17 +826,40 @@ def save_card(entry: dict):
 
 
 def save_cards(entries: list):
-    grouped = _group_by_status_table(entries)
+    grouped = _dedupe_latest_across_statuses(_group_by_status_table(entries))
     if not grouped:
         return
 
     conn = sqlite3.connect(DB_PATH)
-    for table_name, rows in grouped.items():
-        _upsert_timecards(conn, table_name, rows)
-    _rebuild_summary(conn)
-    _sync_invoice_lines(conn)
-    conn.commit()
-    conn.close()
+    try:
+        # Row by row rather than executemany: each one has to be weighed
+        # against what's already stored under its key -- possibly in a
+        # different status table -- before it can be written. See _save_row.
+        for table_name, rows in grouped.items():
+            for row in rows:
+                _save_row(conn, table_name, row)
+        _rebuild_summary(conn)
+        _sync_invoice_lines(conn)
+        # Comment out the next line to KEEP the invoice line of an entry whose
+        # approval was later revoked (it moved to Pending/Rejected), instead of
+        # deleting it. The trade either way:
+        #   pruning (current)       -- the line goes, and any Invoice Number /
+        #                              PO / Sales Price typed in by hand goes too.
+        #   keeping (commented out) -- that manual data survives, but the entry
+        #                              is invoiced despite no longer being
+        #                              approved, and if it's ever approved again
+        #                              it is billed TWICE: the re-approval is a
+        #                              new timecards_approved row, so
+        #                              _sync_invoice_lines adds a second line
+        #                              next to the kept one.
+        _prune_invoice_lines(conn)
+        conn.commit()
+    finally:
+        # A raise anywhere above (a bad row, a schema mismatch) would otherwise
+        # leak the connection and leave the database file locked for the rest
+        # of the process -- the sync runs on a QThread, so the UI would keep
+        # hitting a locked db long after the scan died.
+        conn.close()
 
 
 def export_to_csv(output_path="output.csv"):
