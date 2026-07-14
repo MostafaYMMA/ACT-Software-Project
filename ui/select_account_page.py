@@ -13,13 +13,14 @@ scene rather than a hard cut between two different-colored pages.
 import os
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QGridLayout, QLabel, QFrame, QLineEdit, QPushButton,
+    QWidget, QVBoxLayout, QGridLayout, QLabel, QFrame, QPushButton,
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap
 
 from ui.athu import list_accounts, verify_password
 from ui.profile_circle import ProfileCircle
+from ui.password_field import PasswordField
 from ui.theme_utils import apply_live_style
 from ui.theme import (
     COLOR_ACCENT, COLOR_ACCENT_LIGHT, COLOR_TEXT_PRIMARY,
@@ -153,17 +154,8 @@ class SelectAccountPage(QWidget):
         apply_live_style(self._password_label, lambda c: f"color: {c['TEXT_PRIMARY']}; font-size: 13px;")
         password_layout.addWidget(self._password_label)
 
-        self._password_input = QLineEdit()
-        self._password_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self._password_input.setPlaceholderText("Password")
+        self._password_input = PasswordField(placeholder="Password")
         self._password_input.returnPressed.connect(self._confirm_password)
-        apply_live_style(self._password_input, lambda c: f"""
-            QLineEdit {{
-                background-color: {c['BG']}; color: {c['TEXT_PRIMARY']};
-                border: 1px solid {c['BORDER']}; border-radius: 6px; padding: 8px;
-            }}
-            QLineEdit:focus {{ border: 1px solid {c['ACCENT']}; }}
-        """)
         password_layout.addWidget(self._password_input)
 
         self._password_error = QLabel("")
