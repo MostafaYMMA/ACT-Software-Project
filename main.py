@@ -17,6 +17,7 @@ Added: a small floating-logo slide animation, played at two points:
     select_page.page_logo_label)
   - account created/selected -> main window (logo glides into the top
     bar, landing on main_widget.topbar_logo_label)
+
 Both reuse the same _play_logo_slide helper: a floating copy of the
 boot logo animates from its resting boot position to whatever target
 label is passed in, then hides right as the real static logo is
@@ -44,6 +45,9 @@ from ui.app import MainWindow
 from ui.theme_manager import theme_manager
 from ui.transition import FadeStackedWidget, zoom_in
 from storage_service import init_db
+
+
+WELCOME_SPLASH_DURATION_MS = 900
 
 LOGO_SLIDE_ANIM_MS = 550
 
