@@ -172,16 +172,47 @@ class SelectAccountPage(QWidget):
         self._password_error.setAlignment(Qt.AlignmentFlag.AlignCenter)
         password_layout.addWidget(self._password_error)
 
+        # Styled directly here (not via the global primaryButton/
+        # secondaryButton objectName classes) so the text color always
+        # follows the live theme - the global class made "Continue"
+        # readable only in dark mode, since its text color was fixed
+        # white. Border stays the same thin orange in both modes.
         self._confirm_password_btn = QPushButton("Continue")
-        self._confirm_password_btn.setObjectName("primaryButton")
+        self._confirm_password_btn.setObjectName("passwordContinueBtn")
         self._confirm_password_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._confirm_password_btn.clicked.connect(self._confirm_password)
+        apply_live_style(self._confirm_password_btn, lambda c: f"""
+            QPushButton#passwordContinueBtn {{
+                background-color: transparent;
+                color: {c['TEXT_PRIMARY']};
+                border: 1px solid {c['ACCENT']};
+                border-radius: 6px;
+                padding: 8px;
+                font-weight: 600;
+            }}
+            QPushButton#passwordContinueBtn:hover {{
+                background-color: {c['ACCENT_LIGHT']};
+            }}
+        """)
         password_layout.addWidget(self._confirm_password_btn)
 
         self._cancel_password_btn = QPushButton("Back")
-        self._cancel_password_btn.setObjectName("secondaryButton")
+        self._cancel_password_btn.setObjectName("passwordBackBtn")
         self._cancel_password_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._cancel_password_btn.clicked.connect(self._cancel_password)
+        apply_live_style(self._cancel_password_btn, lambda c: f"""
+            QPushButton#passwordBackBtn {{
+                background-color: transparent;
+                color: {c['TEXT_PRIMARY']};
+                border: 1px solid {c['ACCENT']};
+                border-radius: 6px;
+                padding: 8px;
+                font-weight: 600;
+            }}
+            QPushButton#passwordBackBtn:hover {{
+                background-color: {c['ACCENT_LIGHT']};
+            }}
+        """)
         password_layout.addWidget(self._cancel_password_btn)
 
         self._password_card.hide()

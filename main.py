@@ -4,8 +4,9 @@ Entry point. Flow on every launch:
   2. The app then routes to account creation or account selection:
        - No accounts yet on this machine -> AccountCreationPage
        - One or more accounts exist      -> SelectAccountPage
-  3. Once an account is created OR selected -> brief "Welcome back"
-     splash -> MainWindow (the actual dashboard/sidebar app).
+  3. Once an account is created OR selected -> straight into
+     MainWindow (the actual dashboard/sidebar app) - no intermediate
+     "Welcome back" splash step anymore.
 
 This file is the only "traffic cop" - it doesn't contain any account
 logic (that's ui/athu.py) or any page layout (that's the rest of ui/).
@@ -14,8 +15,9 @@ Added: a small floating-logo slide animation, played at two points:
   - boot splash -> select-account page (logo shrinks and glides
     slightly upward, staying centered, landing on
     select_page.page_logo_label)
-  - welcome splash -> main window (logo glides into the top bar,
-    landing on main_widget.topbar_logo_label)
+  - account created/selected -> main window (logo glides into the top
+    bar, landing on main_widget.topbar_logo_label)
+
 Both reuse the same _play_logo_slide helper: a floating copy of the
 boot logo animates from its resting boot position to whatever target
 label is passed in, then hides right as the real static logo is
@@ -38,14 +40,15 @@ from PySide6.QtCore import QTimer, QPoint, QRect, QPropertyAnimation, QEasingCur
 from ui.athu import accounts_exist
 from ui.account_page import AccountCreationPage
 from ui.select_account_page import SelectAccountPage
-from ui.splash_page import SplashPage
 from ui.boot_logo_splash import BootLogoSplash
 from ui.app import MainWindow
 from ui.theme_manager import theme_manager
 from ui.transition import FadeStackedWidget, zoom_in
 from storage_service import init_db
 
+
 WELCOME_SPLASH_DURATION_MS = 900
+
 LOGO_SLIDE_ANIM_MS = 550
 
 
@@ -68,10 +71,6 @@ class RootWindow(QMainWindow):
         # Boot splash - shown first, every launch, no exceptions.
         self.boot_splash = BootLogoSplash()
         self.stack.addWidget(self.boot_splash)
-
-        # Welcome splash - shown right after an account is picked/created.
-        self.welcome_splash = SplashPage(title="Welcome back", title_font_size=26)
-        self.stack.addWidget(self.welcome_splash)
 
         self.account_page = AccountCreationPage()
         self.account_page.account_created.connect(self._on_account_created)
@@ -112,14 +111,10 @@ class RootWindow(QMainWindow):
         self.stack.setCurrentWidget(self.account_page)
 
     def _on_account_created(self, username):
-        self._show_welcome_then_enter(username)
+        self._enter_main_app(username)
 
     def _on_account_selected(self, username):
-        self._show_welcome_then_enter(username)
-
-    def _show_welcome_then_enter(self, username):
-        self.stack.setCurrentWidget(self.welcome_splash)
-        QTimer.singleShot(WELCOME_SPLASH_DURATION_MS, lambda: self._enter_main_app(username))
+        self._enter_main_app(username)
 
     def _enter_main_app(self, username):
         main_widget = MainWindow(username)
