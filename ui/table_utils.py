@@ -7,10 +7,12 @@ axes, and auto-fill the viewport when the columns come up short of it.
 from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QTableWidget
 from PySide6.QtCore import Qt
 
-# "id" is the internal rowid and carries nothing for the user; the preferred
-# order puts the columns people actually scan first, and anything new on the
-# table shows up after them automatically rather than needing to be listed.
-HIDDEN_COLUMNS = {"id", "timecard_id"}
+# "id" is the internal rowid and carries nothing for the user, and
+# "received_month" just restates "received" (it's a column only so it can sit in
+# the status tables' UNIQUE key); the preferred order puts the columns people
+# actually scan first, and anything new on the table shows up after them
+# automatically rather than needing to be listed.
+HIDDEN_COLUMNS = {"id", "timecard_id", "received_month"}
 PREFERRED_COLUMN_ORDER = [
     "status", "subject", "Project Number", "Project Name", "Task Name",
     "Date", "Qty", "rate",
