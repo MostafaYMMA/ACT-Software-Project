@@ -10,6 +10,7 @@ from PySide6.QtCore import Qt, Signal, QThread, QObject, QPropertyAnimation, QEa
 from ui.theme_manager import theme_manager
 from ui.theme_utils import apply_live_style
 from ui.loading_overlay import LoadingOverlay
+from ui.counting_label import CountingLabel
 from ui.table_utils import order_columns, configure_grid, set_header_labels, fit_columns
 from sync_service import sync_cards
 from storage_service import (
@@ -65,7 +66,11 @@ class StatCard(QFrame):
         apply_live_style(label_widget, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 10px;")
         inner.addWidget(label_widget)
 
-        value_widget = QLabel(value)
+        # CountingLabel instead of a plain QLabel: start_loading() below
+        # plays an indeterminate jitter while a scan is in flight,
+        # set_value() below tweens smoothly to the real number once it's
+        # known - see ui/counting_label.py.
+        value_widget = CountingLabel(value)
         apply_live_style(value_widget, lambda c: f"color: {c['TEXT_PRIMARY']}; font-size: 22px; font-weight: 700;")
         inner.addWidget(value_widget)
 
@@ -152,7 +157,19 @@ class StatCard(QFrame):
         super().mousePressEvent(event)
 
     def set_value(self, value):
-        self.value_label.setText(str(value))
+        """Numeric value (int, or a numeric string) -> tween up to it via
+        CountingLabel.animate_to(). Anything else (e.g. the '--' empty-state
+        placeholder) -> shown as static text, no animation."""
+        try:
+            numeric_value = int(value)
+        except (TypeError, ValueError):
+            self.value_label.set_static_text(str(value))
+        else:
+            self.value_label.animate_to(numeric_value)
+
+    def start_loading(self):
+        """Call when a scan starts, before the real count is known."""
+        self.value_label.start_spin()
 
 
 class SyncWorker(QObject):
@@ -546,6 +563,12 @@ class DashboardPage(QWidget):
         self.scan_btn.setText("Scanning...")
         self._has_scanned = False
         self._set_empty_state()
+
+        # Play the indeterminate counting animation on all three cards
+        # while the scan is in flight - _on_sync_finished below lands each
+        # one on its real value once the scan completes.
+        for card in self.stat_cards.values():
+            card.start_loading()
 
         start_date, end_date = self._get_selected_period()
 
