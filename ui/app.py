@@ -5,6 +5,7 @@ and just hands MainWindow a username.
 
 Layout:
   - Top bar: hamburger icon (top-left) + avatar + "Welcome, {name}"
+    + Switch Account button (top-left cluster) + ACT logo (top-right)
   - Sidebar: hidden by default, overlays the content area when the
     mouse hovers near the hamburger icon (or the sidebar itself),
     slides away on mouse-leave after a short delay.
@@ -12,8 +13,11 @@ Layout:
     switched via the sidebar, with a fade transition between them.
 """
 
+import os
+
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QEvent, Signal
+from PySide6.QtGui import QPixmap
 
 from ui.theme_manager import theme_manager
 from ui.theme_utils import apply_live_style
@@ -34,6 +38,13 @@ TOP_BAR_HEIGHT = 68
 HOVER_HIDE_DELAY_MS = 250
 SIDEBAR_ANIM_MS = 200
 NOTIFICATION_POLL_MS = 5 * 60 * 1000  # continuous background check, every 5 minutes
+
+# Top-bar logo (top-right corner). Reuses the same asset as
+# BootLogoSplash. Sized bigger/clearer per request - adjust if it ever
+# looks cramped against TOP_BAR_HEIGHT.
+_ASSETS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
+_TOPBAR_LOGO_PATH = os.path.join(_ASSETS_DIR, "logo.png")
+TOPBAR_LOGO_TARGET_WIDTH = 130
 
 
 class Sidebar(QFrame):
@@ -176,16 +187,45 @@ class MainWindow(QWidget):
             f"font-size: 20px; font-weight: 700; color: {c['TEXT_PRIMARY']};"
         ))
         top_layout.addWidget(welcome)
+        top_layout.addSpacing(16)
 
-        top_layout.addStretch()
-
+        # Switch Account now sits next to the name (left cluster), instead
+        # of the far right - connection/behavior is unchanged.
         switch_account_btn = QPushButton("⇄ Switch Account")
         switch_account_btn.setObjectName("secondaryButton")
         switch_account_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         switch_account_btn.clicked.connect(self.switch_account_requested.emit)
         top_layout.addWidget(switch_account_btn)
 
+        top_layout.addStretch()
+
+        # ACT logo - top-right corner, bigger/clearer. Stored as
+        # self.topbar_logo_label (not a local var) so RootWindow
+        # (main.py) can find its on-screen position and animate a
+        # matching logo into this exact spot during the welcome ->
+        # main-window handoff, without this file needing to know
+        # anything about that animation.
+        self.topbar_logo_label = QLabel()
+        logo_pixmap = self._load_topbar_logo_pixmap()
+        self.topbar_logo_label.setPixmap(logo_pixmap)
+        self.topbar_logo_label.setFixedSize(logo_pixmap.size())
+        top_layout.addWidget(self.topbar_logo_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+
         return top_bar
+
+    @staticmethod
+    def _load_topbar_logo_pixmap():
+        # Same asset/loading approach as BootLogoSplash, just scaled to
+        # fit the top bar.
+        pixmap = QPixmap(_TOPBAR_LOGO_PATH)
+        if pixmap.isNull():
+            return pixmap
+        scaled_height = int(pixmap.height() * (TOPBAR_LOGO_TARGET_WIDTH / pixmap.width()))
+        return pixmap.scaled(
+            TOPBAR_LOGO_TARGET_WIDTH, scaled_height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
 
     # -----------------------------------------------------------------
     # Sidebar positioning + hover show/hide
