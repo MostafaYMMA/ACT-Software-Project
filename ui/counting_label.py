@@ -93,13 +93,31 @@ class CountingLabel(QLabel):
         anim.setStartValue(0)
         anim.setEndValue(target)
         anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        # DeleteWhenStopped destroys the C++ animation as soon as it lands, so
+        # the reference kept below outlives the object it points at. Dropping
+        # it on "finished" is what keeps _stop_landing_anim from later calling
+        # stop() on an animation Qt has already deleted -- that raises
+        # "libshiboken: Internal C++ object already deleted". The signal fires
+        # before the deferred deletion actually runs, so this always gets there
+        # first.
+        anim.finished.connect(self._clear_landing_anim)
         anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
         self._landing_anim = anim  # prevent garbage collection mid-animation
 
+    def _clear_landing_anim(self):
+        self._landing_anim = None
+
     def _stop_landing_anim(self):
-        if self._landing_anim is not None:
+        if self._landing_anim is None:
+            return
+        try:
             self._landing_anim.stop()
-            self._landing_anim = None
+        except RuntimeError:
+            # Already deleted underneath us by some path other than the
+            # finished signal above -- there's nothing left to stop, and the
+            # reference is cleared below either way.
+            pass
+        self._landing_anim = None
 
     def set_static_text(self, text: str):
         """For non-numeric states (e.g. the initial 'no data yet' placeholder
