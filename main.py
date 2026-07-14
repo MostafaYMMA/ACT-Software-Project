@@ -74,6 +74,7 @@ class RootWindow(QMainWindow):
 
         self.account_page = AccountCreationPage()
         self.account_page.account_created.connect(self._on_account_created)
+        self.account_page.back_requested.connect(self._show_select_page)
         self.stack.addWidget(self.account_page)
 
         self.select_page = SelectAccountPage()
@@ -109,6 +110,9 @@ class RootWindow(QMainWindow):
 
     def _show_account_creation(self):
         self.stack.setCurrentWidget(self.account_page)
+
+    def _show_select_page(self):
+        self.stack.setCurrentWidget(self.select_page)
 
     def _on_account_created(self, username):
         self._enter_main_app(username)
