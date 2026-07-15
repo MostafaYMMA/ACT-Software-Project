@@ -652,6 +652,17 @@ def init_db():
         )
     """)
 
+    # A single-row-per-key store for small pieces of app state that must
+    # survive between runs. Currently holds one key, 'last_export_date':
+    # the received-"to" date of the most recent range export, overwritten on
+    # every export so the History page can offer a "From: last export" range.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS app_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
     # Backfill: the project-type tables are otherwise only written on a save,
     # so on a database that already holds approved/pending records from before
     # they existed they'd sit empty until the next scan. Rebuilding here fills
@@ -683,6 +694,37 @@ def get_export_history():
     ).fetchall()
     conn.close()
     return rows
+
+
+def _set_last_export_date(conn, end_date: str):
+    """
+    Overwrites the stored "last export received-to date" with end_date
+    (a 'YYYY-MM-DD' string). Single row, keyed 'last_export_date', so each
+    export replaces the previous value rather than accumulating history --
+    the export_history table already keeps the full log. Takes an open conn
+    so it can ride inside the export's own transaction/commit.
+    """
+    conn.execute(
+        "INSERT INTO app_state (key, value) VALUES ('last_export_date', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (end_date,),
+    )
+
+
+def get_last_export_date():
+    """
+    The received-"to" date ('YYYY-MM-DD') of the most recent range export,
+    or None if nothing has been exported yet. Backs the History page's
+    "From: last export" button, which uses it as the range's start.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT value FROM app_state WHERE key = 'last_export_date'"
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
 
 
 def _received_date_only(received: str) -> str:
@@ -1127,6 +1169,9 @@ def export_summary_csv_range(start_date: str, end_date: str, output_path: str, p
         [(row[0],) for row in rows],
     )
     _record_export(conn, os.path.basename(output_path))
+    # Remember how far this export reached, so the next one can start where
+    # this one left off. Overwritten every export (see _set_last_export_date).
+    _set_last_export_date(conn, end_date)
     conn.commit()
     conn.close()
     print(f"Exported {len(rows)} row(s) ({start_date} to {end_date}) to {output_path}")
