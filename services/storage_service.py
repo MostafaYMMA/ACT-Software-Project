@@ -467,6 +467,68 @@ def _create_timecards_table(conn, table_name):
     """)
 
 
+def _needs_received_month_rebuild(conn, table_name):
+    """
+    True when table_name exists but predates received_month. Such a table was
+    created before the column joined the row key, and can't be patched in place
+    (see _rebuild_status_table_with_received_month). A table that doesn't exist
+    yet returns False -- _create_timecards_table builds it correctly from the
+    start.
+    """
+    columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{table_name}")')}
+    return bool(columns) and "received_month" not in columns
+
+
+def _rebuild_status_table_with_received_month(conn, table_name):
+    """
+    Brings a status table created before received_month existed up to the
+    current schema. received_month is half of the row key and part of the
+    table's UNIQUE constraint, so ALTER TABLE ADD COLUMN can't introduce it:
+    that can't extend a UNIQUE constraint, and _upsert_timecard's ON CONFLICT
+    needs the constraint to match. The table is rebuilt instead -- renamed
+    aside, a fresh one created, existing rows copied over with received_month
+    derived from each row's received timestamp, then the old table dropped.
+
+    Row ids are carried across so invoice_lines.timecard_id links back into the
+    approved table still resolve. When two old rows collapse onto the new
+    (day, project, task, person, month) key, the one with the latest received
+    wins -- the same "newest state is current" rule _save_row enforces.
+    """
+    tmp_name = f"{table_name}__pre_received_month"
+    conn.execute(f'DROP TABLE IF EXISTS "{tmp_name}"')
+    conn.execute(f'ALTER TABLE "{table_name}" RENAME TO "{tmp_name}"')
+    _create_timecards_table(conn, table_name)
+
+    old_columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{tmp_name}")')}
+    new_columns = [row[1] for row in conn.execute(f'PRAGMA table_info("{table_name}")')]
+
+    # Copy every column the new table has that the old one still carries, apart
+    # from received_month, which is derived below rather than copied.
+    carried = [c for c in new_columns if c in old_columns and c != "received_month"]
+    select_exprs = []
+    for column in carried:
+        # person_number is part of the key and must never be NULL (see _to_row);
+        # an old row that predates the column needs a concrete '' instead.
+        if column == "person_number":
+            select_exprs.append("COALESCE(\"person_number\", '')")
+        else:
+            select_exprs.append(f'"{column}"')
+
+    has_received = "received" in old_columns
+    received_select = 'substr("received", 1, 7)' if has_received else "NULL"
+    order_sql = 'ORDER BY "received"' if has_received else ""
+    carried_sql = ", ".join(f'"{c}"' for c in carried)
+    select_sql = ", ".join(select_exprs)
+
+    conn.execute(f"""
+        INSERT OR REPLACE INTO "{table_name}" ({carried_sql}, received_month)
+        SELECT {select_sql}, {received_select}
+        FROM "{tmp_name}"
+        {order_sql}
+    """)
+    conn.execute(f'DROP TABLE IF EXISTS "{tmp_name}"')
+
+
 def _create_project_type_table(conn, table_name):
     # A division's book of live work: the approved and pending entries whose
     # project name starts with that division's letter, copied out of the two
@@ -571,6 +633,11 @@ def init_db():
         conn.execute("ALTER TABLE timecards RENAME TO timecards_approved")
 
     for table_name in STATUS_TABLES.values():
+        # A table created before received_month existed can't be patched in
+        # place (the column is part of the UNIQUE key) -- rebuild it first so
+        # the CREATE/ensure below act on a table that already has the column.
+        if _needs_received_month_rebuild(conn, table_name):
+            _rebuild_status_table_with_received_month(conn, table_name)
         _create_timecards_table(conn, table_name)
         # ADD COLUMN with a DEFAULT backfills existing rows with it, so
         # records created before these columns existed start as
