@@ -18,6 +18,7 @@ from sync_service import sync_cards
 from storage_service import (
     get_status_project_counts, get_status_rows, get_status_columns,
     update_status_record_field, PROJECT_TYPE_LABELS,
+    get_expense_rows, get_expense_count, get_expense_columns,
 )
 from date_utils import get_this_month_range, get_custom_range
 
@@ -401,6 +402,15 @@ class RowsWorker(QObject):
         self.project_type = project_type
 
     def run(self):
+        # "expenses" is a fourth pseudo-status routed to the expenses table
+        # rather than one of the three timecard status tables.
+        if self.status_key == "expenses":
+            self.finished.emit(get_expense_rows(
+                start_date=self.start_date,
+                end_date=self.end_date,
+                project_type=self.project_type,
+            ))
+            return
         self.finished.emit(get_status_rows(
             self.status_key,
             start_date=self.start_date,
@@ -554,6 +564,7 @@ class DashboardPage(QWidget):
             ("approve", "Approved Mails", "#4CAF50"),
             ("pending", "Pending Mails", "#5F5F5F"),
             ("reject", "Rejected Mails", "#f44336"),
+            ("expenses", "Expenses", "#2196F3"),
         ]
         self.stat_cards = {}
         for key, label, stripe_color in stat_defs:
@@ -691,7 +702,7 @@ class DashboardPage(QWidget):
             return False
 
     def _set_empty_state(self):
-        for key in ("approve", "pending", "reject"):
+        for key in ("approve", "pending", "reject", "expenses"):
             if key in self.stat_cards:
                 self.stat_cards[key].set_value("—")
         self.table.setRowCount(0)
@@ -709,6 +720,13 @@ class DashboardPage(QWidget):
         for key in ("approve", "pending", "reject"):
             if key in self.stat_cards:
                 self.stat_cards[key].set_value(counts.get(key, 0))
+        # Expenses live in their own table (not the approve/pending/reject
+        # split), so they're counted separately -- same window & division.
+        if "expenses" in self.stat_cards:
+            self.stat_cards["expenses"].set_value(get_expense_count(
+                start_date=start_date, end_date=end_date,
+                project_type=self._selected_project_type,
+            ))
 
     def _load_status_rows(self, status_key):
         if not getattr(self, "_has_scanned", False):
@@ -746,12 +764,16 @@ class DashboardPage(QWidget):
         # always beats the RuntimeError _is_rows_loading() guards against.
         self._rows_thread = None
 
-    def _columns_for(self, rows):
+    def _columns_for(self, rows, status_key=None):
         """Column keys to show, in display order (see order_columns). With no
         rows to take keys from -- an empty table, before the first scan -- the
         keys come from the DB schema instead, so the headings are the real
-        ones from the start."""
-        return order_columns(list(rows[0]) if rows else get_status_columns())
+        ones from the start. The expenses view has its own schema, so its
+        empty-state headings come from the expenses table, not the timecards."""
+        if rows:
+            return order_columns(list(rows[0]))
+        schema_columns = get_expense_columns() if status_key == "expenses" else get_status_columns()
+        return order_columns(schema_columns)
 
     def _fit_columns(self):
         fit_columns(self.table)
@@ -761,10 +783,11 @@ class DashboardPage(QWidget):
             "approve": "Approved",
             "pending": "Pending",
             "reject": "Rejected",
+            "expenses": "Expenses",
         }
         title = status_labels.get(status_key, "Approved")
 
-        columns = self._columns_for(rows)
+        columns = self._columns_for(rows, status_key)
         self._displayed_columns = columns
         self._displayed_rows = rows
         self._current_status_key = status_key
@@ -778,6 +801,11 @@ class DashboardPage(QWidget):
                     value = row.get(column)
                     item = QTableWidgetItem("" if value is None else str(value))
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    # Expense rows are read-only (see _on_item_changed) -- take
+                    # the edit affordance off the cell so a double-click on the
+                    # expenses grid doesn't open an editor that goes nowhere.
+                    if status_key == "expenses":
+                        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     self.table.setItem(row_index, col_index, item)
         finally:
             self._populating_table = False
@@ -787,9 +815,9 @@ class DashboardPage(QWidget):
         self._rows_loading_overlay.stop()
         if hasattr(self, "table_title"):
             type_label = PROJECT_TYPE_LABELS.get(self._selected_project_type)
-            self.table_title.setText(
-                f"{type_label} — {title} records" if type_label else f"{title} records"
-            )
+            # "Expenses" reads better as "Expense reports" than "Expenses records".
+            noun = "Expense reports" if status_key == "expenses" else f"{title} records"
+            self.table_title.setText(f"{type_label} — {noun}" if type_label else noun)
 
         pending_key = getattr(self, "_pending_status_key", None)
         if pending_key is not None:
@@ -803,6 +831,12 @@ class DashboardPage(QWidget):
         DB rejection -- is rolled back in the cell so the grid never shows a
         value the database doesn't hold."""
         if self._populating_table:
+            return
+
+        # The expenses grid is read-only here -- its rows live in the expenses
+        # table, not the status tables update_status_record_field writes to, so
+        # persisting an edit through that path would target the wrong table.
+        if self._current_status_key == "expenses":
             return
 
         row_index, col_index = item.row(), item.column()

@@ -1,6 +1,9 @@
-from filter_service import get_approved_cards
-from extractor_service import extract
-from storage_service import init_db, save_cards, export_to_csv, export_invoice_lines_to_excel
+from filter_service import get_approved_cards, get_expense_reports
+from extractor_service import extract, extract_expense
+from storage_service import (
+    init_db, save_cards, save_expenses,
+    export_to_csv, export_invoice_lines_to_excel, export_expenses_to_csv,
+)
 
 
 def sync_cards(progress_callback=None, start_date=None, end_date=None):
@@ -47,3 +50,30 @@ def sync_cards(progress_callback=None, start_date=None, end_date=None):
         export_invoice_lines_to_excel()
     else:
         print("Nothing to save.")
+
+    # --- Expense reports: a second, independent scan of the same window ---
+    # (approved expense-report emails, filtered separately from timecards).
+    report("Checking inbox for approved expense reports...")
+    expense_emails = get_expense_reports(
+        limit=None if has_range else 500,
+        start_date=start_date,
+        end_date=end_date,
+        print_report=False,
+    )
+    report(f"Approved expense reports found: {len(expense_emails)}")
+
+    expense_entries = []
+    for email in expense_emails:
+        entries = extract_expense(email)
+        print(f"  - '{email['subject']}' -> {len(entries)} expense line(s)")
+        expense_entries.extend(entries)
+
+    report(f"Total expense line-items extracted: {len(expense_entries)}")
+
+    if expense_entries:
+        report("Saving expenses...")
+        save_expenses(expense_entries)
+        print("Saved expenses to database.")
+        export_expenses_to_csv()
+    else:
+        print("No expenses to save.")
