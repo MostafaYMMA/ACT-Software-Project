@@ -7,6 +7,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QDate
 
 from ui.theme_utils import apply_live_style
+from ui.project_type_settings import project_type_settings
+from storage_service import get_export_history, export_summary_csv_range, PROJECT_TYPE_LABELS
 from storage_service import (
     get_export_history, export_summary_csv_range, get_last_export_date,
     PROJECT_TYPE_LABELS,
@@ -56,22 +58,30 @@ class HistoryPage(QWidget):
         apply_live_style(type_label, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 12px;")
         type_row.addWidget(type_label)
 
-        self._selected_project_type = None
         self._project_type_group = QButtonGroup(self)
         self._project_type_group.setExclusive(True)
+        self._project_type_buttons = {}  # project_type -> button, for the sync handler below
 
         type_defs = [(None, "All")] + list(PROJECT_TYPE_LABELS.items())
         for project_type, label in type_defs:
             button = QPushButton(label)
             button.setObjectName("periodToggle")
             button.setCheckable(True)
-            button.setChecked(project_type is None)
+            # Reflects whatever's already selected (possibly by the
+            # Dashboard, or from a previous session) rather than always
+            # defaulting to "All" regardless of shared state.
+            button.setChecked(project_type == project_type_settings.project_type)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.toggled.connect(
-                lambda checked, value=project_type: self._on_project_type_changed(value) if checked else None
+                lambda checked, value=project_type: self._on_project_type_toggled(value) if checked else None
             )
             self._project_type_group.addButton(button)
+            self._project_type_buttons[project_type] = button
             type_row.addWidget(button)
+
+        # Keeps this page's buttons in lockstep with the Dashboard's
+        # (and vice versa) - toggling one is what fires this, on both pages.
+        project_type_settings.project_type_changed.connect(self._sync_project_type_selection)
 
         type_row.addStretch()
         layout.addLayout(type_row)
@@ -171,8 +181,16 @@ class HistoryPage(QWidget):
     # -----------------------------------------------------------------
     # Export actions
     # -----------------------------------------------------------------
-    def _on_project_type_changed(self, project_type):
-        self._selected_project_type = project_type
+    def _on_project_type_toggled(self, project_type):
+        project_type_settings.set_project_type(project_type)
+
+    def _sync_project_type_selection(self, project_type):
+        """Fires whenever EITHER page's project-type filter changes -
+        including from this page's own toggle above, in which case the
+        matching button is already checked and this is a no-op."""
+        button = self._project_type_buttons.get(project_type)
+        if button is not None:
+            button.setChecked(True)
 
     def _use_last_export_start(self):
         """Set the 'from' date to where the last export reached. The 'to'
@@ -191,7 +209,7 @@ class HistoryPage(QWidget):
         """Filename offered in the save dialog. A division-only export says
         which division it is, so two exports of the same date range don't
         default to the same name."""
-        slug = _FILENAME_SLUGS.get(self._selected_project_type)
+        slug = _FILENAME_SLUGS.get(project_type_settings.project_type)
         prefix = f"timecards_{slug}" if slug else "timecards"
         return f"{prefix}_{start}_to_{end}.csv"
 
@@ -213,7 +231,7 @@ class HistoryPage(QWidget):
         if not path:
             return  # user cancelled
 
-        project_type = self._selected_project_type
+        project_type = project_type_settings.project_type
         row_count = export_summary_csv_range(start, end, path, project_type=project_type)
 
         # "no rows" means something different once a division is selected --
