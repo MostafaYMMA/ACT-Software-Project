@@ -6,6 +6,7 @@ from datetime import datetime
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Border, Side
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE_DIR, "data", "cards.db")
@@ -23,6 +24,19 @@ _DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"
 _PERIOD_PATTERN = re.compile(
     r"from\s+(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})",
     re.IGNORECASE
+)
+
+# --- ACT "Invoice Overview per Period" template constants -------------
+_ACT_HEADERS = [
+    "Date", "Invoice No", "Project Name", "Period", "Task Name", "Project Mgr",
+    "PO", "SOW", "Line", "Type", "Project Number", "Consultant", "Qty",
+    "Sales Price", "Total Amount",
+]
+_ACT_TITLE = "Advanced Computer Technology (Middle East) LABOR and EXPENSE Overview per Period"
+_ACT_PO = "AE110007829"
+_AED_FORMAT = (
+    '_([$AED]\\ * #,##0.00_);_([$AED]\\ * \\(#,##0.00\\);'
+    '_([$AED]\\ * "-"??_);_(@_)'
 )
 
 
@@ -1238,6 +1252,130 @@ def export_summary_csv_range(start_date: str, end_date: str, output_path: str, p
     _record_export(conn, os.path.basename(output_path))
     # Remember how far this export reached, so the next one can start where
     # this one left off. Overwritten every export (see _set_last_export_date).
+    _set_last_export_date(conn, end_date)
+    conn.commit()
+    conn.close()
+    print(f"Exported {len(rows)} row(s) ({start_date} to {end_date}) to {output_path}")
+    return len(rows)
+
+
+def export_act_invoice_overview_range(start_date: str, end_date: str, output_path: str, project_type=None) -> int:
+    """
+    Exports approved timecard rows whose "Date" falls within
+    [start_date, end_date] straight into the ACT "Invoice Overview per
+    Period" template layout (.xlsx) -- same query/filters/bookkeeping as
+    export_summary_csv_range, but the file this produces opens as the
+    proper template instead of a flat CSV.
+
+    Each timecard entry becomes a LABOR row immediately followed by an
+    Expense row, mirroring the template's existing pattern:
+      LABOR row   -> Date, PO (fixed), Line=1, Type=LABOR, Project Number,
+                     Project Name, Period, Task Name, Qty, Sales Price
+                     (=rate), Total Amount (=Qty*Sales Price formula).
+                     Invoice No / Project Mgr / SOW / Consultant are left
+                     blank -- not tracked by this system.
+      Expense row -> nothing but Line=2, Type=Expense, Sales Price=0,
+                     and the Total Amount formula (matches the template's
+                     own blank Expense rows exactly).
+
+    Returns the number of source timecard rows written (i.e. half the
+    number of spreadsheet rows, since each becomes a LABOR+Expense pair).
+    """
+    type_where, type_params = _project_type_clause(project_type)
+    type_sql = f" AND {type_where}" if type_where else ""
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.execute(
+        'SELECT id, "Project Number", "Project Name", "Task Name", "Qty", rate, day, period '
+        f'FROM timecards_approved WHERE "Date" >= ? AND "Date" <= ?{type_sql} '
+        'ORDER BY "Date" ASC, subject ASC',
+        [start_date, end_date, *type_params],
+    )
+    rows = cursor.fetchall()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Billed Invoice Details"
+
+    ws.merge_cells("B2:D2")
+    ws["B2"] = _ACT_TITLE
+
+    header_row = 4
+    for col_offset, header in enumerate(_ACT_HEADERS):
+        cell = ws.cell(row=header_row, column=2 + col_offset, value=header)
+        cell.font = _HEADER_FONT
+        cell.fill = _HEADER_FILL
+
+    r = header_row + 1
+    for _id, project_number, project_name, task_name, qty, rate, day, period in rows:
+        qty_val = float(qty) if qty not in (None, "") else None
+        rate_val = float(rate) if rate not in (None, "") else 0.0
+
+        # LABOR row
+        ws.cell(row=r, column=2, value=day)                 # Date (no year, as extracted)
+        ws.cell(row=r, column=4, value=project_name)         # Project Name
+        ws.cell(row=r, column=5, value=period)               # Period
+        ws.cell(row=r, column=6, value=task_name)            # Task Name
+        ws.cell(row=r, column=8, value=_ACT_PO)              # PO
+        ws.cell(row=r, column=10, value=1)                   # Line
+        ws.cell(row=r, column=11, value="LABOR")              # Type
+        ws.cell(row=r, column=12, value=project_number)      # Project Number
+        ws.cell(row=r, column=14, value=qty_val)              # Qty
+        sp_cell = ws.cell(row=r, column=15, value=rate_val)   # Sales Price
+        sp_cell.number_format = _AED_FORMAT
+        total_cell = ws.cell(row=r, column=16, value=f"=N{r}*O{r}")  # Total Amount
+        total_cell.number_format = _AED_FORMAT
+        r += 1
+
+        # Expense row -- nothing but Line=2, Type, Sales Price=0, Total formula
+        ws.cell(row=r, column=10, value=2)
+        ws.cell(row=r, column=11, value="Expense")
+        sp_cell = ws.cell(row=r, column=15, value=0)
+        sp_cell.number_format = _AED_FORMAT
+        total_cell = ws.cell(row=r, column=16, value=f"=N{r}*O{r}")
+        total_cell.number_format = _AED_FORMAT
+        r += 1
+
+    last_data_row = r - 1
+
+    table = Table(displayName="Table4", ref=f"B{header_row}:P{last_data_row}")
+    table.tableStyleInfo = TableStyleInfo(
+        name="TableStyleMedium23", showRowStripes=True,
+    )
+    ws.add_table(table)
+
+    # Totals block, right after the data
+    t = last_data_row + 1
+    ws.cell(row=t, column=12, value="Total LABOR")
+    ws.cell(row=t, column=14, value="=SUBTOTAL(109,Table4[Qty])")
+    ws.cell(row=t, column=16, value='=SUMIF(Table4[Type],"LABOR",Table4[Total Amount])')
+
+    ws.cell(row=t + 1, column=12, value="Total EXPENSE")
+    ws.cell(row=t + 1, column=16, value='=SUMIF(Table4[Type],"Expense",Table4[Total Amount])')
+
+    ws.cell(row=t + 2, column=12, value="Invoice Total ")
+    ws.cell(row=t + 2, column=16, value=f"=P{t}+P{t + 1}")
+
+    ws.cell(row=t + 3, column=13, value="VAT")
+    ws.cell(row=t + 3, column=16, value=f"=P{t + 2}*0.05")
+
+    ws.cell(row=t + 4, column=13, value="Total with VAT")
+    ws.cell(row=t + 4, column=16, value=f"=P{t + 2}+P{t + 3}")
+
+    for total_row in (t, t + 1, t + 2, t + 3, t + 4):
+        cell = ws.cell(row=total_row, column=16)
+        cell.number_format = _AED_FORMAT
+
+    for col_letter, width in zip("BCDEFGHIJKLMNOP", [12, 11, 30, 16, 30, 13, 14, 8, 6, 8, 14, 14, 7, 13, 15]):
+        ws.column_dimensions[col_letter].width = width
+
+    wb.save(output_path)
+
+    conn.executemany(
+        "UPDATE timecards_approved SET is_exported = 1 WHERE id = ? AND is_exported != 1",
+        [(row[0],) for row in rows],
+    )
+    _record_export(conn, os.path.basename(output_path))
     _set_last_export_date(conn, end_date)
     conn.commit()
     conn.close()

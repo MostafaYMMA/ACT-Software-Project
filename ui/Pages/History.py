@@ -8,9 +8,8 @@ from PySide6.QtCore import Qt, QDate
 
 from ui.theme_utils import apply_live_style
 from ui.project_type_settings import project_type_settings
-from storage_service import get_export_history, export_summary_csv_range, PROJECT_TYPE_LABELS
 from storage_service import (
-    get_export_history, export_summary_csv_range, get_last_export_date,
+    get_export_history, export_act_invoice_overview_range, get_last_export_date,
     PROJECT_TYPE_LABELS,
 )
 
@@ -211,7 +210,7 @@ class HistoryPage(QWidget):
         default to the same name."""
         slug = _FILENAME_SLUGS.get(project_type_settings.project_type)
         prefix = f"timecards_{slug}" if slug else "timecards"
-        return f"{prefix}_{start}_to_{end}.csv"
+        return f"{prefix}_{start}_to_{end}.xlsx"
 
     def _export_last_month(self):
         start, end = _last_month_range()
@@ -227,12 +226,12 @@ class HistoryPage(QWidget):
         self._run_export(start, end, self._default_name(start, end))
 
     def _run_export(self, start, end, default_name):
-        path, _ = QFileDialog.getSaveFileName(self, "Save export as", default_name, "CSV files (*.csv)")
+        path, _ = QFileDialog.getSaveFileName(self, "Save export as", default_name, "Excel files (*.xlsx)")
         if not path:
             return  # user cancelled
 
         project_type = project_type_settings.project_type
-        row_count = export_summary_csv_range(start, end, path, project_type=project_type)
+        row_count = export_act_invoice_overview_range(start, end, path, project_type=project_type)
 
         # "no rows" means something different once a division is selected --
         # there may well be records in the range, just none of that division --
