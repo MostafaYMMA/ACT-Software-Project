@@ -18,8 +18,8 @@ Layout:
 import os
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame
-from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QEvent, Signal, QSize
-from PySide6.QtGui import QPixmap, QColor, QIcon, QPainter
+from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QPointF, QEvent, Signal, QSize, Property
+from PySide6.QtGui import QPixmap, QColor, QPainter
 
 from ui.theme_manager import theme_manager
 from ui.theme_utils import apply_live_style
@@ -48,24 +48,23 @@ NOTIFICATION_POLL_MS = 5 * 60 * 1000  # continuous background check, every 5 min
 _ASSETS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
 _TOPBAR_LOGO_PATH = os.path.join(_ASSETS_DIR, "logo.png")
 TOPBAR_LOGO_TARGET_WIDTH = 130
-SIDEBAR_OSMO_LOGO_TARGET_WIDTH = 62  # smaller than before, sits left-of-center in the panel
-_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
-
-
-def _find_osmo_logo_path():
-    """Looks in assets/ for any image file with "osmo" in its name -
-    deliberately not a fixed filename, since that's what bit us with the
-    font file (saved under a different name than the code expected).
-    Whatever it's actually called, this finds it."""
-    if not os.path.isdir(_ASSETS_DIR):
-        return None
-    for name in sorted(os.listdir(_ASSETS_DIR)):
-        lower = name.lower()
-        if "osmo" in lower and lower.endswith(_IMAGE_EXTENSIONS):
-            return os.path.join(_ASSETS_DIR, name)
-    return None
 RAIL_ICON_PX = 24  # bigger, crisp vector icon - was a 15px text glyph before
+RAIL_ICON_ANIM_MS = 180
 RAIL_LOGO_TARGET_WIDTH = 40  # real ACT logo, tinted white, sized to match the icons
+
+# Per-icon hover targets - each nav icon gets motion that matches what it
+# represents, not one generic effect reused everywhere:
+#   dashboard -> punchy scale "pop", like tiles snapping into place
+#   records   -> smaller lift + a tilt, like picking a single page off a stack
+#   export    -> swings counter-clockwise, like rewinding/turning back time
+#   late      -> a shake, since this icon exists to flag something urgent
+#   settings  -> a real gear-style rotation
+_DASHBOARD_POP_SCALE = 1.22
+_RECORDS_LIFT_SCALE = 1.12
+_RECORDS_TILT_DEG = -8.0
+_HISTORY_REWIND_DEG = -28.0
+_SETTINGS_SPIN_DEG = 90.0
+_LATE_POP_SCALE = 1.12
 
 # Shared vertical rhythm for the rail and the panel: same top margin,
 # same reserved header height, same row height, same spacing between
@@ -93,13 +92,11 @@ def _load_scaled_pixmap(path, target_width):
     )
 
 
-def _tint_pixmap(pixmap, color):
-    """Recolor every non-transparent pixel of pixmap to a solid color,
-    keeping its exact alpha shape. Used to put a colorful logo (tick
-    swoosh, gradient letters, whatever) on a background that needs a
-    single flat color instead - e.g. the ACT mark on the orange rail,
-    or the OSMO mark in dark mode - without needing separate exported
-    assets per color."""
+def _tint_white(pixmap):
+    """Recolor every non-transparent pixel of pixmap to solid white,
+    keeping its exact alpha shape. Used to put the real ACT logo (tick
+    swoosh included) on the orange rail without needing a second,
+    separately-exported white logo asset."""
     if pixmap.isNull():
         return pixmap
     tinted = QPixmap(pixmap.size())
@@ -107,29 +104,34 @@ def _tint_pixmap(pixmap, color):
     painter = QPainter(tinted)
     painter.drawPixmap(0, 0, pixmap)
     painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
-    painter.fillRect(tinted.rect(), QColor(color))
+    painter.fillRect(tinted.rect(), QColor("white"))
     painter.end()
     return tinted
-
-
-def _tint_white(pixmap):
-    """Back-compat wrapper - existing call sites (the rail logo) keep
-    working unchanged."""
-    return _tint_pixmap(pixmap, "white")
 
 
 class IconRailButton(QPushButton):
     """Icon-only nav button used in the always-visible rail. Clicking it
     navigates immediately - hovering the rail is only what reveals the
-    labeled panel next to it, it isn't required to change pages."""
+    labeled panel next to it, it isn't required to change pages.
+
+    The icon is rendered once to a fixed-size base pixmap and then
+    painted through a live QPainter transform (scale + rotation) rather
+    than being re-rasterized at a different pixel size on every hover
+    tick. That transform is what makes rotation possible at all - a
+    plain resize-the-pixmap "pop" (the previous version of this class,
+    and what ui/nav_button.py's NavButton still does) can only ever grow
+    or shrink the icon uniformly, it can't tilt, swing, or shake it.
+    """
 
     def __init__(self, icon_key, key, parent=None):
         super().__init__(parent)
         self.key = key
+        self.icon_key = icon_key
         self.setFixedSize(44, 44)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setIcon(QIcon(render_icon(icon_key, RAIL_ICON_PX)))
-        self.setIconSize(QSize(RAIL_ICON_PX, RAIL_ICON_PX))
+        self._icon_pixmap = render_icon(icon_key, RAIL_ICON_PX)
+        self._icon_scale = 1.0
+        self._icon_rotation = 0.0
         apply_live_style(self, lambda c: f"""
             QPushButton {{
                 border: none; border-radius: 10px; background: transparent;
@@ -138,6 +140,102 @@ class IconRailButton(QPushButton):
                 background-color: {QColor(c['ACCENT']).lighter(125).name()};
             }}
         """)
+
+    # -- animatable properties (icon scale + rotation, degrees) --
+    def _get_icon_scale(self):
+        return self._icon_scale
+
+    def _set_icon_scale(self, value):
+        self._icon_scale = value
+        self.update()
+
+    icon_scale = Property(float, _get_icon_scale, _set_icon_scale)
+
+    def _get_icon_rotation(self):
+        return self._icon_rotation
+
+    def _set_icon_rotation(self, value):
+        self._icon_rotation = value
+        self.update()
+
+    icon_rotation = Property(float, _get_icon_rotation, _set_icon_rotation)
+
+    def paintEvent(self, event):
+        # Background/border/hover-highlight from the QSS above paints
+        # first, exactly as before; the icon is then painted manually on
+        # top through a transform instead of via setIcon(), since
+        # QPushButton's own icon painting has no notion of rotation.
+        super().paintEvent(event)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.translate(self.width() / 2, self.height() / 2)
+        painter.rotate(self._icon_rotation)
+        painter.scale(self._icon_scale, self._icon_scale)
+        pixmap = self._icon_pixmap
+        painter.drawPixmap(QPointF(-pixmap.width() / 2, -pixmap.height() / 2), pixmap)
+        painter.end()
+
+    def _animate_scale(self, target, easing, duration):
+        anim = QPropertyAnimation(self, b"icon_scale", self)
+        anim.setDuration(duration)
+        anim.setStartValue(self._icon_scale)
+        anim.setEndValue(target)
+        anim.setEasingCurve(easing)
+        anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+        self._scale_anim = anim  # prevent garbage collection mid-animation
+
+    def _animate_rotation(self, target, easing, duration):
+        anim = QPropertyAnimation(self, b"icon_rotation", self)
+        anim.setDuration(duration)
+        anim.setStartValue(self._icon_rotation)
+        anim.setEndValue(target)
+        anim.setEasingCurve(easing)
+        anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+        self._rotation_anim = anim  # prevent garbage collection mid-animation
+
+    def _play_shake(self):
+        # Multi-keyframe rotation (not a simple start->end tween) so the
+        # icon actually oscillates rather than moving to one tilted
+        # position - fits "late" specifically, since this is the one
+        # icon meant to read as urgent/attention-grabbing rather than
+        # just responsive.
+        anim = QPropertyAnimation(self, b"icon_rotation", self)
+        anim.setDuration(380)
+        anim.setKeyValueAt(0.0, 0.0)
+        anim.setKeyValueAt(0.15, 12.0)
+        anim.setKeyValueAt(0.35, -12.0)
+        anim.setKeyValueAt(0.55, 7.0)
+        anim.setKeyValueAt(0.75, -4.0)
+        anim.setKeyValueAt(1.0, 0.0)
+        anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+        self._rotation_anim = anim
+
+    def enterEvent(self, event):
+        if self.icon_key == "dashboard":
+            self._animate_scale(_DASHBOARD_POP_SCALE, QEasingCurve.Type.OutBack, RAIL_ICON_ANIM_MS)
+        elif self.icon_key == "records":
+            self._animate_scale(_RECORDS_LIFT_SCALE, QEasingCurve.Type.OutCubic, RAIL_ICON_ANIM_MS)
+            self._animate_rotation(_RECORDS_TILT_DEG, QEasingCurve.Type.OutBack, RAIL_ICON_ANIM_MS)
+        elif self.icon_key == "export":
+            self._animate_rotation(_HISTORY_REWIND_DEG, QEasingCurve.Type.OutBack, RAIL_ICON_ANIM_MS + 60)
+        elif self.icon_key == "late":
+            self._animate_scale(_LATE_POP_SCALE, QEasingCurve.Type.OutBack, 180)
+            self._play_shake()
+        elif self.icon_key == "settings":
+            self._animate_rotation(_SETTINGS_SPIN_DEG, QEasingCurve.Type.InOutQuad, RAIL_ICON_ANIM_MS + 80)
+        else:
+            self._animate_scale(_DASHBOARD_POP_SCALE, QEasingCurve.Type.OutBack, RAIL_ICON_ANIM_MS)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        # One generic reset back to baseline (scale 1, rotation 0) works
+        # for every icon here regardless of which custom animation played
+        # on the way in - none of the hover targets above are meant to
+        # persist.
+        self._animate_scale(1.0, QEasingCurve.Type.OutCubic, RAIL_ICON_ANIM_MS)
+        self._animate_rotation(0.0, QEasingCurve.Type.OutCubic, RAIL_ICON_ANIM_MS)
+        super().leaveEvent(event)
 
 
 class IconRail(QFrame):
@@ -243,30 +341,11 @@ class Sidebar(QFrame):
         layout.setContentsMargins(0, RAIL_TOP_MARGIN, 0, 16)
         layout.setSpacing(ROW_SPACING)
 
-        # Empty spacer's height is preserved exactly (still
-        # HEADER_BLOCK_HEIGHT) so every row below still lines up with
-        # its icon in the rail - only its content changes, from a blank
-        # spacer to the OSMO mark. Tinted white like the rail's ACT
-        # logo, since this panel's background is always the accent
-        # orange regardless of light/dark mode (see #sidebar in
-        # theme.py) - no need to re-tint on theme change.
-        header = QWidget()
-        header.setFixedHeight(HEADER_BLOCK_HEIGHT)
-        header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(18, 0, 0, 0)
-        header_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
-
-        osmo_logo_label = QLabel()
-        osmo_logo_label.setStyleSheet("background: transparent;")
-        osmo_logo_path = _find_osmo_logo_path()
-        if osmo_logo_path:
-            osmo_pixmap = _tint_white(_load_scaled_pixmap(osmo_logo_path, SIDEBAR_OSMO_LOGO_TARGET_WIDTH))
-            if not osmo_pixmap.isNull():
-                osmo_logo_label.setPixmap(osmo_pixmap)
-                osmo_logo_label.setFixedSize(osmo_pixmap.size())
-        header_layout.addWidget(osmo_logo_label, alignment=Qt.AlignmentFlag.AlignVCenter)
-        header_layout.addStretch()
-        layout.addWidget(header)
+        # Empty spacer matching the rail's header block height exactly,
+        # so the first label starts at the same y as the first icon.
+        header_spacer = QWidget()
+        header_spacer.setFixedHeight(HEADER_BLOCK_HEIGHT)
+        layout.addWidget(header_spacer)
 
         for _icon_key, label, key in nav_items:
             row = PanelLabelRow(key, label)
@@ -410,21 +489,6 @@ class MainWindow(QWidget):
         top_layout.addWidget(self.topbar_logo_label, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         return top_bar
-
-    def _update_osmo_logo(self, mode):
-        """Re-tints the OSMO mark for the given theme mode ("light" or
-        "dark") - white in dark mode, its own exported colors in light
-        mode. Connected to theme_manager.theme_changed so it stays in
-        sync if the user toggles theme without restarting."""
-        if self._osmo_logo_base_pixmap.isNull():
-            return
-        pixmap = (
-            _tint_pixmap(self._osmo_logo_base_pixmap, "white")
-            if mode == "dark"
-            else self._osmo_logo_base_pixmap
-        )
-        self.osmo_logo_label.setPixmap(pixmap)
-        self.osmo_logo_label.setFixedSize(pixmap.size())
 
     @staticmethod
     def _load_topbar_logo_pixmap():
