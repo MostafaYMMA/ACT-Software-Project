@@ -81,11 +81,25 @@ class CountingLabel(QLabel):
         self._stop_landing_anim()
 
         target = int(target)
-        self._set_value(0)  # always climbs UP from zero, never down from a guess
+
         if target <= 0:
-            self._set_value(target)
+            # Still play a visible animated drop to 0 (unless already there),
+            # so switching to a project type with zero records also reads as
+            # "the counter re-ran" rather than a silent, unanimated snap.
+            start = self._value
+            if start == 0:
+                return
+            anim = QPropertyAnimation(self, b"displayValue", self)
+            anim.setDuration(MIN_LANDING_MS)
+            anim.setStartValue(start)
+            anim.setEndValue(0)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.finished.connect(self._clear_landing_anim)
+            anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+            self._landing_anim = anim
             return
 
+        self._set_value(0)  # always climbs UP from zero, never down from a guess
         duration = min(MAX_LANDING_MS, max(MIN_LANDING_MS, target * MS_PER_UNIT))
 
         anim = QPropertyAnimation(self, b"displayValue", self)
