@@ -146,6 +146,34 @@ QToolTip {{
     font-size: 12px;
 }}
 
+/* QMessageBox's own text is a QLabel too, so without this it inherits
+   the global QLabel rule above -- fine for TEXT_PRIMARY on the app's own
+   background, but a QMessageBox renders on the native white dialog
+   background regardless of theme, so in dark mode that rule was putting
+   near-white italic text on a white box (unreadable, and the italic
+   display font read oddly for a system dialog). Explicit background +
+   normal weight/family here makes it match the app's palette instead of
+   silently inheriting rules meant for a different background. */
+QMessageBox {{
+    background-color: {colors['SURFACE']};
+}}
+QMessageBox QLabel {{
+    color: {colors['TEXT_PRIMARY']};
+    font-family: {FONT_FAMILY};
+    font-style: normal;
+}}
+QMessageBox QPushButton {{
+    background-color: {colors['ACCENT']};
+    color: {colors['TEXT_ON_ACCENT']};
+    border: none;
+    border-radius: {RADIUS_SM}px;
+    padding: 6px 18px;
+    min-width: 64px;
+}}
+QMessageBox QPushButton:hover {{
+    background-color: {colors['ACCENT_DARK']};
+}}
+
 /* Tag any title/header QLabel with setObjectName("pageTitle") to opt
    it into the display serif - font-size/weight/color set per-label
    are untouched, only the family + italic slant come from here. */

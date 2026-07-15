@@ -18,7 +18,7 @@ Layout:
 import os
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame
-from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QPointF, QEvent, Signal, QSize, Property
+from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QPointF, QEvent, Signal, QSize, Property, QObject
 from PySide6.QtGui import QPixmap, QColor, QPainter
 
 from ui.theme_manager import theme_manager
@@ -51,6 +51,8 @@ TOPBAR_LOGO_TARGET_WIDTH = 130
 RAIL_ICON_PX = 24  # bigger, crisp vector icon - was a 15px text glyph before
 RAIL_ICON_ANIM_MS = 180
 RAIL_LOGO_TARGET_WIDTH = 40  # real ACT logo, tinted white, sized to match the icons
+SIDEBAR_OSMO_LOGO_TARGET_WIDTH = 62  # smaller than the rail mark, sits left-of-center in the panel
+_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 
 # Per-icon hover targets - each nav icon gets motion that matches what it
 # represents, not one generic effect reused everywhere:
@@ -96,7 +98,8 @@ def _tint_white(pixmap):
     """Recolor every non-transparent pixel of pixmap to solid white,
     keeping its exact alpha shape. Used to put the real ACT logo (tick
     swoosh included) on the orange rail without needing a second,
-    separately-exported white logo asset."""
+    separately-exported white logo asset. Also used for the OSMO mark
+    in the sidebar panel, same reasoning."""
     if pixmap.isNull():
         return pixmap
     tinted = QPixmap(pixmap.size())
@@ -107,6 +110,19 @@ def _tint_white(pixmap):
     painter.fillRect(tinted.rect(), QColor("white"))
     painter.end()
     return tinted
+
+
+def _find_osmo_logo_path():
+    """Looks in assets/ for any image file with "osmo" in its name -
+    deliberately not a fixed filename, so however it ends up named on
+    disk, this still finds it."""
+    if not os.path.isdir(_ASSETS_DIR):
+        return None
+    for name in sorted(os.listdir(_ASSETS_DIR)):
+        lower = name.lower()
+        if "osmo" in lower and lower.endswith(_IMAGE_EXTENSIONS):
+            return os.path.join(_ASSETS_DIR, name)
+    return None
 
 
 class IconRailButton(QPushButton):
@@ -132,6 +148,14 @@ class IconRailButton(QPushButton):
         self._icon_pixmap = render_icon(icon_key, RAIL_ICON_PX)
         self._icon_scale = 1.0
         self._icon_rotation = 0.0
+        # Set by MainWindow after both the rail and the labeled panel
+        # exist (see _link_nav_hover) -- lets hovering this button's
+        # PAIRED PanelLabelRow (same nav key, over in the other panel)
+        # play this exact same animation, and lets moving directly
+        # between the two count as one continuous hover instead of a
+        # leave+re-enter. None until wired; enterEvent/leaveEvent fall
+        # back to animating directly so this class still works standalone.
+        self.hover_link = None
         apply_live_style(self, lambda c: f"""
             QPushButton {{
                 border: none; border-radius: 10px; background: transparent;
@@ -211,7 +235,7 @@ class IconRailButton(QPushButton):
         anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
         self._rotation_anim = anim
 
-    def enterEvent(self, event):
+    def play_hover_animation(self):
         if self.icon_key == "dashboard":
             self._animate_scale(_DASHBOARD_POP_SCALE, QEasingCurve.Type.OutBack, RAIL_ICON_ANIM_MS)
         elif self.icon_key == "records":
@@ -226,16 +250,70 @@ class IconRailButton(QPushButton):
             self._animate_rotation(_SETTINGS_SPIN_DEG, QEasingCurve.Type.InOutQuad, RAIL_ICON_ANIM_MS + 80)
         else:
             self._animate_scale(_DASHBOARD_POP_SCALE, QEasingCurve.Type.OutBack, RAIL_ICON_ANIM_MS)
-        super().enterEvent(event)
 
-    def leaveEvent(self, event):
+    def play_leave_animation(self):
         # One generic reset back to baseline (scale 1, rotation 0) works
         # for every icon here regardless of which custom animation played
         # on the way in - none of the hover targets above are meant to
         # persist.
         self._animate_scale(1.0, QEasingCurve.Type.OutCubic, RAIL_ICON_ANIM_MS)
         self._animate_rotation(0.0, QEasingCurve.Type.OutCubic, RAIL_ICON_ANIM_MS)
+
+    def enterEvent(self, event):
+        if self.hover_link is not None:
+            self.hover_link.enter()
+        else:
+            self.play_hover_animation()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if self.hover_link is not None:
+            self.hover_link.leave()
+        else:
+            self.play_leave_animation()
         super().leaveEvent(event)
+
+
+class _NavHoverLink(QObject):
+    """Pairs one IconRailButton with its matching PanelLabelRow (same nav
+    key, different panel) so hovering EITHER one plays the icon's
+    animation, and moving directly from one to the other counts as one
+    continuous hover rather than a leave-then-re-enter.
+
+    Without this, since the rail and the labeled panel are two separate
+    widgets sitting flush against each other, sliding the cursor from an
+    icon to its own label fires that icon's leaveEvent immediately
+    followed by the label's enterEvent -- which would snap the animation
+    back to baseline and immediately replay it, a visible flicker/restart
+    the animation was never meant to do mid-hover. leave() here doesn't
+    commit right away; it waits a short beat, and enter() cancels that
+    wait if it arrives first -- which is exactly what happens when the
+    cursor crosses straight from one paired widget into the other.
+    """
+
+    _LEAVE_DELAY_MS = 80
+
+    def __init__(self, icon_button):
+        super().__init__()
+        self.icon_button = icon_button
+        self._active = False
+        self._leave_timer = QTimer(self)
+        self._leave_timer.setSingleShot(True)
+        self._leave_timer.setInterval(self._LEAVE_DELAY_MS)
+        self._leave_timer.timeout.connect(self._commit_leave)
+
+    def enter(self):
+        self._leave_timer.stop()
+        if not self._active:
+            self._active = True
+            self.icon_button.play_hover_animation()
+
+    def leave(self):
+        self._leave_timer.start()
+
+    def _commit_leave(self):
+        self._active = False
+        self.icon_button.play_leave_animation()
 
 
 class IconRail(QFrame):
@@ -300,6 +378,11 @@ class PanelLabelRow(QFrame):
         self.setFixedHeight(ROW_HEIGHT)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Set by MainWindow after both panels exist (see
+        # _link_nav_hover) -- see _NavHoverLink for why hovering a name
+        # plays its paired icon's animation instead of the label doing
+        # anything on its own.
+        self.hover_link = None
 
         row_layout = QHBoxLayout(self)
         row_layout.setContentsMargins(14, 0, 14, 0)
@@ -319,6 +402,16 @@ class PanelLabelRow(QFrame):
     def mousePressEvent(self, event):
         self.clicked.emit(self.key)
         super().mousePressEvent(event)
+
+    def enterEvent(self, event):
+        if self.hover_link is not None:
+            self.hover_link.enter()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if self.hover_link is not None:
+            self.hover_link.leave()
+        super().leaveEvent(event)
 
 
 class Sidebar(QFrame):
@@ -341,11 +434,29 @@ class Sidebar(QFrame):
         layout.setContentsMargins(0, RAIL_TOP_MARGIN, 0, 16)
         layout.setSpacing(ROW_SPACING)
 
-        # Empty spacer matching the rail's header block height exactly,
-        # so the first label starts at the same y as the first icon.
-        header_spacer = QWidget()
-        header_spacer.setFixedHeight(HEADER_BLOCK_HEIGHT)
-        layout.addWidget(header_spacer)
+        # Header block matching the rail's header height exactly, so the
+        # first label starts at the same y as the first icon - holds the
+        # OSMO mark (tinted white, like the rail's ACT mark) instead of
+        # a blank spacer. Only shows/slides in when the panel itself
+        # does, since it lives in this panel rather than the always-
+        # docked rail.
+        header = QWidget()
+        header.setFixedHeight(HEADER_BLOCK_HEIGHT)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(18, 0, 0, 0)
+        header_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
+        osmo_logo_label = QLabel()
+        osmo_logo_label.setStyleSheet("background: transparent;")
+        osmo_logo_path = _find_osmo_logo_path()
+        if osmo_logo_path:
+            osmo_pixmap = _tint_white(_load_scaled_pixmap(osmo_logo_path, SIDEBAR_OSMO_LOGO_TARGET_WIDTH))
+            if not osmo_pixmap.isNull():
+                osmo_logo_label.setPixmap(osmo_pixmap)
+                osmo_logo_label.setFixedSize(osmo_pixmap.size())
+        header_layout.addWidget(osmo_logo_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+        header_layout.addStretch()
+        layout.addWidget(header)
 
         for _icon_key, label, key in nav_items:
             row = PanelLabelRow(key, label)
@@ -438,6 +549,8 @@ class MainWindow(QWidget):
         self.sidebar.installEventFilter(self)
         self.sidebar.move(-SIDEBAR_WIDTH, 0)
         self.sidebar.raise_()
+
+        self._link_nav_hover()
 
         # Reposition sidebar/stack whenever the content area resizes.
         content_area.resizeEvent = self._on_content_resize
@@ -538,6 +651,19 @@ class MainWindow(QWidget):
     # -----------------------------------------------------------------
     # Page routing
     # -----------------------------------------------------------------
+    def _link_nav_hover(self):
+        """One _NavHoverLink per nav key, shared by that key's
+        IconRailButton (in self.icon_rail) and PanelLabelRow (in
+        self.sidebar) -- see _NavHoverLink for why hovering either one
+        plays the icon's animation, with no flicker when the cursor
+        crosses directly between the two."""
+        for key, icon_button in self.icon_rail.buttons.items():
+            link = _NavHoverLink(icon_button)
+            icon_button.hover_link = link
+            label_row = self.sidebar.buttons.get(key)
+            if label_row is not None:
+                label_row.hover_link = link
+
     def _on_nav_select(self, key):
         self.show_page(key)
 
