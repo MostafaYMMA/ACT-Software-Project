@@ -146,6 +146,23 @@ QToolTip {{
     font-size: 12px;
 }}
 
+/* Tag any title/header QLabel with setObjectName("pageTitle") to opt
+   it into the display serif - font-size/weight/color set per-label
+   are untouched, only the family + italic slant come from here. */
+#pageTitle {{
+    font-family: {DISPLAY_FONT_FAMILY};
+    font-style: italic;
+}}
+
+QToolTip {{
+    background-color: {colors['TEXT_PRIMARY']};
+    color: {colors['BG']};
+    border: none;
+    border-radius: {RADIUS_SM}px;
+    padding: 6px 10px;
+    font-size: 12px;
+}}
+
 #mainWindow {{
     background-color: {colors['BG']};
 }}

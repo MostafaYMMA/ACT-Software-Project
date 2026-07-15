@@ -2,15 +2,24 @@
 Late tab: a brief of every Pending/Rejected record that's been sitting
 for at least the threshold configured in Settings (see
 ui/notification_settings.py), each row saying how long it's been stuck.
+
+Hovering a row reveals a "Send Mail" button; clicking it opens the
+system's default mail client (via a mailto: link, so this works with
+Outlook classic, new Outlook, Mail, Thunderbird, etc.) addressed to
+that record's sender (see _send_mail_for_row).
 """
+
+from urllib.parse import quote
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QTableWidget, QTableWidgetItem, QHeaderView,
+    QPushButton, QMessageBox,
 )
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QBrush
+from PySide6.QtCore import Qt, QEvent, QUrl
+from PySide6.QtGui import QColor, QBrush, QDesktopServices
 
 from ui.theme_utils import apply_live_style
+from ui.theme_manager import theme_manager
 from ui.notification_settings import notification_settings
 from storage_service import get_stale_records
 
@@ -41,9 +50,16 @@ def _format_threshold(hours):
     return f"{int(hours)} hour{'s' if int(hours) != 1 else ''}"
 
 
+_SEND_BUTTON_WIDTH = 110
+_SEND_BUTTON_HEIGHT = 26
+
+
 class LatePage(QWidget):
     def __init__(self):
         super().__init__()
+        self.records = []       # rows currently in the table, aligned by index
+        self._hover_row = None
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 20, 28, 20)
         layout.setSpacing(14)
@@ -75,11 +91,35 @@ class LatePage(QWidget):
         """)
         layout.addWidget(self.table, stretch=1)
 
+        # Overlay button shown over whichever row the mouse is hovering.
+        # Parented to the viewport so it scrolls with the rows and sits on
+        # top of the cell items.
+        self.send_button = QPushButton("Send Mail", self.table.viewport())
+        self.send_button.setFixedSize(_SEND_BUTTON_WIDTH, _SEND_BUTTON_HEIGHT)
+        self.send_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_live_style(self.send_button, lambda c: f"""
+            QPushButton {{
+                background-color: {c['ACCENT']}; color: {c['TEXT_ON_ACCENT']};
+                border: none; border-radius: 4px; font-weight: 600; font-size: 11px;
+            }}
+            QPushButton:hover {{ background-color: {c['ACCENT_DARK']}; }}
+        """)
+        self.send_button.hide()
+        self.send_button.clicked.connect(self._on_send_mail_clicked)
+
+        self.table.setMouseTracking(True)
+        self.table.viewport().setMouseTracking(True)
+        self.table.cellEntered.connect(self._on_cell_entered)
+        self.table.viewport().installEventFilter(self)
+
         self.refresh()
 
     def refresh(self):
         threshold_hours = notification_settings.threshold_hours
         records = get_stale_records(threshold_hours)
+        self.records = records
+        self._hover_row = None
+        self.send_button.hide()
 
         self.subtitle.setText(
             f"Pending or rejected for at least {_format_threshold(threshold_hours)} "
@@ -112,3 +152,67 @@ class LatePage(QWidget):
     def showEvent(self, event):
         self.refresh()
         super().showEvent(event)
+
+    def _on_cell_entered(self, row, column):
+        """Moves the Send Mail button over `row` and shows it, centered
+        horizontally in the middle of the row."""
+        if row < 0 or row >= len(self.records):
+            self.send_button.hide()
+            self._hover_row = None
+            return
+
+        self._hover_row = row
+        viewport_width = self.table.viewport().width()
+        x = max(0, (viewport_width - _SEND_BUTTON_WIDTH) // 2)
+        y = self.table.rowViewportPosition(row) + (self.table.rowHeight(row) - _SEND_BUTTON_HEIGHT) // 2
+        self.send_button.move(x, y)
+        self.send_button.show()
+        self.send_button.raise_()
+
+    def eventFilter(self, obj, event):
+        """Hides the Send Mail button once the mouse leaves the table
+        viewport, so it doesn't linger over a row after the cursor moves
+        away (cellEntered alone only fires when entering a new cell)."""
+        if obj is self.table.viewport() and event.type() == QEvent.Type.Leave:
+            self.send_button.hide()
+            self._hover_row = None
+        return super().eventFilter(obj, event)
+
+    def _on_send_mail_clicked(self):
+        if self._hover_row is None or self._hover_row >= len(self.records):
+            return
+        record = self.records[self._hover_row]
+        self._send_mail_for_row(record)
+
+    def _send_mail_for_row(self, record):
+        """Opens a compose window in whatever mail client is registered
+        as the system default, addressed to this record's sender (the
+        same "sender" column stored for this timecard email in the
+        database), pre-filled with a reply-style subject.
+
+        Uses a mailto: link handed off to QDesktopServices rather than
+        driving Outlook via COM, so it works with Outlook classic, new
+        Outlook, Mail, Thunderbird, or anything else registered as the
+        default mail handler. As with the old approach, this only opens
+        a compose window -- the user reviews/edits and sends it
+        themselves.
+        """
+        sender = (record.get("sender") or "").strip()
+        if not sender:
+            QMessageBox.warning(
+                self, "No sender on file",
+                "This record doesn't have a sender email address stored, so a mail can't be composed."
+            )
+            return
+
+        subject = record.get("subject") or ""
+        reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}" if subject else ""
+
+        mailto_url = f"mailto:{quote(sender)}?subject={quote(reply_subject)}"
+
+        if not QDesktopServices.openUrl(QUrl(mailto_url)):
+            QMessageBox.critical(
+                self, "Couldn't open mail client",
+                "Could not open a compose window in your default mail application. "
+                "Make sure a mail client is installed and set as the system default."
+            )

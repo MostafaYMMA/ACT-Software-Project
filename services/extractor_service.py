@@ -62,6 +62,42 @@ _period_person_pattern = re.compile(
 )
 
 
+# PR_SMTP_ADDRESS MAPI property tag. Used as a fallback to resolve the
+# real SMTP address for Exchange senders, where SenderEmailAddress would
+# otherwise return an internal "/O=.../CN=..." legacyExchangeDN instead
+# of a usable email address.
+_PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
+
+
+def _get_sender_email(mail_item):
+    """Return the sender's actual email address (e.g. someone@gmail.com)
+    instead of their display name.
+
+    - For plain SMTP accounts (Gmail, Outlook.com, IMAP, etc.),
+      SenderEmailAddress already IS the email address.
+    - For Exchange accounts, SenderEmailAddress instead returns an
+      internal legacyExchangeDN string, so we resolve the underlying
+      Exchange user's PrimarySmtpAddress, falling back to the
+      PR_SMTP_ADDRESS MAPI property if that lookup fails.
+    """
+    try:
+        if getattr(mail_item, "SenderEmailType", None) == "EX":
+            try:
+                exch_user = mail_item.Sender.GetExchangeUser()
+                if exch_user and exch_user.PrimarySmtpAddress:
+                    return exch_user.PrimarySmtpAddress
+            except Exception:
+                pass
+            try:
+                return mail_item.PropertyAccessor.GetProperty(_PR_SMTP_ADDRESS)
+            except Exception:
+                pass
+
+        return mail_item.SenderEmailAddress or ""
+    except Exception:
+        return ""
+
+
 def _header_fields(text):
     """Pull the document-level name/period/person-number out of one text
     blob (email body or attachment text). Returns None for any field not
@@ -136,7 +172,10 @@ def extract(email):
     """
     mail_item = email["mail_item"]
     subject = email.get("subject") or ""
-    sender = email.get("sender") or ""
+    # Use the sender's actual email address rather than the display name
+    # (filter_service's "sender" is item.SenderName -- a display name).
+    # Column name stays "sender"; only the value changes.
+    sender = _get_sender_email(mail_item) or email.get("sender") or ""
     received = str(mail_item.ReceivedTime)
     status = email.get("status")
 

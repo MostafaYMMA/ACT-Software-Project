@@ -10,8 +10,8 @@ def sync_cards(progress_callback=None, start_date=None, end_date=None):
     start_date/end_date (optional): restrict the scan to emails whose
     Outlook "received on" time falls within [start_date, end_date]
     (see date_utils for building these from a UI period choice). When
-    both are omitted, behavior is unchanged: the 100 most recently
-    received emails, no date restriction.
+    both are omitted, the 500 most recently received emails are scanned,
+    with no date restriction.
     """
 
     def report(msg):
@@ -25,7 +25,7 @@ def sync_cards(progress_callback=None, start_date=None, end_date=None):
 
     report("Checking inbox for approved timecards...")
     emails = get_approved_cards(
-        limit=None if has_range else 100,
+        limit=None if has_range else 500,
         start_date=start_date,
         end_date=end_date,
     )
