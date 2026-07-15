@@ -90,7 +90,7 @@ class AccountTile(QFrame):
                 border-radius: 12px;
             }}
             AccountTile:hover {{
-                border: 1px solid {COLOR_ACCENT};
+                border: 2px solid {COLOR_ACCENT};
             }}
         """)
 
