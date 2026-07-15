@@ -51,6 +51,8 @@ TOPBAR_LOGO_TARGET_WIDTH = 130
 RAIL_ICON_PX = 24  # bigger, crisp vector icon - was a 15px text glyph before
 RAIL_ICON_ANIM_MS = 180
 RAIL_LOGO_TARGET_WIDTH = 40  # real ACT logo, tinted white, sized to match the icons
+SIDEBAR_OSMO_LOGO_TARGET_WIDTH = 62  # smaller than the rail mark, sits left-of-center in the panel
+_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 
 # Per-icon hover targets - each nav icon gets motion that matches what it
 # represents, not one generic effect reused everywhere:
@@ -96,7 +98,8 @@ def _tint_white(pixmap):
     """Recolor every non-transparent pixel of pixmap to solid white,
     keeping its exact alpha shape. Used to put the real ACT logo (tick
     swoosh included) on the orange rail without needing a second,
-    separately-exported white logo asset."""
+    separately-exported white logo asset. Also used for the OSMO mark
+    in the sidebar panel, same reasoning."""
     if pixmap.isNull():
         return pixmap
     tinted = QPixmap(pixmap.size())
@@ -107,6 +110,19 @@ def _tint_white(pixmap):
     painter.fillRect(tinted.rect(), QColor("white"))
     painter.end()
     return tinted
+
+
+def _find_osmo_logo_path():
+    """Looks in assets/ for any image file with "osmo" in its name -
+    deliberately not a fixed filename, so however it ends up named on
+    disk, this still finds it."""
+    if not os.path.isdir(_ASSETS_DIR):
+        return None
+    for name in sorted(os.listdir(_ASSETS_DIR)):
+        lower = name.lower()
+        if "osmo" in lower and lower.endswith(_IMAGE_EXTENSIONS):
+            return os.path.join(_ASSETS_DIR, name)
+    return None
 
 
 class IconRailButton(QPushButton):
@@ -341,11 +357,29 @@ class Sidebar(QFrame):
         layout.setContentsMargins(0, RAIL_TOP_MARGIN, 0, 16)
         layout.setSpacing(ROW_SPACING)
 
-        # Empty spacer matching the rail's header block height exactly,
-        # so the first label starts at the same y as the first icon.
-        header_spacer = QWidget()
-        header_spacer.setFixedHeight(HEADER_BLOCK_HEIGHT)
-        layout.addWidget(header_spacer)
+        # Header block matching the rail's header height exactly, so the
+        # first label starts at the same y as the first icon - holds the
+        # OSMO mark (tinted white, like the rail's ACT mark) instead of
+        # a blank spacer. Only shows/slides in when the panel itself
+        # does, since it lives in this panel rather than the always-
+        # docked rail.
+        header = QWidget()
+        header.setFixedHeight(HEADER_BLOCK_HEIGHT)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(18, 0, 0, 0)
+        header_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
+        osmo_logo_label = QLabel()
+        osmo_logo_label.setStyleSheet("background: transparent;")
+        osmo_logo_path = _find_osmo_logo_path()
+        if osmo_logo_path:
+            osmo_pixmap = _tint_white(_load_scaled_pixmap(osmo_logo_path, SIDEBAR_OSMO_LOGO_TARGET_WIDTH))
+            if not osmo_pixmap.isNull():
+                osmo_logo_label.setPixmap(osmo_pixmap)
+                osmo_logo_label.setFixedSize(osmo_pixmap.size())
+        header_layout.addWidget(osmo_logo_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+        header_layout.addStretch()
+        layout.addWidget(header)
 
         for _icon_key, label, key in nav_items:
             row = PanelLabelRow(key, label)
