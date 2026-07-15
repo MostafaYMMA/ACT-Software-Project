@@ -13,6 +13,7 @@ from ui.theme_utils import apply_live_style
 from ui.loading_overlay import LoadingOverlay
 from ui.counting_label import CountingLabel
 from ui.table_utils import order_columns, configure_grid, set_header_labels, fit_columns
+from ui.project_type_settings import project_type_settings
 from sync_service import sync_cards
 from storage_service import (
     get_status_project_counts, get_status_rows, get_status_columns,
@@ -519,19 +520,29 @@ class DashboardPage(QWidget):
         ]
         self._project_type_group = QButtonGroup(self)
         self._project_type_group.setExclusive(True)
-        self._selected_project_type = None
+        self._project_type_buttons = {}  # project_type -> button, for the sync handler below
+        # Starts from whatever's already selected (possibly set on the
+        # History page, or from a previous session) instead of always
+        # defaulting to "All" regardless of shared state.
+        self._selected_project_type = project_type_settings.project_type
 
         for project_type, label in type_defs:
             button = QPushButton(label)
             button.setObjectName("periodToggle")  # same pill styling as the period toggles
             button.setCheckable(True)
-            button.setChecked(project_type is None)
+            button.setChecked(project_type == project_type_settings.project_type)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.toggled.connect(
-                lambda checked, value=project_type: self._on_project_type_changed(value) if checked else None
+                lambda checked, value=project_type: self._on_project_type_toggled(value) if checked else None
             )
             self._project_type_group.addButton(button)
+            self._project_type_buttons[project_type] = button
             type_row.addWidget(button)
+
+        # Keeps this page's buttons in lockstep with the Export History
+        # page's (and vice versa) - toggling one is what fires this, on
+        # both pages.
+        project_type_settings.project_type_changed.connect(self._sync_project_type_selection)
 
         type_row.addStretch()
         layout.addLayout(type_row)
@@ -632,6 +643,20 @@ class DashboardPage(QWidget):
             card.set_selected(key == selected_key)
         if hasattr(self, "table"):
             self._load_status_rows(selected_key)
+
+    def _on_project_type_toggled(self, project_type):
+        project_type_settings.set_project_type(project_type)
+
+    def _sync_project_type_selection(self, project_type):
+        """Fires whenever EITHER page's project-type filter changes -
+        including from this page's own toggle above, in which case the
+        matching button is already checked and setChecked(True) is a
+        no-op (QButtonGroup won't re-fire toggled for a button that's
+        already in that state)."""
+        button = self._project_type_buttons.get(project_type)
+        if button is not None:
+            button.setChecked(True)
+        self._on_project_type_changed(project_type)
 
     def _on_project_type_changed(self, project_type):
         self._selected_project_type = project_type
