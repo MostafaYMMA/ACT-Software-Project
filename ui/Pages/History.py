@@ -9,6 +9,10 @@ from PySide6.QtCore import Qt, QDate
 from ui.theme_utils import apply_live_style
 from ui.project_type_settings import project_type_settings
 from storage_service import get_export_history, export_summary_csv_range, PROJECT_TYPE_LABELS
+from storage_service import (
+    get_export_history, export_summary_csv_range, get_last_export_date,
+    PROJECT_TYPE_LABELS,
+)
 
 # Goes into the default filename of a division-only export, so the two
 # divisions' files don't land on top of each other in the save dialog.
@@ -98,6 +102,16 @@ class HistoryPage(QWidget):
         apply_live_style(range_label, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 13px;")
         controls_row.addWidget(range_label)
 
+        # Fills the "from" picker with the received-date the last export
+        # reached, so a follow-up export can start where the previous one left
+        # off (the "to" is still picked by hand). Disabled until something has
+        # been exported -- there's no "last export" to start from yet.
+        self.last_export_btn = QPushButton("From last export")
+        self.last_export_btn.setObjectName("secondaryButton")
+        self.last_export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.last_export_btn.clicked.connect(self._use_last_export_start)
+        controls_row.addWidget(self.last_export_btn)
+
         date_edit_style = lambda c: f"""
             QDateEdit {{
                 border: 1px solid {c['BORDER']};
@@ -178,6 +192,19 @@ class HistoryPage(QWidget):
         if button is not None:
             button.setChecked(True)
 
+    def _use_last_export_start(self):
+        """Set the 'from' date to where the last export reached. The 'to'
+        date is left as-is for the user to choose before Export Range."""
+        last = get_last_export_date()
+        if not last:
+            QMessageBox.information(
+                self, "No previous export",
+                "Nothing has been exported yet, so there's no last-export date to start from.",
+            )
+            return
+        self.from_date.setDate(QDate.fromString(last, "yyyy-MM-dd"))
+        self.status_label.setText(f"Start set to last export date ({last}). Pick a 'to' date and Export Range.")
+
     def _default_name(self, start, end):
         """Filename offered in the save dialog. A division-only export says
         which division it is, so two exports of the same date range don't
@@ -226,6 +253,13 @@ class HistoryPage(QWidget):
     # Export history log
     # -----------------------------------------------------------------
     def refresh(self):
+        last = get_last_export_date()
+        self.last_export_btn.setEnabled(bool(last))
+        self.last_export_btn.setToolTip(
+            f"Start a range from {last} (last export)" if last
+            else "No export has been done yet"
+        )
+
         rows = get_export_history()
         self.table.setRowCount(len(rows))
         for row_index, (name, date_str) in enumerate(rows):

@@ -21,35 +21,42 @@ from PySide6.QtWidgets import QApplication
 
 FONT_FAMILY = "'Segoe UI', 'SF Pro Text', 'Helvetica Neue', Arial, sans-serif"
 
-# Used for every QLabel (titles, "Welcome", sidebar nav text, stat card
-# text) - see the QLabel rule in build_stylesheet(). Tables, buttons,
-# and inputs use different Qt widget types (QTableWidgetItem,
-# QPushButton, QLineEdit/QDateEdit), so they're untouched by this and
-# stay on FONT_FAMILY - dense data stays legible even though labels get
-# the display treatment.
-DISPLAY_FONT_FAMILY = "'Instrument Serif', serif"
+# Fallback until the bundled font actually loads (see below) - if no
+# font file is found, labels just render in a generic serif instead of
+# crashing or silently doing nothing.
+DISPLAY_FONT_FAMILY = "serif"
 
-_DISPLAY_FONT_FILENAME = "InstrumentSerif-Italic.ttf"
 _font_load_attempted = False
+_FONT_EXTENSIONS = (".ttf", ".otf")
 
 
 def _ensure_display_font_loaded():
-    """Registers the bundled display font the first time it's safe to do
-    so (QFontDatabase needs a live QApplication). Self-contained here so
-    no other file needs to import or call anything - if the app hasn't
-    been created yet (e.g. the GLOBAL_STYLESHEET line below, evaluated
-    at import time), this quietly no-ops and retries next call."""
-    global _font_load_attempted
+    """Loads whichever font file is sitting in assets/fonts/ - no fixed
+    filename required. This is what makes "just drop in a different font
+    file" actually work with zero code changes: whatever file is there
+    (any name, .ttf or .otf) gets registered, and DISPLAY_FONT_FAMILY is
+    read back out of its real internal family name.
+    Deferred until a QApplication exists (QFontDatabase needs one) - if
+    called too early (e.g. the GLOBAL_STYLESHEET line at the bottom of
+    this file, evaluated at import time), it quietly no-ops and retries
+    on the next call instead."""
+    global _font_load_attempted, DISPLAY_FONT_FAMILY
     if _font_load_attempted:
         return
     if QApplication.instance() is None:
         return
-    font_path = os.path.join(
+    fonts_dir = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "assets", "fonts", _DISPLAY_FONT_FILENAME,
+        "assets", "fonts",
     )
-    if os.path.exists(font_path):
-        QFontDatabase.addApplicationFont(font_path)
+    if os.path.isdir(fonts_dir):
+        for name in sorted(os.listdir(fonts_dir)):
+            if name.lower().endswith(_FONT_EXTENSIONS):
+                font_id = QFontDatabase.addApplicationFont(os.path.join(fonts_dir, name))
+                families = QFontDatabase.applicationFontFamilies(font_id)
+                if families:
+                    DISPLAY_FONT_FAMILY = f"'{families[0]}', serif"
+                    break
     _font_load_attempted = True
 
 
@@ -81,9 +88,9 @@ LIGHT = {
 }
 
 DARK = {
-    "BG": "#1E1E1E",
-    "SURFACE": "#2A2A28",
-    "SURFACE_ALT": "#252523",
+    "BG": "#000000",
+    "SURFACE": "#0C0C0C",
+    "SURFACE_ALT": "#070707",
     "ACCENT": "#FE5102",
     "ACCENT_DARK": "#DA4602",
     "ACCENT_LIGHT": "#3A2416",
@@ -117,6 +124,7 @@ def build_stylesheet(colors):
     """Builds the global QSS for a given palette dict (LIGHT or DARK).
     Anything styled through these selectors (objectName-based) recolors
     live the instant the app-level stylesheet changes - no rebuild needed."""
+    _ensure_display_font_loaded()
     return f"""
 QWidget {{
     font-family: {FONT_FAMILY};
@@ -125,6 +133,17 @@ QWidget {{
 
 QLabel {{
     color: {colors['TEXT_PRIMARY']};
+    font-family: {DISPLAY_FONT_FAMILY};
+    font-style: italic;
+}}
+
+QToolTip {{
+    background-color: {colors['TEXT_PRIMARY']};
+    color: {colors['BG']};
+    border: none;
+    border-radius: {RADIUS_SM}px;
+    padding: 6px 10px;
+    font-size: 12px;
 }}
 
 /* Tag any title/header QLabel with setObjectName("pageTitle") to opt
