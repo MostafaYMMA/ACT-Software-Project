@@ -12,7 +12,7 @@ import win32com.client
 # Some real subjects/bodies contain characters (emoji, etc.) outside the
 # console's default codepage (cp1252 on Windows) -- without this, the
 # [DEBUG] print of such a subject raises UnicodeEncodeError, which the
-# per-item try/except in get_approved_cards() catches by skipping that
+# per-item try/except in get_matching_emails() catches by skipping that
 # email entirely (silent data loss). main.py already does this same
 # reconfigure when the app is launched normally; repeated here so this
 # module is safe even when run/imported some other way.
@@ -129,7 +129,8 @@ DEBUG = True  # set to False to silence per-email debug prints
 
 
 # ----------------------------------------------------------------------
-# Global counters
+# Global counters (shared by both filters, since they now run in the
+# same pass over the same items).
 # ----------------------------------------------------------------------
 class Counters:
     def __init__(self):
@@ -139,13 +140,14 @@ class Counters:
         self.subjects_with_approved = 0
         self.subjects_matching_logic = 0          # informational only
         self.total_attachments_scanned = 0
-        self.total_matching_attachments = 0        # attachments with >=1 keyword
+        self.total_matching_attachments = 0        # attachments with >=1 timecard keyword
         self.emails_with_attachment_keywords = 0
         self.emails_with_body_keywords = 0
         self.emails_matched_via_body = 0
         self.emails_matched_via_attachment = 0
         self.emails_with_matching_attachment = 0
-        self.total_emails_matched = 0
+        self.total_emails_matched = 0             # timecard filter total
+        self.total_expense_matches = 0             # expense report filter total
 
     def report(self):
         print("\n" + "=" * 70)
@@ -154,16 +156,21 @@ class Counters:
         print(f"Total emails scanned:                     {self.total_emails}")
         print(f"Read emails:                               {self.read_emails}")
         print(f"Unread emails:                             {self.unread_emails}")
-        print(f"Subjects containing 'Approved' (info only):{self.subjects_with_approved}")
-        print(f"Subjects matching logic (info only):       {self.subjects_matching_logic}")
-        print(f"Total attachments scanned (all emails):    {self.total_attachments_scanned}")
-        print(f"Total matching attachments (>=1 keyword):  {self.total_matching_attachments}")
-        print(f"Emails w/ keywords found in attachment:    {self.emails_with_attachment_keywords}")
-        print(f"Emails w/ keywords found in body:          {self.emails_with_body_keywords}")
-        print(f"Emails matched via BODY (strict logic):    {self.emails_matched_via_body}")
-        print(f"Emails matched via ATTACHMENT (keyword):   {self.emails_matched_via_attachment}")
-        print(f"Emails with a MATCHING attachment:         {self.emails_with_matching_attachment}")
-        print(f"TOTAL EMAILS MATCHED (body OR attachment): {self.total_emails_matched}")
+        print("-" * 70)
+        print("Timecard filter:")
+        print(f"  Subjects containing 'Approved' (info only):{self.subjects_with_approved}")
+        print(f"  Subjects matching logic (info only):       {self.subjects_matching_logic}")
+        print(f"  Total attachments scanned (all emails):    {self.total_attachments_scanned}")
+        print(f"  Total matching attachments (>=1 keyword):  {self.total_matching_attachments}")
+        print(f"  Emails w/ keywords found in attachment:    {self.emails_with_attachment_keywords}")
+        print(f"  Emails w/ keywords found in body:          {self.emails_with_body_keywords}")
+        print(f"  Emails matched via BODY (strict logic):    {self.emails_matched_via_body}")
+        print(f"  Emails matched via ATTACHMENT (keyword):   {self.emails_matched_via_attachment}")
+        print(f"  Emails with a MATCHING attachment:         {self.emails_with_matching_attachment}")
+        print(f"  TOTAL EMAILS MATCHED (body OR attachment): {self.total_emails_matched}")
+        print("-" * 70)
+        print("Expense Report filter:")
+        print(f"  TOTAL EXPENSE REPORT MATCHES:              {self.total_expense_matches}")
         print("=" * 70)
 
 
@@ -183,7 +190,7 @@ def words_from_text(text):
 
 
 def find_keywords(text):
-    """Return list of configured keywords found in text (case-insensitive)."""
+    """Return list of configured timecard keywords found in text (case-insensitive)."""
     if not text:
         return []
     found = []
@@ -521,15 +528,20 @@ def extract_text_from_file(filepath):
 
 
 # ----------------------------------------------------------------------
-# Attachment processing
+# Attachment processing -- runs ONCE per attachment per email. Both the
+# timecard filter and the Expense Report filter read from this same
+# result (att["text"]), so each attachment is saved to disk and text-
+# extracted only once, not once per filter.
 # ----------------------------------------------------------------------
 def process_attachment(attachment, temp_dir, counters):
     """
     Save one attachment to disk, extract its text, split it into a
     clean word list (words_from_text), and check whether that word
-    list contains AT LEAST ONE of the KEYWORDS (loose match -- this
-    is what decides an attachment-based email match). Returns a
-    result dict; deletes the temp file before returning.
+    list contains AT LEAST ONE of the timecard KEYWORDS (loose match --
+    this is what decides an attachment-based timecard match). The full
+    extracted text is also kept in the result so the Expense Report
+    filter can reuse it without re-extracting. Deletes the temp file
+    before returning.
     """
     result = {
         "filename": None,
@@ -537,7 +549,7 @@ def process_attachment(attachment, temp_dir, counters):
         "keywords_found": [],
         "text": "",
         "word_count": 0,
-        "matches_keyword": False,   # True if ANY keyword found
+        "matches_keyword": False,   # True if ANY timecard keyword found
     }
 
     filename = None
@@ -585,136 +597,35 @@ def process_attachment(attachment, temp_dir, counters):
     return result
 
 
-def extract_attachment_text_only(attachment, temp_dir):
-    """
-    Same save-to-disk / extract / cleanup flow as process_attachment(),
-    but returns just (filename, extracted_text) with no dependency on
-    the timecard Counters object or KEYWORDS list. Used by the
-    Expense Report scan so it stays independent of the timecard logic.
-    """
-    filename = None
-    saved_path = None
-    text = ""
-    try:
-        filename = attachment.FileName
-        safe_name = f"{abs(hash(filename))}_{filename}"
-        saved_path = os.path.join(temp_dir, safe_name)
-        attachment.SaveAsFile(saved_path)
-        text = extract_text_from_file(saved_path)
-    except Exception:
-        traceback.print_exc()
-    finally:
-        if saved_path and os.path.exists(saved_path):
-            try:
-                os.remove(saved_path)
-            except Exception:
-                traceback.print_exc()
-    return filename, text
-
-
-def process_email_expense(item, temp_dir):
-    """
-    Process a single MailItem for the Expense Report filter.
-
-    MATCH RULE (all three required, checked against subject + body +
-    every attachment's extracted text combined):
-        "Expense Report", "Approved", "Project"
-
-    Returns a dict describing the matched email (subject, sender,
-    received, where each required term was found) if all three terms
-    are present somewhere in the email, or None if not matched.
-    """
-    subject = getattr(item, "Subject", "") or ""
-
-    try:
-        sender = item.SenderName
-    except Exception:
-        sender = "(unknown sender)"
-
-    try:
-        received = item.ReceivedTime
-    except Exception:
-        received = "(unknown date)"
-
-    try:
-        body = item.Body or ""
-    except Exception:
-        body = ""
-
-    attachment_texts = []
-    try:
-        attachments = item.Attachments
-        for i in range(1, attachments.Count + 1):
-            att_filename, att_text = extract_attachment_text_only(attachments.Item(i), temp_dir)
-            if att_text:
-                attachment_texts.append((att_filename, att_text))
-    except Exception:
-        traceback.print_exc()
-
-    combined_text = "\n".join([subject, body] + [t for _, t in attachment_texts])
-
-    is_matched, terms_found = matches_expense_logic(combined_text)
-
-    if DEBUG:
-        print(f"[DEBUG][Expense] Subject: '{subject}' | terms_found={terms_found} | "
-              f"matched={is_matched}")
-
-    if not is_matched:
-        return None
-
-    # Where each required term showed up, for reporting.
-    term_locations = []
-    for term, pattern in EXPENSE_TERM_PATTERNS:
-        found_in = []
-        if pattern.search(subject):
-            found_in.append("Subject")
-        if pattern.search(body):
-            found_in.append("Body")
-        for att_filename, att_text in attachment_texts:
-            if pattern.search(att_text):
-                found_in.append(f"Attachment '{att_filename}'")
-        term_locations.append((term, found_in))
-
-    print(f"\n>>> EXPENSE REPORT MATCH: {subject}")
-    print("-" * 70)
-    print(f"Subject:   {subject}")
-    print(f"Sender:    {sender}")
-    print(f"Received:  {received}")
-    print("Required terms found in:")
-    for term, found_in in term_locations:
-        print(f"    - {term}: {', '.join(found_in) if found_in else '(not found here)'}")
-    print("-" * 70)
-
-    return {
-        "subject": subject,
-        "sender": sender,
-        "received": received,
-        "terms_found": terms_found,
-        "term_locations": term_locations,
-        "mail_item": item,
-    }
-
-
 # ----------------------------------------------------------------------
-# Email processing
+# Email processing -- SINGLE per-email entry point used by the single
+# folder-scanning pass below. Subject/body/attachments are read and
+# extracted exactly once per email, and the result is evaluated against
+# BOTH the timecard filter and the Expense Report filter.
 # ----------------------------------------------------------------------
-def process_email(item, temp_dir, counters):
+def process_email_combined(item, temp_dir, counters):
     """
-    Process a single MailItem. Every attachment is opened and scanned
-    regardless of subject content.
+    Process a single MailItem against both filters:
 
-    MATCH RULE:
+    TIMECARD MATCH RULE (unchanged from the original single-purpose
+    scanner):
       - Subject alone NEVER triggers a match (informational only).
       - BODY triggers a match only via the STRICT logic
         (approved_pattern AND subject_pattern both present).
       - ATTACHMENT triggers a match if its word list contains AT
         LEAST ONE keyword from KEYWORDS (loose match).
 
+    EXPENSE REPORT MATCH RULE:
+      - ALL of "Expense Report", "Approved", "Project" must appear
+        somewhere across subject + body + attachment text combined.
+
+    Every attachment is opened and text-extracted only once; both
+    filters reuse that same extracted text.
+
     Returns:
-        A dict describing the matched email (with all the detail
-        needed for reporting) if this email matched, or None if it
-        did not match. This return value is what get_approved_cards()
-        collects into its matching_emails list.
+        (timecard_match, expense_match) -- each is either the matched-
+        email dict (same shape as the original single-purpose
+        scanners produced) or None if that filter didn't match.
     """
     counters.total_emails += 1
 
@@ -763,7 +674,7 @@ def process_email(item, temp_dir, counters):
     if found_in_body:
         counters.emails_with_body_keywords += 1
 
-    # --- BODY match uses the STRICT approval logic ---
+    # --- BODY match uses the STRICT timecard approval logic ---
     body_approval_match = matches_approval_logic(body)
 
     if DEBUG:
@@ -771,7 +682,7 @@ def process_email(item, temp_dir, counters):
 
     subject_keywords = find_keywords(subject)
 
-    # --- ALWAYS open every attachment ---
+    # --- ALWAYS open every attachment, exactly once ---
     attachment_results = []
     found_in_attachment = False
     attachment_keyword_match = False
@@ -796,118 +707,164 @@ def process_email(item, temp_dir, counters):
     if attachment_keyword_match:
         counters.emails_with_matching_attachment += 1
 
-    # --- FINAL MATCH DECISION: body (strict) OR attachment (loose keyword) ---
-    is_matched = body_approval_match or attachment_keyword_match
-    if not is_matched:
-        return None  # not a match -- skip reporting, nothing to collect
+    # ============================================================
+    # TIMECARD FILTER DECISION: body (strict) OR attachment (loose)
+    # ============================================================
+    timecard_is_matched = body_approval_match or attachment_keyword_match
+    timecard_match = None
 
-    counters.total_emails_matched += 1
-    if body_approval_match:
-        counters.emails_matched_via_body += 1
-    if attachment_keyword_match:
-        counters.emails_matched_via_attachment += 1
+    if timecard_is_matched:
+        counters.total_emails_matched += 1
+        if body_approval_match:
+            counters.emails_matched_via_body += 1
+        if attachment_keyword_match:
+            counters.emails_matched_via_attachment += 1
 
-    status = detect_status(subject, body)
-    if status is None:
-        # Some matched emails (e.g. forwarded invoices) carry the actual
-        # Approved/Pending/Rejected word only inside a matching
-        # attachment's own text, not in the email's own subject/body --
-        # detect_status() can't see that on its own. Without this
-        # fallback, extract() would tag every entry from that email
-        # status=None and save_cards() would silently drop all of them.
+        status = detect_status(subject, body)
+        if status is None:
+            # Some matched emails (e.g. forwarded invoices) carry the actual
+            # Approved/Pending/Rejected word only inside a matching
+            # attachment's own text, not in the email's own subject/body --
+            # detect_status() can't see that on its own. Without this
+            # fallback, extract() would tag every entry from that email
+            # status=None and save_cards() would silently drop all of them.
+            for att in attachment_results:
+                if att.get("keywords_found"):
+                    status = detect_status("", att.get("text") or "")
+                    if status:
+                        break
+
+        matched_via = []
+        if body_approval_match:
+            matched_via.append("BODY (strict logic)")
+        if attachment_keyword_match:
+            matched_via.append("ATTACHMENT (keyword match)")
+
+        print(f"\n>>> MATCHED EMAIL SUBJECT (Timecard): {subject}")
+        print("-" * 70)
+        print(f"Subject:          {subject}")
+        print(f"Sender:           {sender}")
+        print(f"Received:         {received}")
+        print(f"Matched via:      {' + '.join(matched_via)}")
+        print(f"(Subject alone matched approval logic: {subject_would_have_matched} "
+              f"-- informational only, did not cause this match)")
+
+        locations = []
+        if subject_keywords:
+            locations.append(f"Subject ({', '.join(subject_keywords)})")
+        if found_in_body:
+            locations.append(f"Body ({', '.join(body_keywords)})")
         for att in attachment_results:
-            if att.get("keywords_found"):
-                status = detect_status("", att.get("text") or "")
-                if status:
-                    break
-
-    matched_via = []
-    if body_approval_match:
-        matched_via.append("BODY (strict logic)")
-    if attachment_keyword_match:
-        matched_via.append("ATTACHMENT (keyword match)")
-
-    # --- Print the matched subject clearly ---
-    print(f"\n>>> MATCHED EMAIL SUBJECT: {subject}")
-
-    print("-" * 70)
-    print(f"Subject:          {subject}")
-    print(f"Sender:           {sender}")
-    print(f"Received:         {received}")
-    print(f"Matched via:      {' + '.join(matched_via)}")
-    print(f"(Subject alone matched approval logic: {subject_would_have_matched} "
-          f"-- informational only, did not cause this match)")
-
-    locations = []
-    if subject_keywords:
-        locations.append(f"Subject ({', '.join(subject_keywords)})")
-    if found_in_body:
-        locations.append(f"Body ({', '.join(body_keywords)})")
-    for att in attachment_results:
-        if att["keywords_found"]:
-            locations.append(
-                f"Attachment '{att['filename']}' [{att['filetype']}] "
-                f"({', '.join(att['keywords_found'])})"
-            )
-
-    if locations:
-        print("Keywords found in:")
-        for loc in locations:
-            print(f"    - {loc}")
-    else:
-        print("Keywords found in: (none)")
-
-    # --- Attachments processed summary ---
-    if attachment_results:
-        print("Attachments processed:")
-        for att in attachment_results:
-            flag = " <-- MATCHED (keyword)" if att["matches_keyword"] else ""
-            print(f"    - {att['filename']} ({att['filetype']}, {att['word_count']} words){flag}")
-    else:
-        print("Attachments processed: (none)")
-
-    # --- Full breakdown: every attachment name + every keyword found in it ---
-    print("Attachment name -> keywords found (detailed):")
-    if attachment_results:
-        for att in attachment_results:
-            name = att["filename"] if att["filename"] else "(unknown filename)"
             if att["keywords_found"]:
-                kw_list = ", ".join(att["keywords_found"])
-            else:
-                kw_list = "(no keywords found)"
-            print(f"    - {name}: {kw_list}")
-    else:
-        print("    (no attachments on this email)")
+                locations.append(
+                    f"Attachment '{att['filename']}' [{att['filetype']}] "
+                    f"({', '.join(att['keywords_found'])})"
+                )
 
-    print("-" * 70)
+        if locations:
+            print("Keywords found in:")
+            for loc in locations:
+                print(f"    - {loc}")
+        else:
+            print("Keywords found in: (none)")
 
-    # Build and return the record for this matched email.
-    matched_email = {
-        "subject": subject,
-        "sender": sender,
-        "received": received,
-        "status": status,                    # "Approved" / "Pending" / "Rejected" / None
-        "matched_via": matched_via,          # e.g. ["BODY (strict logic)"]
-        "matched_via_body": body_approval_match,
-        "matched_via_attachment": attachment_keyword_match,
-        "subject_keywords": subject_keywords,
-        "body_keywords": body_keywords,
-        "keyword_locations": locations,
-        "attachments": [
-            {
-                "filename": att["filename"],
-                "filetype": att["filetype"],
-                "word_count": att["word_count"],
-                "keywords_found": att["keywords_found"],
-                "matches_keyword": att["matches_keyword"],
-                "text": att["text"],
-            }
-            for att in attachment_results
-        ],
-        "mail_item": item,  # raw Outlook MailItem, in case caller needs it
-    }
+        if attachment_results:
+            print("Attachments processed:")
+            for att in attachment_results:
+                flag = " <-- MATCHED (keyword)" if att["matches_keyword"] else ""
+                print(f"    - {att['filename']} ({att['filetype']}, {att['word_count']} words){flag}")
+        else:
+            print("Attachments processed: (none)")
 
-    return matched_email
+        print("Attachment name -> keywords found (detailed):")
+        if attachment_results:
+            for att in attachment_results:
+                name = att["filename"] if att["filename"] else "(unknown filename)"
+                if att["keywords_found"]:
+                    kw_list = ", ".join(att["keywords_found"])
+                else:
+                    kw_list = "(no keywords found)"
+                print(f"    - {name}: {kw_list}")
+        else:
+            print("    (no attachments on this email)")
+
+        print("-" * 70)
+
+        timecard_match = {
+            "subject": subject,
+            "sender": sender,
+            "received": received,
+            "status": status,                    # "Approved" / "Pending" / "Rejected" / None
+            "matched_via": matched_via,          # e.g. ["BODY (strict logic)"]
+            "matched_via_body": body_approval_match,
+            "matched_via_attachment": attachment_keyword_match,
+            "subject_keywords": subject_keywords,
+            "body_keywords": body_keywords,
+            "keyword_locations": locations,
+            "attachments": [
+                {
+                    "filename": att["filename"],
+                    "filetype": att["filetype"],
+                    "word_count": att["word_count"],
+                    "keywords_found": att["keywords_found"],
+                    "matches_keyword": att["matches_keyword"],
+                    "text": att["text"],
+                }
+                for att in attachment_results
+            ],
+            "mail_item": item,  # raw Outlook MailItem, in case caller needs it
+        }
+
+    # ============================================================
+    # EXPENSE REPORT FILTER DECISION: ALL required terms present,
+    # reusing the SAME attachment_results extracted above (no
+    # second SaveAsFile / extract_text_from_file pass).
+    # ============================================================
+    combined_text = "\n".join(
+        [subject, body] + [att["text"] for att in attachment_results if att.get("text")]
+    )
+    expense_is_matched, expense_terms_found = matches_expense_logic(combined_text)
+    expense_match = None
+
+    if DEBUG:
+        print(f"        [DEBUG] Expense terms_found={expense_terms_found} | "
+              f"matched={expense_is_matched}")
+
+    if expense_is_matched:
+        counters.total_expense_matches += 1
+
+        term_locations = []
+        for term, pattern in EXPENSE_TERM_PATTERNS:
+            found_in = []
+            if pattern.search(subject):
+                found_in.append("Subject")
+            if pattern.search(body):
+                found_in.append("Body")
+            for att in attachment_results:
+                if att.get("text") and pattern.search(att["text"]):
+                    found_in.append(f"Attachment '{att['filename']}'")
+            term_locations.append((term, found_in))
+
+        print(f"\n>>> EXPENSE REPORT MATCH: {subject}")
+        print("-" * 70)
+        print(f"Subject:   {subject}")
+        print(f"Sender:    {sender}")
+        print(f"Received:  {received}")
+        print("Required terms found in:")
+        for term, found_in in term_locations:
+            print(f"    - {term}: {', '.join(found_in) if found_in else '(not found here)'}")
+        print("-" * 70)
+
+        expense_match = {
+            "subject": subject,
+            "sender": sender,
+            "received": received,
+            "terms_found": expense_terms_found,
+            "term_locations": term_locations,
+            "mail_item": item,
+        }
+
+    return timecard_match, expense_match
 
 
 # ----------------------------------------------------------------------
@@ -927,19 +884,17 @@ def get_outlook_folder(namespace, folder_name="Inbox"):
     raise ValueError(f"Folder '{folder_name}' not found under Inbox.")
 
 
-# ----------------------------------------------------------------------
-# Public entry point: get_approved_cards()
-# ----------------------------------------------------------------------
 def _received_time_naive(item):
     """
     Best-effort naive datetime.datetime for item.ReceivedTime, used to
     compare against start_date/end_date ahead of the (much slower)
-    process_email() call. Outlook/pywin32 hands back ReceivedTime as a
-    tz-aware pywintypes.datetime whose tzinfo doesn't reflect an actual
-    conversion (it's local wall-clock time labeled as a fixed offset) --
-    dropping tzinfo here matches how storage_service._parse_received()
-    already treats the same value once it's stored as the "received"
-    column, so the two stay consistent.
+    process_email_combined() call. Outlook/pywin32 hands back
+    ReceivedTime as a tz-aware pywintypes.datetime whose tzinfo doesn't
+    reflect an actual conversion (it's local wall-clock time labeled as
+    a fixed offset) -- dropping tzinfo here matches how
+    storage_service._parse_received() already treats the same value
+    once it's stored as the "received" column, so the two stay
+    consistent.
     """
     try:
         received = item.ReceivedTime
@@ -948,23 +903,35 @@ def _received_time_naive(item):
     return received.replace(tzinfo=None) if getattr(received, "tzinfo", None) is not None else received
 
 
+# ----------------------------------------------------------------------
+# SINGLE public entry point: get_matching_emails()
+#
+# This is the merged replacement for the old get_approved_cards() and
+# get_expense_reports() -- it connects to Outlook ONCE, scans the
+# folder in ONE pass, and evaluates every email against BOTH filters
+# (each attachment is saved/extracted from disk only once, shared
+# between the two filters), same entry-point shape (args, folder
+# connect/scan/cleanup flow, optional summary report) as the original
+# single-purpose timecard scanner.
+# ----------------------------------------------------------------------
 def get_approved_cards(folder_name="Inbox", print_report=True, limit=None,
-                        start_date=None, end_date=None):
+                         start_date=None, end_date=None):
     """
-    Connect to Outlook, scan the given folder (Inbox by default) using
-    the same single-pass logic as main(), and return the list of
-    matched emails.
+    Connect to Outlook, scan the given folder (Inbox by default) in a
+    single pass, and return the matches for BOTH filters.
 
-    A match is an email where either:
-      - the BODY satisfies the strict approval logic (approved_pattern
-        AND subject_pattern both present), or
-      - at least one ATTACHMENT contains one of the KEYWORDS.
+    Timecard match: BODY satisfies the strict approval logic
+    (approved_pattern AND subject_pattern both present), OR at least
+    one ATTACHMENT contains one of the KEYWORDS.
+
+    Expense Report match: "Expense Report", "Approved", AND "Project"
+    are ALL present somewhere across subject + body + attachment text.
 
     Args:
         folder_name: name of the folder under Inbox to scan
                      ("Inbox" itself, or a named subfolder).
-        print_report: if True, prints the Counters summary at the end
-                     (same output as main()).
+        print_report: if True, prints the Counters summary (covering
+                     both filters) at the end.
         limit: if set, only scan the `limit` most recently received
                      emails instead of the whole folder. Ignored for
                      items outside [start_date, end_date] when those are
@@ -977,12 +944,13 @@ def get_approved_cards(folder_name="Inbox", print_report=True, limit=None,
                      `limit`.
 
     Returns:
-        matching_emails: list of dicts, one per matched email, in the
-        same format built inside process_email() (subject, sender,
-        received, matched_via, keyword_locations, attachments, etc).
+        (timecard_matches, expense_matches): two lists of dicts, one
+        per matched email, in the same per-item format the original
+        get_approved_cards() / get_expense_reports() each returned.
     """
     counters = Counters()
-    matching_emails = []
+    timecard_matches = []
+    expense_matches = []
 
     try:
         outlook = win32com.client.Dispatch("Outlook.Application")
@@ -991,14 +959,15 @@ def get_approved_cards(folder_name="Inbox", print_report=True, limit=None,
     except Exception as exc:
         print(f"FATAL: Could not connect to Outlook: {exc}")
         traceback.print_exc()
-        return matching_emails
+        return timecard_matches, expense_matches
 
     items = folder.Items
     items.Sort("[ReceivedTime]", True)  # newest first, so limit takes the most recent
     temp_dir = tempfile.mkdtemp(prefix="outlook_scan_")
 
     try:
-        # Single pass over the folder (capped at `limit` if given) -- O(n).
+        # Single pass over the folder (capped at `limit` if given) -- O(n),
+        # evaluating both filters per email.
         for item in (itertools.islice(items, limit) if limit else items):
             try:
                 if getattr(item, "Class", None) != OL_MAIL_ITEM_CLASS:
@@ -1013,9 +982,11 @@ def get_approved_cards(folder_name="Inbox", print_report=True, limit=None,
                     if start_date is not None and received_at < start_date:
                         break  # newest-first order: nothing after this is in range
 
-                matched_email = process_email(item, temp_dir, counters)
-                if matched_email is not None:
-                    matching_emails.append(matched_email)
+                timecard_match, expense_match = process_email_combined(item, temp_dir, counters)
+                if timecard_match is not None:
+                    timecard_matches.append(timecard_match)
+                if expense_match is not None:
+                    expense_matches.append(expense_match)
             except Exception:
                 traceback.print_exc()
                 continue
@@ -1025,91 +996,16 @@ def get_approved_cards(folder_name="Inbox", print_report=True, limit=None,
     if print_report:
         counters.report()
 
-    return matching_emails
-
-
-def get_expense_reports(folder_name="Inbox", print_report=True, limit=None,
-                         start_date=None, end_date=None):
-    """
-    Connect to Outlook, scan the given folder (Inbox by default), and
-    return the list of emails matching the Expense Report filter.
-
-    A match is an email where "Expense Report", "Approved", AND
-    "Project" are ALL present somewhere across the subject, body, and
-    attachment text combined.
-
-    Args mirror get_approved_cards() (folder_name, print_report, limit,
-    start_date/end_date).
-
-    Returns:
-        matching_emails: list of dicts, one per matched email
-        (subject, sender, received, terms_found, term_locations).
-    """
-    matching_emails = []
-    total_scanned = 0
-
-    try:
-        outlook = win32com.client.Dispatch("Outlook.Application")
-        namespace = outlook.GetNamespace("MAPI")
-        folder = get_outlook_folder(namespace, folder_name)
-    except Exception as exc:
-        print(f"FATAL: Could not connect to Outlook: {exc}")
-        traceback.print_exc()
-        return matching_emails
-
-    items = folder.Items
-    items.Sort("[ReceivedTime]", True)  # newest first
-    temp_dir = tempfile.mkdtemp(prefix="outlook_expense_scan_")
-
-    try:
-        for item in (itertools.islice(items, limit) if limit else items):
-            try:
-                if getattr(item, "Class", None) != OL_MAIL_ITEM_CLASS:
-                    continue
-
-                if start_date is not None or end_date is not None:
-                    received_at = _received_time_naive(item)
-                    if received_at is None:
-                        continue
-                    if end_date is not None and received_at > end_date:
-                        continue
-                    if start_date is not None and received_at < start_date:
-                        break
-
-                total_scanned += 1
-                matched_email = process_email_expense(item, temp_dir)
-                if matched_email is not None:
-                    matching_emails.append(matched_email)
-            except Exception:
-                traceback.print_exc()
-                continue
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-    if print_report:
-        print("\n" + "=" * 70)
-        print("EXPENSE REPORT SUMMARY")
-        print("=" * 70)
-        print(f"Total emails scanned:            {total_scanned}")
-        print(f"Expense Reports found:           {len(matching_emails)}")
-        if matching_emails:
-            print("Matching subjects:")
-            for m in matching_emails:
-                print(f"    - {m['subject']}")
-        print("=" * 70)
-
-    return matching_emails
+    return timecard_matches, expense_matches
 
 
 # ----------------------------------------------------------------------
 # Main entry point
 # ----------------------------------------------------------------------
 def main():
-    matching_emails = get_approved_cards("Inbox")
-    print(f"\n{len(matching_emails)} matching email(s) returned by get_approved_cards().")
-
-    expense_emails = get_expense_reports("Inbox")
-    print(f"\n{len(expense_emails)} Expense Report email(s) returned by get_expense_reports().")
+    timecard_matches, expense_matches = get_approved_cards("Inbox")
+    print(f"\n{len(timecard_matches)} matching timecard email(s) returned by get_approved_cards().")
+    print(f"{len(expense_matches)} matching Expense Report email(s) returned by get_approved_cards().")
 
 
 if __name__ == "__main__":
