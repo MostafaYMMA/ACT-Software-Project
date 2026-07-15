@@ -25,7 +25,6 @@ already sitting there - so it reads as one continuous motion instead
 of pages just swapping. Purely additive - no existing routing, timers,
 or signals are changed.
 """
-from PySide6.QtCore import QTimer
 import sys
 import os
 
@@ -34,8 +33,9 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "services"))
 
-from PySide6.QtWidgets import QApplication, QMainWindow, QLabel
+from PySide6.QtWidgets import QApplication, QMainWindow, QLabel, QWidget
 from PySide6.QtCore import QTimer, QPoint, QRect, QPropertyAnimation, QEasingCurve
+from PySide6.QtGui import QFont, QFontDatabase
 
 from ui.athu import accounts_exist
 from ui.account_page import AccountCreationPage
@@ -45,7 +45,6 @@ from ui.app import MainWindow
 from ui.theme_manager import theme_manager
 from ui.transition import FadeStackedWidget, zoom_in
 from storage_service import init_db
-
 
 WELCOME_SPLASH_DURATION_MS = 900
 
@@ -169,14 +168,29 @@ class RootWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
-    # Apply your global stylesheet
+    # ---------- Load custom font ----------
+    font_path = os.path.join(
+        os.path.dirname(__file__),
+        "assets",
+        "fonts",
+        "GentleHearts-Regular.ttf"
+    )
+
+    font_id = QFontDatabase.addApplicationFont(font_path)
+
+    print("Font path:", font_path)
+    print("Font exists:", os.path.exists(font_path))
+    print("Font ID:", font_id)
+
+    if font_id != -1:
+        print("Loaded families:", QFontDatabase.applicationFontFamilies(font_id))
+    else:
+        print("Failed to load font.")
+    # --------------------------------------
+
     app.setStyleSheet(theme_manager.stylesheet())
 
-    # Create the main window
     window = RootWindow()
-
-    # Open the window maximized
     window.showMaximized()
 
-    # Start the application
     sys.exit(app.exec())
