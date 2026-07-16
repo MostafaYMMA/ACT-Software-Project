@@ -16,6 +16,10 @@ HIDDEN_COLUMNS = {"id", "timecard_id", "received_month"}
 PREFERRED_COLUMN_ORDER = [
     "status", "subject", "Project Number", "Project Name", "Task Name",
     "Date", "Qty", "rate",
+    # Expense-report columns (only present on the expenses grid; harmless on
+    # the timecard grids, where order_columns filters them out as absent).
+    "expense_type", "Amount", "currency", "description", "receipt",
+    "submitted_by", "approved_by", "approved_on", "expense_report", "item",
 ]
 HEADER_LABELS = {
     "status": "Status",
@@ -30,6 +34,19 @@ HEADER_LABELS = {
     "received": "Received",
     "rate": "Rate",
     "is_exported": "Exported",
+    # Expenses grid
+    "expense_report": "Expense Report",
+    "item": "Item",
+    "expense_type": "Expense Type",
+    "Amount": "Amount",
+    "currency": "Currency",
+    "description": "Description",
+    "receipt": "Receipt",
+    "submitted_by": "Submitted By",
+    "approved_by": "Approved By",
+    "approved_on": "Approved On",
+    "report_total": "Report Total",
+    "report_currency": "Report Currency",
 }
 MAX_COLUMN_WIDTH = 320
 

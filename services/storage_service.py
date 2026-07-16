@@ -641,6 +641,47 @@ def _rebuild_project_type_tables(conn):
             """, [status_label, *where_params])
 
 
+def _create_expenses_table(conn):
+    # Expense-report line items (see extractor_service.extract_expense): one
+    # row per line of an "Expense Item" table, with the report's document-level
+    # fields (project, status, submitter/approver) copied onto each. The
+    # filter only ever matches APPROVED reports, so there's one table here, not
+    # the three-status split the timecards use.
+    #
+    # Shared columns are named exactly like the timecard tables ("Project
+    # Number"/"Project Name"/"Task Name"/"Date") so the two can be joined --
+    # the relation is on "Project Number". What makes a line unique is its
+    # report id + item number: re-reading the same report updates its lines
+    # rather than duplicating them.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            expense_report TEXT,
+            item TEXT,
+            "Date" TEXT,
+            "Project Number" TEXT,
+            "Project Name" TEXT,
+            "Task Name" TEXT,
+            expense_type TEXT,
+            "Amount" REAL,
+            currency TEXT,
+            description TEXT,
+            receipt TEXT,
+            status TEXT,
+            submitted_by TEXT,
+            approved_by TEXT,
+            approved_on TEXT,
+            report_total TEXT,
+            report_currency TEXT,
+            subject TEXT,
+            sender TEXT,
+            received TEXT,
+            received_month TEXT,
+            UNIQUE(expense_report, item)
+        )
+    """)
+
+
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -690,6 +731,8 @@ def init_db():
 
     for table_name in PROJECT_TYPE_TABLES.values():
         _create_project_type_table(conn, table_name)
+
+    _create_expenses_table(conn)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS timecards_summary (
@@ -1312,6 +1355,155 @@ def save_cards(entries: list, origin=None):
         conn.close()
 
 
+def _expense_amount(value):
+    """Best-effort float for an amount string like "229.98" or "37,909".
+    Returns None when it can't be parsed, so a bad cell doesn't sink the row."""
+    if value in (None, ""):
+        return None
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _expense_to_row(entry: dict) -> tuple:
+    return (
+        entry.get("expense_report"),
+        entry.get("item"),
+        entry.get("date"),
+        entry.get("project_code"),
+        entry.get("project_name"),
+        entry.get("task"),
+        entry.get("expense_type"),
+        _expense_amount(entry.get("amount")),
+        entry.get("currency"),
+        entry.get("description"),
+        entry.get("receipt"),
+        entry.get("status"),
+        entry.get("submitted_by"),
+        entry.get("approved_by"),
+        entry.get("approved_on"),
+        entry.get("report_total"),
+        entry.get("report_currency"),
+        entry.get("subject"),
+        entry.get("sender"),
+        entry.get("received"),
+        _received_month(entry.get("received")),
+    )
+
+
+def save_expenses(entries: list):
+    """
+    Persist expense-report line items (from extractor_service.extract_expense).
+    Keyed on (expense_report, item): re-reading the same report refreshes its
+    existing line rows in place rather than inserting duplicates.
+    """
+    if not entries:
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        _create_expenses_table(conn)
+        conn.executemany("""
+            INSERT INTO expenses
+            (expense_report, item, "Date", "Project Number", "Project Name", "Task Name",
+             expense_type, "Amount", currency, description, receipt, status,
+             submitted_by, approved_by, approved_on, report_total, report_currency,
+             subject, sender, received, received_month)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(expense_report, item) DO UPDATE SET
+                "Date" = excluded."Date",
+                "Project Number" = excluded."Project Number",
+                "Project Name" = excluded."Project Name",
+                "Task Name" = excluded."Task Name",
+                expense_type = excluded.expense_type,
+                "Amount" = excluded."Amount",
+                currency = excluded.currency,
+                description = excluded.description,
+                receipt = excluded.receipt,
+                status = excluded.status,
+                submitted_by = excluded.submitted_by,
+                approved_by = excluded.approved_by,
+                approved_on = excluded.approved_on,
+                report_total = excluded.report_total,
+                report_currency = excluded.report_currency,
+                subject = excluded.subject,
+                sender = excluded.sender,
+                received = excluded.received,
+                received_month = excluded.received_month
+        """, [_expense_to_row(e) for e in entries])
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_expense_rows(start_date=None, end_date=None, project_type=None):
+    """All expense line-item rows as dicts, newest report first. When a date
+    range is given, only rows whose "received" falls within it are returned
+    (same rule the timecard views use).
+
+    project_type ("beverage"/"hospitality", or None for all) narrows the rows
+    to one division by the same "Project Name" prefix rule the timecards use --
+    an expense on project "HLGIU-..." lands under Hospitality, so the Dashboard
+    can filter timecards and expenses with one shared control."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        if conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='expenses'"
+        ).fetchone() is None:
+            return []
+        where, params = _project_type_clause(project_type)
+        where_sql = f" WHERE {where}" if where else ""
+        cursor = conn.execute(
+            f'SELECT * FROM expenses{where_sql} ORDER BY "Date" DESC, expense_report ASC, item ASC',
+            params,
+        )
+        columns = [desc[0] for desc in cursor.description]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        if start_date is not None or end_date is not None:
+            rows = [r for r in rows if _received_in_range(r.get("received"), start_date, end_date)]
+        return rows
+    finally:
+        conn.close()
+
+
+def get_expense_count(start_date=None, end_date=None, project_type=None):
+    """Number of expense line-item rows in the given window/division -- backs
+    the Dashboard's Expenses stat card."""
+    return len(get_expense_rows(start_date, end_date, project_type))
+
+
+def get_expense_columns():
+    """Column names of the expenses table, in schema order -- lets the grid
+    show the right headings on an empty table (before any expenses exist)."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        if conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='expenses'"
+        ).fetchone() is None:
+            return []
+        return [row[1] for row in conn.execute('PRAGMA table_info("expenses")')]
+    finally:
+        conn.close()
+
+
+def export_expenses_to_csv(output_path="expenses.csv"):
+    """Dump the expenses table to a CSV, one row per line item."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cursor = conn.execute('SELECT * FROM expenses ORDER BY "Date" ASC, expense_report ASC, item ASC')
+        columns = [desc[0] for desc in cursor.description]
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(columns)
+            writer.writerows(cursor.fetchall())
+        _record_export(conn, os.path.basename(output_path))
+        conn.commit()
+    finally:
+        conn.close()
+    print(f"Exported expenses to {output_path}")
+
+
 def _row_dict_to_entry(row_dict, status_label):
     """
     Converts one stored row (a dict straight off SELECT *) back into the
@@ -1591,8 +1783,6 @@ def record_finalize_from_other_device(name, end_date):
         conn.commit()
     finally:
         conn.close()
-
-
 def export_to_csv(output_path="output.csv"):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.execute('SELECT * FROM timecards_summary ORDER BY "Date" ASC')
