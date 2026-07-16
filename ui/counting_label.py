@@ -93,7 +93,7 @@ class CountingLabel(QLabel):
             anim.setDuration(MIN_LANDING_MS)
             anim.setStartValue(start)
             anim.setEndValue(0)
-            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.setEasingCurve(QEasingCurve.Type.Linear)
             anim.finished.connect(self._clear_landing_anim)
             anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
             self._landing_anim = anim
@@ -106,7 +106,13 @@ class CountingLabel(QLabel):
         anim.setDuration(int(duration))
         anim.setStartValue(0)
         anim.setEndValue(target)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        # Linear, not an Out-curve: an Out curve moves fast at the start and
+        # crawls for the last stretch, and with an integer property that
+        # crawl shows up as several repeated frames of the same number
+        # right before it lands - reads as stuttering/lag. Linear keeps the
+        # per-frame increment roughly constant the whole way, so it climbs
+        # evenly start to finish instead.
+        anim.setEasingCurve(QEasingCurve.Type.Linear)
         # DeleteWhenStopped destroys the C++ animation as soon as it lands, so
         # the reference kept below outlives the object it points at. Dropping
         # it on "finished" is what keeps _stop_landing_anim from later calling

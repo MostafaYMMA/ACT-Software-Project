@@ -5,8 +5,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy,
     QDateEdit, QButtonGroup,
 )
-from PySide6.QtCore import Qt, Signal, QThread, QObject, QPropertyAnimation, QEasingCurve, Property, QDate, QPointF, QRectF, QTimer
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QRadialGradient, QPixmap, QRegion
+from PySide6.QtCore import Qt, Signal, QThread, QObject, QPropertyAnimation, QEasingCurve, Property, QDate
 
 from ui.theme_manager import theme_manager
 from ui.theme_utils import apply_live_style
@@ -14,8 +13,7 @@ from ui.loading_overlay import LoadingOverlay
 from ui.counting_label import CountingLabel
 from ui.table_utils import order_columns, configure_grid, set_header_labels, fit_columns
 from ui.project_type_settings import project_type_settings
-from ui.sync_partner_settings import sync_partner_settings
-from sync_service import sync_cards, push_rate_update
+from sync_service import sync_cards
 from storage_service import (
     get_status_project_counts, get_status_rows, get_status_columns,
     update_status_record_field, PROJECT_TYPE_LABELS,
@@ -24,122 +22,10 @@ from storage_service import (
 from date_utils import get_this_month_range, get_custom_range
 
 CARD_ANIM_MS = 220
-SPOTLIGHT_FADE_MS = 180
-SPOTLIGHT_RADIUS = 70.0
-SPOTLIGHT_MAX_ALPHA = 70  # 0-255, how strong the glow gets at full opacity/center
-SPOTLIGHT_CORNER_RADIUS = 6.0  # matches the border-radius already used below
-SPOTLIGHT_TICK_MS = 16  # ~60fps -- caps how often the glow can reposition, independent of how fast raw mouse-move events arrive
 
 # Columns whose edits only make sense as numbers -- a non-numeric entry is
 # rejected and the cell reverts to what the database holds.
 _NUMERIC_COLUMNS = {"rate", "Qty"}
-
-
-class _SpotlightOverlay(QWidget):
-    """Transparent, click-through container stacked exactly on top of a
-    StatCard. Holds a single small QLabel (_glow_label) carrying the cached
-    gradient pixmap; the label is repositioned via move() as the cursor
-    moves, rather than repainted.
-
-    This is the third iteration of this effect, each removing a layer of
-    cost the previous one still had:
-      1. Custom paintEvent rebuilding the gradient every frame.
-      2. Custom paintEvent reusing a cached pixmap, but still entering
-         Python's paintEvent (with clip-path setup) 60x/sec.
-      3. This version: no per-frame Python paintEvent at all. move() lets
-         Qt's C++ side recomposite the label's already-rendered pixmap at
-         its new position. Clipping to the card's rounded corners is done
-         once via setMask() on resize, not recomputed every frame.
-    """
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-
-        diameter = int(SPOTLIGHT_RADIUS * 2)
-        self._glow_label = QLabel(self)
-        self._glow_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._glow_label.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self._glow_label.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        self._glow_label.resize(diameter, diameter)
-        self._glow_label.hide()
-
-        self._accent = QColor("#FFA500")
-        self._opacity = 0.0
-        self._has_spot = False
-        self._glow_pixmap_key = None
-
-    def set_accent(self, color_str):
-        self._accent = QColor(color_str)
-        self._glow_pixmap_key = None  # force a regeneration next time it's actually needed
-        if self._opacity > 0.0:
-            self._refresh_pixmap()
-
-    def resizeEvent(self, event):
-        path = QPainterPath()
-        path.addRoundedRect(
-            QRectF(self.rect()).adjusted(0, 0, -1, -1),
-            SPOTLIGHT_CORNER_RADIUS, SPOTLIGHT_CORNER_RADIUS,
-        )
-        # setMask clips at the window-system/compositing level -- paid for
-        # once here on resize, never per-frame (unlike QPainter.setClipPath,
-        # which has to rasterize the clip every single paint call).
-        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
-        super().resizeEvent(event)
-
-    def set_spot(self, pos):
-        self._has_spot = True
-        self._glow_label.move(int(pos.x() - SPOTLIGHT_RADIUS), int(pos.y() - SPOTLIGHT_RADIUS))
-        self._sync_visibility()
-
-    def clear_spot(self):
-        self._has_spot = False
-        self._sync_visibility()
-
-    def set_opacity(self, value):
-        self._opacity = value
-        self._refresh_pixmap()
-        self._sync_visibility()
-
-    def _sync_visibility(self):
-        self._glow_label.setVisible(self._has_spot and self._opacity > 0.0)
-
-    def _refresh_pixmap(self):
-        # Cache key is just opacity (rounded, so float noise mid-animation
-        # doesn't force needless rebuilds) -- accent changes reset the key
-        # in set_accent above. During steady hovering (opacity pinned at
-        # 1.0), this never regenerates; it only runs during the ~180ms
-        # fade in/out, and once on the very first hover.
-        key = round(self._opacity, 2)
-        if key == self._glow_pixmap_key:
-            return
-
-        diameter = int(SPOTLIGHT_RADIUS * 2)
-        pixmap = QPixmap(diameter, diameter)
-        pixmap.fill(Qt.GlobalColor.transparent)
-
-        p = QPainter(pixmap)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        center_color = QColor(self._accent)
-        center_color.setAlpha(int(SPOTLIGHT_MAX_ALPHA * self._opacity))
-        mid_color = QColor(self._accent)
-        mid_color.setAlpha(int(SPOTLIGHT_MAX_ALPHA * self._opacity * 0.35))
-        edge_color = QColor(self._accent)
-        edge_color.setAlpha(0)
-
-        gradient = QRadialGradient(QPointF(SPOTLIGHT_RADIUS, SPOTLIGHT_RADIUS), SPOTLIGHT_RADIUS)
-        gradient.setColorAt(0.0, center_color)
-        gradient.setColorAt(0.5, mid_color)
-        gradient.setColorAt(1.0, edge_color)
-
-        p.fillRect(pixmap.rect(), gradient)
-        p.end()
-
-        self._glow_label.setPixmap(pixmap)
-        self._glow_pixmap_key = key
 
 
 class StatCard(QFrame):
@@ -198,39 +84,8 @@ class StatCard(QFrame):
         # for theme). Re-run _apply_size on every theme change instead.
         theme_manager.theme_changed.connect(lambda _mode: self._apply_size())
 
-        # Cursor-spotlight hover effect - purely cosmetic, doesn't touch
-        # selection/sizing/click logic above. Painting itself lives entirely
-        # in _SpotlightOverlay; StatCard tracks the cursor and forwards
-        # position/opacity to it, throttled by _spotlight_timer so raw
-        # mouse-move events (which can fire far faster than the screen
-        # refreshes) don't each trigger their own repaint.
-        self.setMouseTracking(True)
-        self._spotlight_opacity_cache = 0.0
-        self._pending_spot = None
-        self._spotlight = _SpotlightOverlay(self)
-        self._spotlight.set_accent(theme_manager.colors()["ACCENT"])
-        self._spotlight.setGeometry(self.rect())
-        self._spotlight.show()
-        self._spotlight.raise_()
-        theme_manager.theme_changed.connect(
-            lambda _mode: self._spotlight.set_accent(theme_manager.colors()["ACCENT"])
-        )
-
-        self._spotlight_timer = QTimer(self)
-        self._spotlight_timer.setInterval(SPOTLIGHT_TICK_MS)
-        self._spotlight_timer.timeout.connect(self._flush_spotlight_pos)
-
     def set_selected(self, selected):
         self._selected = selected
-        if selected:
-            # Effect is fully disabled while selected -- no tracking, no
-            # timer running, no lingering glow at whatever the last cursor
-            # position was.
-            self._spotlight_timer.stop()
-            self._pending_spot = None
-            self._spotlight.clear_spot()
-            self._spotlight_opacity_cache = 0.0
-            self._spotlight.set_opacity(0.0)
         self._apply_size(animate=True)
 
     def _target_widths(self):
@@ -297,62 +152,7 @@ class StatCard(QFrame):
 
     def resizeEvent(self, event):
         self._apply_size(animate=False)
-        self._spotlight.setGeometry(self.rect())
         super().resizeEvent(event)
-
-    def enterEvent(self, event):
-        if not self._selected:
-            self._animate_spotlight_opacity_to(1.0)
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self._spotlight_timer.stop()
-        self._pending_spot = None
-        self._animate_spotlight_opacity_to(0.0)
-        super().leaveEvent(event)
-
-    def mouseMoveEvent(self, event):
-        # Selected cards never show the spotlight -- skip tracking entirely
-        # rather than tracking-and-not-painting, so there's zero per-move
-        # cost while a card is selected.
-        if self._selected:
-            super().mouseMoveEvent(event)
-            return
-
-        # Just record the latest position here; _flush_spotlight_pos (fired
-        # by _spotlight_timer at a fixed ~60fps) is what actually moves the
-        # glow label. Native mouse-move events can arrive far faster than
-        # the screen can redraw, so acting on every single one was doing
-        # multiples of the necessary work for no visible benefit.
-        self._pending_spot = event.position()
-        if not self._spotlight_timer.isActive():
-            self._spotlight_timer.start()
-
-        super().mouseMoveEvent(event)
-
-    def _flush_spotlight_pos(self):
-        if self._pending_spot is not None:
-            self._spotlight.set_spot(self._pending_spot)
-            self._pending_spot = None
-
-    # -- animatable property: opacity fades in on hover, out on leave -----
-    def _get_spotlight_opacity(self):
-        return self._spotlight_opacity_cache
-
-    def _set_spotlight_opacity(self, value):
-        self._spotlight_opacity_cache = value
-        self._spotlight.set_opacity(value)
-
-    spotlight_opacity = Property(float, _get_spotlight_opacity, _set_spotlight_opacity)
-
-    def _animate_spotlight_opacity_to(self, target):
-        anim = QPropertyAnimation(self, b"spotlight_opacity", self)
-        anim.setDuration(SPOTLIGHT_FADE_MS)
-        anim.setStartValue(self._spotlight_opacity_cache)
-        anim.setEndValue(target)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
-        self._spotlight_anim = anim  # prevent garbage collection mid-animation
 
     def mousePressEvent(self, event):
         self.clicked.emit()
@@ -418,24 +218,6 @@ class RowsWorker(QObject):
             end_date=self.end_date,
             project_type=self.project_type,
         ))
-
-
-class _RatePushWorker(QObject):
-    """Sends one rate edit to the sync partner immediately, off the GUI
-    thread -- an Outlook Send() call can take a moment, and the table
-    edit itself is already saved locally by the time this runs, so there's
-    nothing for the UI to wait on. See DashboardPage._on_item_changed."""
-    finished = Signal(bool)
-
-    def __init__(self, status_key, record_id, recipient_email):
-        super().__init__()
-        self.status_key = status_key
-        self.record_id = record_id
-        self.recipient_email = recipient_email
-
-    def run(self):
-        sent = push_rate_update(self.status_key, self.record_id, self.recipient_email)
-        self.finished.emit(sent)
 
 
 class DashboardPage(QWidget):
@@ -886,30 +668,8 @@ class DashboardPage(QWidget):
 
         if update_status_record_field(self._current_status_key, record.get("id"), column, new_value):
             record[column] = new_value
-            # A rate edit needs its OWN sync message, not just whatever
-            # the next Update click happens to send: build_outgoing_snapshot
-            # only ever includes rows this device scanned itself, so an
-            # edit to a rate on a record the OTHER device originally
-            # scanned would otherwise never reach them at all, through
-            # any button, ever (see sync_service.push_rate_update).
-            if column == "rate" and sync_partner_settings.partner_email:
-                self._push_rate_edit(record.get("id"))
         else:
             revert()
-
-    def _push_rate_edit(self, record_id):
-        thread = QThread(self)
-        worker = _RatePushWorker(self._current_status_key, record_id, sync_partner_settings.partner_email)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(thread.quit)
-        thread.finished.connect(thread.deleteLater)
-        # Keep references alive until the thread actually finishes -- a
-        # fire-and-forget QThread with no owner reference risks Python
-        # garbage-collecting it mid-send.
-        self._rate_push_thread = thread
-        self._rate_push_worker = worker
-        thread.start()
 
     def scan_inbox(self):
         self.scan_btn.setEnabled(False)
