@@ -14,7 +14,8 @@ from ui.loading_overlay import LoadingOverlay
 from ui.counting_label import CountingLabel
 from ui.table_utils import order_columns, configure_grid, set_header_labels, fit_columns
 from ui.project_type_settings import project_type_settings
-from sync_service import sync_cards
+from ui.sync_partner_settings import sync_partner_settings
+from sync_service import sync_cards, push_rate_update
 from storage_service import (
     get_status_project_counts, get_status_rows, get_status_columns,
     update_status_record_field, PROJECT_TYPE_LABELS,
@@ -417,6 +418,24 @@ class RowsWorker(QObject):
             end_date=self.end_date,
             project_type=self.project_type,
         ))
+
+
+class _RatePushWorker(QObject):
+    """Sends one rate edit to the sync partner immediately, off the GUI
+    thread -- an Outlook Send() call can take a moment, and the table
+    edit itself is already saved locally by the time this runs, so there's
+    nothing for the UI to wait on. See DashboardPage._on_item_changed."""
+    finished = Signal(bool)
+
+    def __init__(self, status_key, record_id, recipient_email):
+        super().__init__()
+        self.status_key = status_key
+        self.record_id = record_id
+        self.recipient_email = recipient_email
+
+    def run(self):
+        sent = push_rate_update(self.status_key, self.record_id, self.recipient_email)
+        self.finished.emit(sent)
 
 
 class DashboardPage(QWidget):
@@ -867,8 +886,30 @@ class DashboardPage(QWidget):
 
         if update_status_record_field(self._current_status_key, record.get("id"), column, new_value):
             record[column] = new_value
+            # A rate edit needs its OWN sync message, not just whatever
+            # the next Update click happens to send: build_outgoing_snapshot
+            # only ever includes rows this device scanned itself, so an
+            # edit to a rate on a record the OTHER device originally
+            # scanned would otherwise never reach them at all, through
+            # any button, ever (see sync_service.push_rate_update).
+            if column == "rate" and sync_partner_settings.partner_email:
+                self._push_rate_edit(record.get("id"))
         else:
             revert()
+
+    def _push_rate_edit(self, record_id):
+        thread = QThread(self)
+        worker = _RatePushWorker(self._current_status_key, record_id, sync_partner_settings.partner_email)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(thread.deleteLater)
+        # Keep references alive until the thread actually finishes -- a
+        # fire-and-forget QThread with no owner reference risks Python
+        # garbage-collecting it mid-send.
+        self._rate_push_thread = thread
+        self._rate_push_worker = worker
+        thread.start()
 
     def scan_inbox(self):
         self.scan_btn.setEnabled(False)
