@@ -82,7 +82,7 @@ except ImportError:
 
 # --- Strict approval/timecard logic -- used ONLY for BODY matching
 #     (and for informational subject reporting). DO NOT MODIFY. ---
-approved_pattern = re.compile(r"\b(?:approved|pending|rejected)\b", re.IGNORECASE)
+approved_pattern = re.compile(r"\b(?:approved|Submitted|pending|rejected)\b", re.IGNORECASE)
 
 subject_pattern = re.compile(
     r"\btime(?:\s+|-)?card\b|^\s*FW:\s*FYI:?",
@@ -97,6 +97,9 @@ KEYWORDS = [
     "Time-card",
     "Time Card Status",
     "Approved",
+    "Submitted",
+    "Pending",
+    "Rejected",
     "Reported time by entry date",
 ]
 
@@ -251,7 +254,7 @@ def detect_status(subject, body):
     """
     Which of approved/pending/rejected this email actually is. Subject
     is checked first (e.g. "...Were Approved"), body is the fallback.
-    Returns "Approved" / "Pending" / "Rejected", or None if neither
+    Returns "Approved" / "Submitted" / "Pending" / "Rejected", or None if neither
     text contains one of those words.
     """
     for source in (subject, body):
