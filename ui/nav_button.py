@@ -113,12 +113,22 @@ class NavButton(QFrame):
         self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.icon_label.setStyleSheet("background: transparent;")
         self.icon_label.setPixmap(render_icon(icon_key, ICON_BASE_PX))
+        # Without this, Qt sends enterEvent/leaveEvent to whichever CHILD
+        # widget is directly under the cursor, not to this parent frame -
+        # so moving onto this label would fire a spurious leaveEvent on
+        # NavButton (shrinking the icon back down every time), and hovering
+        # the label itself would never trigger anything at all. Making it
+        # mouse-transparent means the parent is the only thing that ever
+        # sees enter/leave, across the icon, the text, and the gap between
+        # them - one continuous hover, no matter where inside the row.
+        self.icon_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         layout.addWidget(self.icon_label)
 
         self.text_label = QLabel(label)
         self.text_label.setStyleSheet(
             "background: transparent; color: white; font-size: 14px; font-weight: 500;"
         )
+        self.text_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         layout.addWidget(self.text_label)
 
         layout.addStretch()

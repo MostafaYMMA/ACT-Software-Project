@@ -326,6 +326,17 @@ def update_status_record_field(status_key, record_id, column, value):
                     f'UPDATE "{table_name}" SET received = ?, received_month = ? WHERE id = ?',
                     (value, _received_month(value), record_id),
                 )
+            elif column == "rate":
+                # rate is the one field either user might edit on ANY
+                # record, including one the other device originally
+                # scanned -- stamping who/when here is what lets a rate
+                # sync (see build_rate_update_payload/apply_rate_update)
+                # decide whose edit is newer instead of just blindly
+                # overwriting whichever one arrives last.
+                cursor = conn.execute(
+                    f'UPDATE "{table_name}" SET rate = ?, rate_updated_at = ?, rate_updated_by = ? WHERE id = ?',
+                    (value, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), get_device_id(), record_id),
+                )
             else:
                 cursor = conn.execute(
                     f'UPDATE "{table_name}" SET "{column}" = ? WHERE id = ?',
@@ -661,6 +672,20 @@ def init_db():
         _ensure_columns(conn, table_name, [
             "name TEXT", "period TEXT", "person_number TEXT",
             "is_exported INTEGER DEFAULT 0", "rate REAL DEFAULT 0",
+            # origin: which device's own Outlook scan this row came from
+            # (see get_device_id/save_cards) -- None/legacy rows are
+            # treated as this device's own the first time anything
+            # touches them (see _save_row's backfill). What this actually
+            # gates: build_outgoing_snapshot only ever publishes rows
+            # whose origin is THIS device, so a synced-in row is never
+            # re-broadcast back out -- without that, two devices would
+            # keep re-mailing each other's data back and forth forever.
+            "origin TEXT",
+            # rate is hand-typed and never touched by a rescan (see
+            # _upsert_timecard) -- these two exist so a cross-device rate
+            # sync can tell whose edit is newer instead of just blindly
+            # overwriting whatever's here (see _apply_rate_if_newer).
+            "rate_updated_at TEXT", "rate_updated_by TEXT",
         ])
 
     for table_name in PROJECT_TYPE_TABLES.values():
@@ -789,6 +814,84 @@ def _set_last_export_date(conn, end_date: str):
         "INSERT INTO app_state (key, value) VALUES ('last_export_date', ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (end_date,),
+    )
+
+
+def get_device_id():
+    """
+    A short random id identifying THIS installation, generated once and
+    then persisted in app_state forever after. This is what tags a row's
+    "origin" (see init_db's _ensure_columns call) and what a sync payload
+    is tagged with as its "device_id" -- the other side uses that to know
+    whose snapshot it's looking at and to track how far it's caught up
+    with THIS specific device (see get_last_applied_seq), independent of
+    however many other devices might also be syncing with it.
+    """
+    import uuid
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT value FROM app_state WHERE key = 'device_id'"
+        ).fetchone()
+        if row and row[0]:
+            return row[0]
+        new_id = uuid.uuid4().hex[:12]
+        conn.execute(
+            "INSERT INTO app_state (key, value) VALUES ('device_id', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (new_id,),
+        )
+        conn.commit()
+        return new_id
+    finally:
+        conn.close()
+
+
+def _next_outgoing_seq(conn):
+    """
+    Increments and returns THIS device's outgoing snapshot counter.
+    Every call to build_outgoing_snapshot() burns one of these -- it's
+    what lets the other side tell "I already have everything through
+    seq 8" apart from "here's a stale seq 5 that arrived late", so a pile
+    of queued sync mails collapses to "apply only the newest one" with no
+    reordering logic needed on the receiving end (see
+    apply_incoming_snapshot).
+    """
+    row = conn.execute(
+        "SELECT value FROM app_state WHERE key = 'sync_outgoing_seq'"
+    ).fetchone()
+    current = int(row[0]) if row and row[0] else 0
+    new_value = current + 1
+    conn.execute(
+        "INSERT INTO app_state (key, value) VALUES ('sync_outgoing_seq', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (str(new_value),),
+    )
+    return new_value
+
+
+def get_last_applied_seq(sender_device_id):
+    """The highest snapshot seq already applied FROM sender_device_id, or
+    0 if none has ever been applied. Per-sender, so this device can sync
+    with more than one other device without them stepping on each other's
+    sequence numbers."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT value FROM app_state WHERE key = ?",
+            (f"sync_applied_seq:{sender_device_id}",),
+        ).fetchone()
+        return int(row[0]) if row and row[0] else 0
+    finally:
+        conn.close()
+
+
+def _set_last_applied_seq(conn, sender_device_id, seq):
+    conn.execute(
+        "INSERT INTO app_state (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (f"sync_applied_seq:{sender_device_id}", str(seq)),
     )
 
 
@@ -1034,12 +1137,12 @@ def _dedupe_latest_across_statuses(grouped):
 def _find_existing(conn, key):
     """
     Every stored row matching key, in whichever status table it sits.
-    Returns (table_name, id, received, rate, is_exported) tuples.
+    Returns (table_name, id, received, rate, is_exported, origin) tuples.
     """
     found = []
     for table_name in STATUS_TABLES.values():
         for row in conn.execute(f"""
-            SELECT id, received, rate, is_exported FROM "{table_name}"
+            SELECT id, received, rate, is_exported, origin FROM "{table_name}"
             WHERE day = ? AND "Project Number" = ? AND "Task Name" = ?
               AND person_number = ? AND received_month = ?
         """, key):
@@ -1047,18 +1150,22 @@ def _find_existing(conn, key):
     return found
 
 
-def _upsert_timecard(conn, table_name, row):
+def _upsert_timecard(conn, table_name, row, origin=None):
     # The ON CONFLICT column list must name exactly the columns of the
     # table's UNIQUE constraint (see _create_timecards_table) -- SQLite
     # raises "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
     # constraint" otherwise. The key columns are not in the DO UPDATE list
     # (they're what was matched on); sender is, since it's no longer part of
     # the key and a later forward of the same timecard should refresh it.
+    # origin is also deliberately NOT in the DO UPDATE list, same reasoning
+    # as rate/is_exported below -- who an entry originally came from isn't
+    # a property of its latest received timestamp, so a later rescan or
+    # resync must never flip it.
     conn.execute(f"""
         INSERT INTO "{table_name}"
-        (day, "Date", labor_type, time_type, "Qty", "Project Number", "Project Name", "Task Name", name, period, person_number, subject, sender, received, received_month)
+        (day, "Date", labor_type, time_type, "Qty", "Project Number", "Project Name", "Task Name", name, period, person_number, subject, sender, received, received_month, origin)
         VALUES
-        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(day, "Project Number", "Task Name", person_number, received_month) DO UPDATE SET
             "Date" = excluded."Date",
             labor_type = excluded.labor_type,
@@ -1070,10 +1177,10 @@ def _upsert_timecard(conn, table_name, row):
             subject = excluded.subject,
             sender = excluded.sender,
             received = excluded.received
-    """, row)
+    """, (*row, origin))
 
 
-def _save_row(conn, table_name, row):
+def _save_row(conn, table_name, row, origin=None):
     """
     Writes one entry into its status table, holding the rule that an entry
     exists exactly once across the three of them: same day, project, task,
@@ -1089,38 +1196,47 @@ def _save_row(conn, table_name, row):
     A row already stored with a LATER "received" than the incoming one is
     left alone and the incoming row dropped -- re-reading an old Pending
     email must not undo the Approval that came after it.
+
+    origin: which device this entry is attributed to. Only used to seed a
+    brand-new row, or to backfill a legacy row that predates this column
+    -- an entry that already has an origin keeps it regardless of who
+    happens to be writing this particular update (see _upsert_timecard).
     """
     key = _row_key(row)
     incoming = _parse_received(row[13])
     existing = _find_existing(conn, key)
 
-    for _table, _id, stored_received, _rate, _is_exported in existing:
+    for _table, _id, stored_received, _rate, _is_exported, _origin in existing:
         stored = _parse_received(stored_received)
         if stored is not None and (incoming is None or stored > incoming):
             return
 
-    # A rate is typed in by hand and is_exported records that the entry went
-    # out in a file; neither is a property of the status it happened to be
-    # sitting under, so they ride along when the entry is moved.
+    # A rate is typed in by hand, is_exported records that the entry went
+    # out in a file, and origin records who it's attributed to; none of the
+    # three is a property of the status it happened to be sitting under, so
+    # they all ride along when the entry is moved.
     carried_rate = 0.0
     carried_is_exported = 0
-    for other_table, row_id, _received, rate, is_exported in existing:
+    carried_origin = None
+    for other_table, row_id, _received, rate, is_exported, existing_origin in existing:
         if other_table == table_name:
             continue  # same table: the upsert below updates it in place
         carried_rate = carried_rate or (rate or 0)
         carried_is_exported = max(carried_is_exported, is_exported or 0)
+        carried_origin = carried_origin or existing_origin
         conn.execute(f'DELETE FROM "{other_table}" WHERE id = ?', (row_id,))
 
-    _upsert_timecard(conn, table_name, row)
+    _upsert_timecard(conn, table_name, row, origin=carried_origin or origin)
 
-    if carried_rate or carried_is_exported:
+    if carried_rate or carried_is_exported or origin:
         conn.execute(f"""
             UPDATE "{table_name}" SET
                 rate = CASE WHEN COALESCE(rate, 0) = 0 THEN ? ELSE rate END,
-                is_exported = CASE WHEN COALESCE(is_exported, 0) = 0 THEN ? ELSE is_exported END
+                is_exported = CASE WHEN COALESCE(is_exported, 0) = 0 THEN ? ELSE is_exported END,
+                origin = COALESCE(origin, ?)
             WHERE day = ? AND "Project Number" = ? AND "Task Name" = ?
               AND person_number = ? AND received_month = ?
-        """, (carried_rate, carried_is_exported, *key))
+        """, (carried_rate, carried_is_exported, origin, *key))
 
 
 def _group_by_status_table(entries):
@@ -1142,11 +1258,23 @@ def _group_by_status_table(entries):
     return grouped
 
 
-def save_card(entry: dict):
-    save_cards([entry])
+def save_card(entry: dict, origin=None):
+    save_cards([entry], origin=origin)
 
 
-def save_cards(entries: list):
+def save_cards(entries: list, origin=None):
+    """
+    origin: which device these entries are attributed to. Defaults to
+    THIS device's own id (a real Outlook scan is always "mine"); a synced
+    import from the other user's device explicitly passes THEIR device
+    id instead (see apply_incoming_snapshot), so build_outgoing_snapshot
+    can later tell "did I scan this myself, or did I just receive it"
+    and never re-broadcast something that isn't actually this device's
+    own contribution.
+    """
+    if origin is None:
+        origin = get_device_id()
+
     grouped = _dedupe_latest_across_statuses(_group_by_status_table(entries))
     if not grouped:
         return
@@ -1158,7 +1286,7 @@ def save_cards(entries: list):
         # different status table -- before it can be written. See _save_row.
         for table_name, rows in grouped.items():
             for row in rows:
-                _save_row(conn, table_name, row)
+                _save_row(conn, table_name, row, origin=origin)
         _rebuild_summary(conn)
         _rebuild_project_type_tables(conn)
         _sync_invoice_lines(conn)
@@ -1181,6 +1309,287 @@ def save_cards(entries: list):
         # leak the connection and leave the database file locked for the rest
         # of the process -- the sync runs on a QThread, so the UI would keep
         # hitting a locked db long after the scan died.
+        conn.close()
+
+
+def _row_dict_to_entry(row_dict, status_label):
+    """
+    Converts one stored row (a dict straight off SELECT *) back into the
+    same "entry" shape extract() produces -- the shape _to_row()/
+    save_cards() already know how to consume. This is what lets a synced
+    row round-trip through the EXACT SAME write path a real Outlook scan
+    uses (see apply_incoming_snapshot), instead of a second parallel
+    insert path that could drift out of sync with the real one over time.
+
+    rate/rate_updated_at/rate_updated_by ride along as extra keys that
+    _to_row() itself ignores -- they're picked back up separately by
+    apply_incoming_snapshot's per-row rate merge.
+    """
+    return {
+        "day": row_dict.get("day"),
+        "received": row_dict.get("received"),
+        "labor_type": row_dict.get("labor_type"),
+        "time_type": row_dict.get("time_type"),
+        "hours": row_dict.get("Qty"),
+        "project_code": row_dict.get("Project Number"),
+        "project_name": row_dict.get("Project Name"),
+        "task": row_dict.get("Task Name"),
+        "name": row_dict.get("name"),
+        "period": row_dict.get("period"),
+        "person_number": row_dict.get("person_number"),
+        "subject": row_dict.get("subject"),
+        "sender": row_dict.get("sender"),
+        "status": status_label,
+        "rate": row_dict.get("rate"),
+        "rate_updated_at": row_dict.get("rate_updated_at"),
+        "rate_updated_by": row_dict.get("rate_updated_by"),
+    }
+
+
+def build_outgoing_snapshot(project_type=None):
+    """
+    Packages everything THIS device has scanned itself (origin = this
+    device's id -- see save_cards) for the current open period (since the
+    last finalize/export -- see get_last_export_date) into a dict ready to
+    be mailed to the other user and handed to their apply_incoming_snapshot().
+
+    Deliberately excludes any row this device only knows about because it
+    was itself synced in from the OTHER device -- each device only ever
+    publishes what it originally scanned. The other side already has
+    anything it sent; re-sending it back would just make every payload
+    grow forever and teach the other side nothing new.
+
+    This is a FULL current-period snapshot, not a delta since the last
+    one sent -- that's what makes it safe for the receiving side to
+    simply skip every queued sync mail except the newest one from a given
+    sender (see apply_incoming_snapshot / get_last_applied_seq) without
+    ever losing an entry that only appeared in an older, unprocessed one.
+    """
+    device_id = get_device_id()
+    period_start = get_last_export_date()  # 'YYYY-MM-DD', or None if never exported
+    type_where, type_params = _project_type_clause(project_type)
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = []
+        for status_label, table_name in STATUS_TABLES.items():
+            clauses = ["origin = ?"]
+            params = [device_id]
+            if period_start:
+                clauses.append("received >= ?")
+                params.append(period_start)
+            if type_where:
+                clauses.append(type_where)
+                params.extend(type_params)
+
+            cursor = conn.execute(
+                f'SELECT * FROM "{table_name}" WHERE {" AND ".join(clauses)}', params
+            )
+            columns = [desc[0] for desc in cursor.description]
+            for raw in cursor.fetchall():
+                rows.append(_row_dict_to_entry(dict(zip(columns, raw)), status_label))
+
+        seq = _next_outgoing_seq(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "device_id": device_id,
+        "seq": seq,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "period_start": period_start,
+        "rows": rows,
+    }
+
+
+def apply_incoming_snapshot(payload):
+    """
+    Merges another device's build_outgoing_snapshot() payload into this
+    database. Safe to call more than once with the same payload, and safe
+    if payloads from the same sender arrive out of order -- it's only
+    actually applied when its seq is strictly newer than the last one
+    already applied FROM THAT SENDER (see get_last_applied_seq); an
+    older or repeated one is silently skipped rather than reprocessed.
+
+    That's a deliberate design choice, not just deduplication: because
+    each snapshot is the sender's FULL current-period picture rather than
+    a delta, the newest one queued from a given sender is always a
+    superset of any older one still sitting unprocessed -- so if several
+    sync mails from the same device pile up (e.g. this laptop was closed
+    for a few days), applying only the newest and discarding the rest is
+    correct, not lossy.
+
+    Returns a dict describing what happened, for the caller (the email
+    import step, in a later phase) to log/surface to the user.
+    """
+    if not payload:
+        return {"applied": False, "reason": "empty payload"}
+
+    device_id = payload.get("device_id")
+    incoming_seq = payload.get("seq") or 0
+    if not device_id:
+        return {"applied": False, "reason": "missing device_id"}
+
+    last_applied = get_last_applied_seq(device_id)
+    if incoming_seq <= last_applied:
+        return {
+            "applied": False, "reason": "superseded",
+            "seq": incoming_seq, "last_applied": last_applied,
+        }
+
+    rows = payload.get("rows") or []
+
+    # The timecard data itself (day/project/task/status/etc) goes through
+    # the exact same path a real scan uses -- see save_cards -- just
+    # tagged with the SENDER's device id as origin instead of ours, which
+    # is what keeps this device from ever re-broadcasting it back out.
+    save_cards(rows, origin=device_id)
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rates_applied = 0
+        for entry in rows:
+            if not entry.get("rate_updated_at"):
+                continue
+            if _apply_rate_if_newer(
+                conn,
+                status_label=entry.get("status"),
+                natural_key=_row_key(_to_row(entry)),
+                rate=entry.get("rate"),
+                updated_at=entry.get("rate_updated_at"),
+                updated_by=entry.get("rate_updated_by"),
+            ):
+                rates_applied += 1
+
+        _set_last_applied_seq(conn, device_id, incoming_seq)
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "applied": True, "seq": incoming_seq,
+        "rows_merged": len(rows), "rates_applied": rates_applied,
+    }
+
+
+def _apply_rate_if_newer(conn, status_label, natural_key, rate, updated_at, updated_by):
+    """
+    The shared last-write-wins merge behind BOTH the per-row rate carried
+    inside a snapshot and a standalone rate-update message (see
+    build_rate_update_payload/apply_rate_update below). Only overwrites
+    the locally stored rate if the incoming edit is strictly newer than
+    whatever timestamp is already stored -- an incoming edit that's the
+    same age or older than the local one is left alone, so replaying an
+    old message (or two devices' clocks disagreeing by a few seconds)
+    can't undo a genuinely newer local edit.
+    """
+    table_name = STATUS_TABLES.get(status_label)
+    if table_name is None or rate is None or not updated_at:
+        return False
+
+    row = conn.execute(
+        f'SELECT id, rate_updated_at FROM "{table_name}" '
+        f'WHERE day = ? AND "Project Number" = ? AND "Task Name" = ? '
+        f'AND person_number = ? AND received_month = ?',
+        natural_key,
+    ).fetchone()
+    if row is None:
+        return False  # the timecard itself hasn't landed here -- nothing to attach a rate to
+
+    record_id, stored_updated_at = row
+    incoming_parsed = _parse_received(updated_at)
+    stored_parsed = _parse_received(stored_updated_at) if stored_updated_at else None
+    if incoming_parsed is not None and stored_parsed is not None and stored_parsed >= incoming_parsed:
+        return False
+
+    conn.execute(
+        f'UPDATE "{table_name}" SET rate = ?, rate_updated_at = ?, rate_updated_by = ? WHERE id = ?',
+        (rate, updated_at, updated_by, record_id),
+    )
+    return True
+
+
+def build_rate_update_payload(status_key, record_id):
+    """
+    A small standalone message for ONE rate edit, meant to be sent right
+    after the edit happens rather than waiting for the next full scan/
+    snapshot -- the point is the other user seeing a rate you just typed
+    in without needing to Scan Inbox first. Returns None if record_id
+    doesn't exist.
+    """
+    table_name = STATUS_TABLES.get(_STATUS_LABELS.get(status_key, "Approved"))
+    if table_name is None:
+        return None
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            f'SELECT day, "Project Number", "Task Name", person_number, received_month, '
+            f'rate, rate_updated_at, rate_updated_by FROM "{table_name}" WHERE id = ?',
+            (record_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+
+    day, project_number, task_name, person_number, received_month, rate, rate_updated_at, rate_updated_by = row
+    return {
+        "device_id": get_device_id(),
+        "status": _STATUS_LABELS.get(status_key, "Approved"),
+        "natural_key": [day, project_number, task_name, person_number, received_month],
+        "rate": rate,
+        "rate_updated_at": rate_updated_at,
+        "rate_updated_by": rate_updated_by,
+    }
+
+
+def apply_rate_update(payload):
+    """Applies one standalone rate-update message (see
+    build_rate_update_payload). Returns True if it actually changed
+    anything (i.e. it was newer than what's already stored)."""
+    if not payload:
+        return False
+    natural_key = tuple(payload.get("natural_key") or ())
+    if len(natural_key) != 5:
+        return False
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        applied = _apply_rate_if_newer(
+            conn,
+            status_label=payload.get("status"),
+            natural_key=natural_key,
+            rate=payload.get("rate"),
+            updated_at=payload.get("rate_updated_at"),
+            updated_by=payload.get("rate_updated_by"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return applied
+
+
+def record_finalize_from_other_device(name, end_date):
+    """
+    Applied when THIS device receives a "finalize" sync message from the
+    other user (see sync_service.pull_updates) -- logs their export into
+    THIS device's own export_history and advances THIS device's
+    last_export_date to match theirs.
+
+    This is what makes the finalize boundary SHARED state instead of
+    something each machine tracks independently: without it, the device
+    that didn't click Finalize would keep treating the just-closed period
+    as still open, and any timecard received in the last few days of it
+    would get scanned into what it thinks is next month's data instead.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        _record_export(conn, name)
+        _set_last_export_date(conn, end_date)
+        conn.commit()
+    finally:
         conn.close()
 
 
