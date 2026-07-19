@@ -1,8 +1,11 @@
 import sqlite3
 import csv
+import json
 import os
 import re
-from datetime import datetime
+import urllib.error
+import urllib.request
+from datetime import date, datetime
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Border, Side
@@ -34,10 +37,15 @@ _ACT_HEADERS = [
 ]
 _ACT_TITLE = "Advanced Computer Technology (Middle East) LABOR and EXPENSE Overview per Period"
 _ACT_PO = "AE110007829"
-_AED_FORMAT = (
-    '_([$AED]\\ * #,##0.00_);_([$AED]\\ * \\(#,##0.00\\);'
-    '_([$AED]\\ * "-"??_);_(@_)'
+_USD_FORMAT = (
+    '_([$USD]\\ * #,##0.00_);_([$USD]\\ * \\(#,##0.00\\);'
+    '_([$USD]\\ * "-"??_);_(@_)'
 )
+
+# --- Live currency conversion (expenses -> USD) -------------------------
+_FX_API_URL = "https://open.er-api.com/v6/latest/USD"  # free, keyless; {code: units-per-USD}
+_FX_CACHE_TTL_SECONDS = 3600  # re-fetch at most once an hour
+_FX_REQUEST_TIMEOUT_SECONDS = 5
 
 
 def _ensure_columns(conn, table, column_defs):
@@ -642,44 +650,79 @@ def _rebuild_project_type_tables(conn):
 
 
 def _create_expenses_table(conn):
-    # Expense-report line items (see extractor_service.extract_expense): one
-    # row per line of an "Expense Item" table, with the report's document-level
-    # fields (project, status, submitter/approver) copied onto each. The
-    # filter only ever matches APPROVED reports, so there's one table here, not
-    # the three-status split the timecards use.
+    # Expense reports (see extractor_service.extract_expense): one row per
+    # report, not per line item -- the report's own header fields are all we
+    # keep, since the Expense Item line table is no longer parsed. "Amount"/
+    # currency hold the report's "Report Total : <amount> <currency>" line.
     #
-    # Shared columns are named exactly like the timecard tables ("Project
-    # Number"/"Project Name"/"Task Name"/"Date") so the two can be joined --
-    # the relation is on "Project Number". What makes a line unique is its
-    # report id + item number: re-reading the same report updates its lines
-    # rather than duplicating them.
+    # "Project Number"/"Project Name" are named exactly like the timecard
+    # tables so the two can be joined on "Project Number". What makes a
+    # report unique is its own report number: re-reading the same report
+    # updates its row rather than duplicating it.
+    #
+    # A table from before this line-item -> report-level rework has "item"
+    # in its schema and no UNIQUE(expense_report) -- there's no way to keep
+    # its rows (they were keyed per line, not per report), so it's dropped
+    # and rebuilt fresh rather than migrated.
+    old_columns = {row[1] for row in conn.execute('PRAGMA table_info("expenses")')}
+    if "item" in old_columns:
+        conn.execute('DROP TABLE "expenses"')
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS expenses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             expense_report TEXT,
-            item TEXT,
-            "Date" TEXT,
             "Project Number" TEXT,
             "Project Name" TEXT,
-            "Task Name" TEXT,
-            expense_type TEXT,
             "Amount" REAL,
             currency TEXT,
-            description TEXT,
-            receipt TEXT,
             status TEXT,
             submitted_by TEXT,
-            approved_by TEXT,
-            approved_on TEXT,
-            report_total TEXT,
-            report_currency TEXT,
             subject TEXT,
             sender TEXT,
             received TEXT,
             received_month TEXT,
-            UNIQUE(expense_report, item)
+            UNIQUE(expense_report)
         )
     """)
+    # Which timecard row this expense is billed against (see
+    # extractor_service.extract_expense / _fill_fallback_timecard_match):
+    # link_method is "same_email" (a timecard day in this expense's own
+    # email matched its expense_date -- highest priority, no DB row
+    # required), "fallback_date_match" (no such day in that email, so this
+    # is one of the sender's OTHER approved timecard rows whose own date
+    # matches instead -- matched_timecard_id is that row's real id in
+    # timecards_approved), or "none" (no expense_date, or nothing anywhere
+    # lands on it). The matched_* columns describe the pinned day-row
+    # either way, so displaying/exporting a link never needs a join.
+    _ensure_columns(conn, "expenses", [
+        "link_method TEXT",
+        "matched_timecard_id INTEGER",
+        "matched_sender TEXT",
+        "matched_person_number TEXT",
+        "matched_name TEXT",
+        "matched_period TEXT",
+        "matched_subject TEXT",
+        "matched_day TEXT",
+        "matched_project_number TEXT",
+        "matched_project_name TEXT",
+        "matched_task_name TEXT",
+        # expense_date is the LATEST date among this report's own Expense
+        # Item lines (see extractor_service._expense_header_fields) --
+        # the anchor both matching paths key on. matched_date is the
+        # derived real calendar date of the timecard day-entry actually
+        # picked (see _derive_timecard_date) -- equal to expense_date
+        # whenever link_method isn't "none", kept alongside it so a
+        # mismatch would be visible rather than silently assumed.
+        "expense_date TEXT",
+        "matched_date TEXT",
+        # "Amount"/currency are the report's own reported total, kept as-is
+        # for traceability; amount_usd is that same total converted with
+        # the live rate in effect when the report was scanned (see
+        # _to_usd) -- what every cross-currency sum (e.g. two reports
+        # linked to the same record) actually adds together.
+        "amount_usd REAL",
+    ])
 
 
 def init_db():
@@ -1366,37 +1409,251 @@ def _expense_amount(value):
         return None
 
 
+# A timecard row's own "day" ("Tuesday, 26 May") never carries a year --
+# "period" ("01/01/2026 - 01/07/2026") is the only place one lives. Mirrors
+# extractor_service's identically-named helpers exactly (same text shape,
+# read here from DB columns instead of freshly parsed text) -- kept as a
+# small, self-contained duplicate rather than an import so this module's
+# only DB-facing timecard-matching logic doesn't reach into the extractor.
+_MONTH_ABBR = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+_period_range_pattern = re.compile(
+    r"(?P<sm>\d{1,2})/(?P<sd>\d{1,2})/(?P<sy>\d{2,4})\s*-\s*"
+    r"(?P<em>\d{1,2})/(?P<ed>\d{1,2})/(?P<ey>\d{2,4})"
+)
+_day_text_pattern = re.compile(r"(?P<weekday>[A-Za-z]+),\s*(?P<dom>\d{1,2})\s+(?P<month>[A-Za-z]+)")
+
+
+def _full_year(year_str):
+    year = int(year_str)
+    return year if year > 99 else 2000 + year
+
+
+def _derive_timecard_date(day_text, period_text):
+    """Recovers the real calendar date a timecard row refers to, by
+    combining its own 'day' text with the year(s) implied by its 'period'.
+    Returns a 'YYYY-MM-DD' string, or None if either piece can't be parsed.
+    See extractor_service._derive_timecard_date for the full reasoning
+    (year-boundary weeks, etc) -- identical logic, mirrored here."""
+    day_match = _day_text_pattern.search(day_text or "")
+    period_match = _period_range_pattern.search(period_text or "")
+    if not day_match or not period_match:
+        return None
+
+    month = _MONTH_ABBR.get(day_match.group("month").strip().upper())
+    if not month:
+        return None
+    dom = int(day_match.group("dom"))
+
+    try:
+        start = date(_full_year(period_match.group("sy")), int(period_match.group("sm")), int(period_match.group("sd")))
+        end = date(_full_year(period_match.group("ey")), int(period_match.group("em")), int(period_match.group("ed")))
+    except ValueError:
+        start = end = None
+
+    candidate_years = [start.year, end.year] if start and end else [_full_year(period_match.group("sy"))]
+    candidates = []
+    for year in dict.fromkeys(candidate_years):
+        try:
+            candidates.append(date(year, month, dom))
+        except ValueError:
+            continue
+    if not candidates:
+        return None
+
+    if start and end:
+        in_range = [c for c in candidates if start <= c <= end]
+        if in_range:
+            return in_range[0].isoformat()
+    return candidates[0].isoformat()
+
+
+def _fetch_live_usd_rates():
+    """Today's {currency_code: units-per-USD} table from a free, keyless
+    FX API. Returns None on any failure (offline, API down, bad response)
+    -- callers fall back to whatever's cached rather than blowing up a
+    scan/export over a network hiccup."""
+    try:
+        with urllib.request.urlopen(_FX_API_URL, timeout=_FX_REQUEST_TIMEOUT_SECONDS) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        if payload.get("result") != "success" or not payload.get("rates"):
+            return None
+        return payload["rates"]
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+        print(f"[FX] Could not fetch live exchange rates: {exc}")
+        return None
+
+
+def _cached_usd_rates(conn):
+    """Live {currency: units-per-USD} table, cached in app_state for
+    _FX_CACHE_TTL_SECONDS -- so a whole batch of expenses scanned together
+    shares one network round trip instead of each triggering its own.
+    Falls back to whatever was last cached (however stale) when a fresh
+    fetch fails; returns None only when there has never been a successful
+    fetch at all.
+    """
+    rates_row = conn.execute(
+        "SELECT value FROM app_state WHERE key = 'fx_rates_usd'"
+    ).fetchone()
+    cached = json.loads(rates_row[0]) if rates_row and rates_row[0] else None
+
+    fetched_row = conn.execute(
+        "SELECT value FROM app_state WHERE key = 'fx_rates_fetched_at'"
+    ).fetchone()
+    fetched_at = _parse_received(fetched_row[0]) if fetched_row and fetched_row[0] else None
+    is_fresh = (
+        fetched_at is not None
+        and (datetime.now() - fetched_at).total_seconds() < _FX_CACHE_TTL_SECONDS
+    )
+    if cached is not None and is_fresh:
+        return cached
+
+    fresh = _fetch_live_usd_rates()
+    if fresh is None:
+        return cached  # stale-but-better-than-nothing, or None if never fetched
+
+    conn.execute(
+        "INSERT INTO app_state (key, value) VALUES ('fx_rates_usd', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (json.dumps(fresh),),
+    )
+    conn.execute(
+        "INSERT INTO app_state (key, value) VALUES ('fx_rates_fetched_at', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),),
+    )
+    return fresh
+
+
+def _to_usd(conn, amount, currency):
+    """`amount` (in `currency`) converted to USD using the live/cached rate
+    table, or None when it can't be converted (unrecognized/missing
+    currency code, or no rate table has ever been fetched successfully)."""
+    if amount is None:
+        return None
+    code = (currency or "").strip().upper()
+    if code == "USD":
+        return amount
+    rates = _cached_usd_rates(conn)
+    if not rates or not rates.get(code):
+        return None
+    return amount / rates[code]
+
+
 def _expense_to_row(entry: dict) -> tuple:
     return (
         entry.get("expense_report"),
-        entry.get("item"),
-        entry.get("date"),
         entry.get("project_code"),
         entry.get("project_name"),
-        entry.get("task"),
-        entry.get("expense_type"),
-        _expense_amount(entry.get("amount")),
-        entry.get("currency"),
-        entry.get("description"),
-        entry.get("receipt"),
+        _expense_amount(entry.get("report_total")),
+        entry.get("report_currency"),
         entry.get("status"),
         entry.get("submitted_by"),
-        entry.get("approved_by"),
-        entry.get("approved_on"),
-        entry.get("report_total"),
-        entry.get("report_currency"),
         entry.get("subject"),
         entry.get("sender"),
         entry.get("received"),
         _received_month(entry.get("received")),
+        entry.get("link_method"),
+        entry.get("matched_timecard_id"),
+        entry.get("matched_sender"),
+        entry.get("matched_person_number"),
+        entry.get("matched_name"),
+        entry.get("matched_period"),
+        entry.get("matched_subject"),
+        entry.get("matched_day"),
+        entry.get("matched_project_number"),
+        entry.get("matched_project_name"),
+        entry.get("matched_task_name"),
+        entry.get("amount_usd"),
+        entry.get("expense_date"),
+        entry.get("matched_date"),
     )
+
+
+def _fill_fallback_timecard_match(conn, entry):
+    """
+    Fills in an expense entry's matched_* fields when extract_expense found
+    no timecard day matching this report's expense_date in the expense's
+    own email (entry has no "link_method" yet) -- the highest-priority
+    match is always a same-email date match (stamped by extract_expense
+    itself); this only runs for entries that didn't get one.
+
+    Searches EVERY one of the sender's own approved timecard rows (across
+    all their timecard emails, not just the expense's own) for one whose
+    derived real calendar date (see _derive_timecard_date) equals this
+    report's expense_date, and takes the latest-received match when more
+    than one qualifies.
+
+    Mutates entry in place. Sets link_method to "fallback_date_match" when
+    a same-date row is found; "none" otherwise -- no expense_date to match
+    on, an unknown sender, or no row of the sender's lands on that date at
+    all. Deliberately doesn't fall further back to "just the sender's last
+    record regardless of date": attaching an expense to an unrelated day
+    would be a worse answer than leaving it unlinked.
+    """
+    sender = entry.get("sender")
+    expense_date = entry.get("expense_date")
+    if not sender or not expense_date:
+        entry["link_method"] = "none"
+        return
+
+    candidates = conn.execute("""
+        SELECT id, day, "Project Number", "Project Name", "Task Name",
+               name, person_number, period, subject, sender, received
+        FROM timecards_approved
+        WHERE sender = ?
+    """, (sender,)).fetchall()
+
+    best = None
+    best_received = None
+    for row in candidates:
+        (tc_id, day, project_number, project_name, task_name,
+         name, person_number, period, subject, tc_sender, received) = row
+        if _derive_timecard_date(day, period) != expense_date:
+            continue
+        parsed_received = _parse_received(received)
+        if best is None or (parsed_received is not None and (best_received is None or parsed_received > best_received)):
+            best = row
+            best_received = parsed_received
+
+    if best is None:
+        entry["link_method"] = "none"
+        return
+
+    (tc_id, day, project_number, project_name, task_name,
+     name, person_number, period, subject, tc_sender, _received) = best
+    entry["link_method"] = "fallback_date_match"
+    entry["matched_timecard_id"] = tc_id
+    entry["matched_sender"] = tc_sender
+    entry["matched_person_number"] = person_number
+    entry["matched_name"] = name
+    entry["matched_period"] = period
+    entry["matched_subject"] = subject
+    entry["matched_day"] = day
+    entry["matched_date"] = expense_date
+    entry["matched_project_number"] = project_number
+    entry["matched_project_name"] = project_name
+    entry["matched_task_name"] = task_name
 
 
 def save_expenses(entries: list):
     """
-    Persist expense-report line items (from extractor_service.extract_expense).
-    Keyed on (expense_report, item): re-reading the same report refreshes its
-    existing line rows in place rather than inserting duplicates.
+    Persist expense reports (from extractor_service.extract_expense) -- one
+    row per report. Keyed on expense_report: re-reading the same report
+    refreshes its existing row in place rather than inserting a duplicate.
+
+    Each entry that extract_expense didn't already match to a same-email,
+    same-date timecard (no "link_method" set) gets the cross-email,
+    same-date fallback applied here, where the DB it needs to search
+    actually lives (see _fill_fallback_timecard_match).
+
+    Each entry also gets amount_usd filled in here: its own reported
+    amount/currency converted with the live rate in effect right now (see
+    _to_usd). Doing the conversion once, at save time, means it's frozen to
+    the rate on the day the report was actually scanned rather than
+    silently drifting every time an export re-reads the row later.
     """
     if not entries:
         return
@@ -1404,33 +1661,46 @@ def save_expenses(entries: list):
     conn = sqlite3.connect(DB_PATH)
     try:
         _create_expenses_table(conn)
+        for entry in entries:
+            if not entry.get("link_method"):
+                _fill_fallback_timecard_match(conn, entry)
+            entry["amount_usd"] = _to_usd(
+                conn, _expense_amount(entry.get("report_total")), entry.get("report_currency")
+            )
         conn.executemany("""
             INSERT INTO expenses
-            (expense_report, item, "Date", "Project Number", "Project Name", "Task Name",
-             expense_type, "Amount", currency, description, receipt, status,
-             submitted_by, approved_by, approved_on, report_total, report_currency,
-             subject, sender, received, received_month)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(expense_report, item) DO UPDATE SET
-                "Date" = excluded."Date",
+            (expense_report, "Project Number", "Project Name", "Amount", currency,
+             status, submitted_by, subject, sender, received, received_month,
+             link_method, matched_timecard_id, matched_sender, matched_person_number,
+             matched_name, matched_period, matched_subject, matched_day,
+             matched_project_number, matched_project_name, matched_task_name, amount_usd,
+             expense_date, matched_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(expense_report) DO UPDATE SET
                 "Project Number" = excluded."Project Number",
                 "Project Name" = excluded."Project Name",
-                "Task Name" = excluded."Task Name",
-                expense_type = excluded.expense_type,
                 "Amount" = excluded."Amount",
                 currency = excluded.currency,
-                description = excluded.description,
-                receipt = excluded.receipt,
                 status = excluded.status,
                 submitted_by = excluded.submitted_by,
-                approved_by = excluded.approved_by,
-                approved_on = excluded.approved_on,
-                report_total = excluded.report_total,
-                report_currency = excluded.report_currency,
                 subject = excluded.subject,
                 sender = excluded.sender,
                 received = excluded.received,
-                received_month = excluded.received_month
+                received_month = excluded.received_month,
+                link_method = excluded.link_method,
+                matched_timecard_id = excluded.matched_timecard_id,
+                matched_sender = excluded.matched_sender,
+                matched_person_number = excluded.matched_person_number,
+                matched_name = excluded.matched_name,
+                matched_period = excluded.matched_period,
+                matched_subject = excluded.matched_subject,
+                matched_day = excluded.matched_day,
+                matched_project_number = excluded.matched_project_number,
+                matched_project_name = excluded.matched_project_name,
+                matched_task_name = excluded.matched_task_name,
+                amount_usd = excluded.amount_usd,
+                expense_date = excluded.expense_date,
+                matched_date = excluded.matched_date
         """, [_expense_to_row(e) for e in entries])
         conn.commit()
     finally:
@@ -1455,7 +1725,7 @@ def get_expense_rows(start_date=None, end_date=None, project_type=None):
         where, params = _project_type_clause(project_type)
         where_sql = f" WHERE {where}" if where else ""
         cursor = conn.execute(
-            f'SELECT * FROM expenses{where_sql} ORDER BY "Date" DESC, expense_report ASC, item ASC',
+            f'SELECT * FROM expenses{where_sql} ORDER BY received DESC, expense_report ASC',
             params,
         )
         columns = [desc[0] for desc in cursor.description]
@@ -1488,10 +1758,10 @@ def get_expense_columns():
 
 
 def export_expenses_to_csv(output_path="expenses.csv"):
-    """Dump the expenses table to a CSV, one row per line item."""
+    """Dump the expenses table to a CSV, one row per report."""
     conn = sqlite3.connect(DB_PATH)
     try:
-        cursor = conn.execute('SELECT * FROM expenses ORDER BY "Date" ASC, expense_report ASC, item ASC')
+        cursor = conn.execute('SELECT * FROM expenses ORDER BY received ASC, expense_report ASC')
         columns = [desc[0] for desc in cursor.description]
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
@@ -1858,6 +2128,60 @@ def export_summary_csv_range(start_date: str, end_date: str, output_path: str, p
     return len(rows)
 
 
+def _linked_expenses_by_timecard(conn, timecard_ids):
+    """
+    {timecard_row_id: total_linked_expense_amount_usd} for the given
+    timecards_approved ids, out of every expense linked to one of them
+    (see extractor_service.extract_expense / storage_service.save_expenses
+    for how that link is made). Covers both link_method kinds:
+      - "fallback_date_match" -- matched_timecard_id IS that row's real id.
+      - "same_email" -- no real id (that path never persists a row for the
+        in-email timecard text -- see extract_expense's docstring), so it's
+        resolved back to a real id here by matching the same identifying
+        fields (sender/subject/day/person_number) against these rows
+        instead.
+
+    Sums amount_usd, not the report's own raw "Amount" -- two reports on
+    the same record aren't necessarily in the same currency, so adding
+    their face-value amounts together would be meaningless. amount_usd is
+    already each report's own amount converted at the rate in effect when
+    it was scanned (see _to_usd), so summing it is a real total. A record
+    with more than one linked expense (rare) therefore gets both added
+    together here rather than one silently overwriting the other -- and a
+    report that couldn't be converted (amount_usd is NULL) contributes
+    nothing rather than sinking the whole sum.
+    """
+    if not timecard_ids:
+        return {}
+
+    placeholders = ",".join("?" * len(timecard_ids))
+    totals = {}
+
+    for tc_id, amount_usd in conn.execute(f"""
+        SELECT matched_timecard_id, amount_usd FROM expenses
+        WHERE link_method = 'fallback_date_match' AND matched_timecard_id IN ({placeholders})
+    """, timecard_ids):
+        totals[tc_id] = (totals.get(tc_id) or 0) + (amount_usd or 0)
+
+    same_email_expenses = conn.execute("""
+        SELECT matched_sender, matched_subject, matched_day, matched_person_number, amount_usd
+        FROM expenses WHERE link_method = 'same_email'
+    """).fetchall()
+    if same_email_expenses:
+        rows = conn.execute(f"""
+            SELECT id, sender, subject, day, person_number FROM timecards_approved
+            WHERE id IN ({placeholders})
+        """, timecard_ids).fetchall()
+        by_descriptor = {(sender, subject, day, person_number): tc_id
+                         for tc_id, sender, subject, day, person_number in rows}
+        for m_sender, m_subject, m_day, m_person, amount_usd in same_email_expenses:
+            tc_id = by_descriptor.get((m_sender, m_subject, m_day, m_person))
+            if tc_id is not None:
+                totals[tc_id] = (totals.get(tc_id) or 0) + (amount_usd or 0)
+
+    return totals
+
+
 def export_act_invoice_overview_range(start_date: str, end_date: str, output_path: str, project_type=None) -> int:
     """
     Exports approved timecard rows whose "Date" falls within
@@ -1870,12 +2194,25 @@ def export_act_invoice_overview_range(start_date: str, end_date: str, output_pat
     Expense row, mirroring the template's existing pattern:
       LABOR row   -> Date, PO (fixed), Line=1, Type=LABOR, Project Number,
                      Project Name, Period, Task Name, Qty, Sales Price
-                     (=rate), Total Amount (=Qty*Sales Price formula).
+                     (=rate, converted from AED to USD at the live rate --
+                     see below), Total Amount (=Qty*Sales Price formula).
                      Invoice No / Project Mgr / SOW / Consultant are left
                      blank -- not tracked by this system.
-      Expense row -> nothing but Line=2, Type=Expense, Sales Price=0,
-                     and the Total Amount formula (matches the template's
-                     own blank Expense rows exactly).
+      Expense row -> Line=2, Type=Expense, and the Total Amount formula.
+                     Sales Price is that record's own linked expense
+                     amount (already in USD -- see
+                     _linked_expenses_by_timecard) when one exists, or 0
+                     -- an unchanged blank row -- otherwise.
+
+    Every monetary figure on the sheet -- LABOR, Expense, and the
+    LABOR/EXPENSE/Invoice Total/VAT totals block -- ends up in USD, so
+    nothing on it silently mixes currencies. rate is entered by hand
+    elsewhere in AED (that's the one implicit currency this whole system
+    otherwise assumes), so it's converted here with the same live/cached
+    rate table _to_usd uses for expenses. If no AED rate can be resolved
+    at all (never fetched successfully, and offline right now) this
+    raises rather than exporting an invoice with silently wrong LABOR
+    totals -- that's worse than an export simply failing.
 
     Returns the number of source timecard rows written (i.e. half the
     number of spreadsheet rows, since each becomes a LABOR+Expense pair).
@@ -1891,6 +2228,20 @@ def export_act_invoice_overview_range(start_date: str, end_date: str, output_pat
         [start_date, end_date, *type_params],
     )
     rows = cursor.fetchall()
+    linked_expenses = _linked_expenses_by_timecard(conn, [row[0] for row in rows])
+
+    aed_per_usd = None
+    if rows:
+        fx_rates = _cached_usd_rates(conn)
+        aed_per_usd = fx_rates.get("AED") if fx_rates else None
+        if not aed_per_usd:
+            conn.close()
+            raise RuntimeError(
+                "Could not get a live AED -> USD exchange rate (no internet right "
+                "now, and none cached from an earlier run) -- refusing to export an "
+                "invoice with unconverted LABOR amounts. Try again once you have a "
+                "connection."
+            )
 
     wb = Workbook()
     ws = wb.active
@@ -1909,6 +2260,7 @@ def export_act_invoice_overview_range(start_date: str, end_date: str, output_pat
     for _id, project_number, project_name, task_name, qty, rate, day, period in rows:
         qty_val = float(qty) if qty not in (None, "") else None
         rate_val = float(rate) if rate not in (None, "") else 0.0
+        rate_usd = rate_val / aed_per_usd
 
         # LABOR row
         ws.cell(row=r, column=2, value=day)                 # Date (no year, as extracted)
@@ -1920,19 +2272,21 @@ def export_act_invoice_overview_range(start_date: str, end_date: str, output_pat
         ws.cell(row=r, column=11, value="LABOR")              # Type
         ws.cell(row=r, column=12, value=project_number)      # Project Number
         ws.cell(row=r, column=14, value=qty_val)              # Qty
-        sp_cell = ws.cell(row=r, column=15, value=rate_val)   # Sales Price
-        sp_cell.number_format = _AED_FORMAT
+        sp_cell = ws.cell(row=r, column=15, value=rate_usd)   # Sales Price (USD)
+        sp_cell.number_format = _USD_FORMAT
         total_cell = ws.cell(row=r, column=16, value=f"=N{r}*O{r}")  # Total Amount
-        total_cell.number_format = _AED_FORMAT
+        total_cell.number_format = _USD_FORMAT
         r += 1
 
-        # Expense row -- nothing but Line=2, Type, Sales Price=0, Total formula
+        # Expense row -- Line=2, Type, Total formula; Sales Price is this
+        # record's own linked expense amount (already converted to USD --
+        # see _linked_expenses_by_timecard) when it has one, 0 otherwise.
         ws.cell(row=r, column=10, value=2)
         ws.cell(row=r, column=11, value="Expense")
-        sp_cell = ws.cell(row=r, column=15, value=0)
-        sp_cell.number_format = _AED_FORMAT
+        sp_cell = ws.cell(row=r, column=15, value=linked_expenses.get(_id) or 0)
+        sp_cell.number_format = _USD_FORMAT
         total_cell = ws.cell(row=r, column=16, value=f"=N{r}*O{r}")
-        total_cell.number_format = _AED_FORMAT
+        total_cell.number_format = _USD_FORMAT
         r += 1
 
     last_data_row = r - 1
@@ -1963,7 +2317,7 @@ def export_act_invoice_overview_range(start_date: str, end_date: str, output_pat
 
     for total_row in (t, t + 1, t + 2, t + 3, t + 4):
         cell = ws.cell(row=total_row, column=16)
-        cell.number_format = _AED_FORMAT
+        cell.number_format = _USD_FORMAT
 
     for col_letter, width in zip("BCDEFGHIJKLMNOP", [12, 11, 30, 16, 30, 13, 14, 8, 6, 8, 14, 14, 7, 13, 15]):
         ws.column_dimensions[col_letter].width = width
