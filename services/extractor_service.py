@@ -272,15 +272,6 @@ _MONTH_ABBR = {
 _oracle_date_pattern = re.compile(r"\b(\d{1,2})-([A-Za-z]{3})-(\d{4})\b")
 _expense_item_marker_pattern = re.compile(r"Expense Item", re.IGNORECASE)
 
-# A timecard's own "period" ("01/01/2026 - 01/07/2026") is the only place a
-# day-block's year lives -- "day" itself ("Tuesday, 26 May") never carries one.
-_period_range_pattern = re.compile(
-    r"(?P<sm>\d{1,2})/(?P<sd>\d{1,2})/(?P<sy>\d{2,4})\s*-\s*"
-    r"(?P<em>\d{1,2})/(?P<ed>\d{1,2})/(?P<ey>\d{2,4})"
-)
-_day_text_pattern = re.compile(r"(?P<weekday>[A-Za-z]+),\s*(?P<dom>\d{1,2})\s+(?P<month>[A-Za-z]+)")
-
-
 def _parse_oracle_date(day_str, month_str, year_str):
     """('02', 'MAR', '2026') -> 'YYYY-MM-DD', or None if the month
     abbreviation or the resulting date isn't valid."""
@@ -308,55 +299,6 @@ def _expense_item_dates(chunk):
         if parsed:
             dates.append(parsed)
     return dates
-
-
-def _full_year(year_str):
-    year = int(year_str)
-    return year if year > 99 else 2000 + year
-
-
-def _derive_timecard_date(day_text, period_text):
-    """Recovers the real calendar date a timecard day-entry refers to, by
-    combining its own 'day' text ('Tuesday, 26 May' -- no year) with the
-    year(s) implied by its 'period' ('MM/DD/YYYY - MM/DD/YYYY'). Returns a
-    'YYYY-MM-DD' string, or None if either piece can't be parsed.
-
-    Tries the period's start year first, then its end year -- a week
-    that crosses a year boundary (e.g. period 12/29/2025 - 01/04/2026) has
-    days that belong to each -- and prefers whichever candidate actually
-    falls inside [period start, period end] when both parse.
-    """
-    day_match = _day_text_pattern.search(day_text or "")
-    period_match = _period_range_pattern.search(period_text or "")
-    if not day_match or not period_match:
-        return None
-
-    month = _MONTH_ABBR.get(day_match.group("month").strip().upper())
-    if not month:
-        return None
-    dom = int(day_match.group("dom"))
-
-    try:
-        start = date(_full_year(period_match.group("sy")), int(period_match.group("sm")), int(period_match.group("sd")))
-        end = date(_full_year(period_match.group("ey")), int(period_match.group("em")), int(period_match.group("ed")))
-    except ValueError:
-        start = end = None
-
-    candidate_years = [start.year, end.year] if start and end else [_full_year(period_match.group("sy"))]
-    candidates = []
-    for year in dict.fromkeys(candidate_years):
-        try:
-            candidates.append(date(year, month, dom))
-        except ValueError:
-            continue
-    if not candidates:
-        return None
-
-    if start and end:
-        in_range = [c for c in candidates if start <= c <= end]
-        if in_range:
-            return in_range[0].isoformat()
-    return candidates[0].isoformat()
 
 
 def _expense_header_fields(text):
@@ -445,45 +387,6 @@ def _expense_texts(mail_item):
     return texts
 
 
-def _timecard_entries_in_text(text):
-    """Every timecard day-entry found in one text blob, each carrying its
-    document-level header fields (name/period/person_number) plus its own
-    derived calendar date (see _derive_timecard_date). Reuses the exact
-    same day-block/header parsing extract() itself uses for the real
-    timecard scan. A day-block whose date can't be derived (bad/missing
-    day or period text) is skipped -- there's nothing to match it by."""
-    header_fields = _header_fields(text)
-    entries = []
-    for day, block in _day_blocks(text):
-        parsed = _parse_block(day, block)
-        if parsed is None:
-            continue
-        parsed["name"] = header_fields["name"]
-        parsed["period"] = header_fields["period"]
-        parsed["person_number"] = header_fields["person_number"]
-        parsed["derived_date"] = _derive_timecard_date(parsed["day"], parsed["period"])
-        if parsed["derived_date"] is not None:
-            entries.append(parsed)
-    return entries
-
-
-def _in_email_timecard_match(texts, target_date):
-    """Scan every text source of ONE expense email (each PDF attachment's
-    text, plus the body) for an embedded timecard day-entry whose OWN
-    derived date equals target_date -- highest-priority way to know whose
-    expense this is and which specific day it belongs to: the same email
-    that carries the expense report can also carry that person's own
-    timecard (body or attachment). Returns the first matching day-entry
-    found, or None if target_date is unknown or nothing matches it."""
-    if target_date is None:
-        return None
-    for _source_name, text in texts:
-        for entry in _timecard_entries_in_text(text):
-            if entry["derived_date"] == target_date:
-                return entry
-    return None
-
-
 def extract_expense(email):
     """
     email: a matched-email dict from filter_service.get_expense_reports()
@@ -497,17 +400,14 @@ def extract_expense(email):
     within it, on its own; a report seen in more than one source (e.g. the
     same text repeated across the PDF and the body) is only kept once.
 
-    Also maps each report to the timecard record it should be billed
-    against (see storage_service.save_expenses/_fill_fallback_timecard_match
-    for the full picture): highest priority is a timecard day-entry found
-    in this SAME email (body or attachment) whose own date matches this
-    report's expense_date (the latest date among its Expense Item lines --
-    see _expense_header_fields) -- when one exists, the report is stamped
-    with it right here, in-memory, with no DB lookup needed. A report with
-    no expense_date, or whose expense_date matches nothing in this email,
-    is left without a "link_method", which tells save_expenses to search
-    the sender's OTHER timecard emails for a day matching that same date
-    instead.
+    Linking each report to the timecard RECORD it should be billed against
+    (i.e. which sender/period submission it belongs to) is NOT done here --
+    see storage_service.save_expenses/_fill_sender_timecard_match, which
+    matches purely on the report's sender email against the sender of each
+    timecard record on file (preferring the record whose period contains
+    this report's expense_date, falling back to that sender's most
+    recently received record). This function only extracts each report's
+    own fields.
     """
     mail_item = email["mail_item"]
     subject = email.get("subject") or ""
@@ -540,21 +440,6 @@ def extract_expense(email):
             # Approved by construction -- fall back to that if the header
             # text didn't spell it out.
             entry["status"] = header.get("status") or email.get("status") or "Approved"
-
-            timecard_match = _in_email_timecard_match(texts, entry.get("expense_date"))
-            if timecard_match is not None:
-                entry["link_method"] = "same_email"
-                entry["matched_timecard_id"] = None  # not a real DB row -- see extract_expense's docstring
-                entry["matched_sender"] = sender
-                entry["matched_person_number"] = timecard_match.get("person_number")
-                entry["matched_name"] = timecard_match.get("name")
-                entry["matched_period"] = timecard_match.get("period")
-                entry["matched_subject"] = subject
-                entry["matched_day"] = timecard_match.get("day")
-                entry["matched_date"] = timecard_match.get("derived_date")
-                entry["matched_project_number"] = timecard_match.get("project_code")
-                entry["matched_project_name"] = timecard_match.get("project_name")
-                entry["matched_task_name"] = timecard_match.get("task")
 
             entries.append(entry)
 

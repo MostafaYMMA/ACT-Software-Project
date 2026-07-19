@@ -685,16 +685,18 @@ def _create_expenses_table(conn):
             UNIQUE(expense_report)
         )
     """)
-    # Which timecard row this expense is billed against (see
-    # extractor_service.extract_expense / _fill_fallback_timecard_match):
-    # link_method is "same_email" (a timecard day in this expense's own
-    # email matched its expense_date -- highest priority, no DB row
-    # required), "fallback_date_match" (no such day in that email, so this
-    # is one of the sender's OTHER approved timecard rows whose own date
-    # matches instead -- matched_timecard_id is that row's real id in
-    # timecards_approved), or "none" (no expense_date, or nothing anywhere
-    # lands on it). The matched_* columns describe the pinned day-row
-    # either way, so displaying/exporting a link never needs a join.
+    # Which timecard RECORD this expense is billed against (see
+    # storage_service._fill_sender_timecard_match): link_method is
+    # "period_match" (one of the sender's own timecard records has a
+    # period containing this report's expense_date), "latest_fallback"
+    # (no record's period contains it -- or expense_date is unknown -- so
+    # this is simply that sender's most recently received record), or
+    # "none" (the sender submitted no timecard record at all, or the
+    # report has no sender). matched_timecard_id/matched_day/matched_date/
+    # matched_project_number/matched_project_name/matched_task_name are
+    # kept as columns for backward compatibility but are no longer
+    # populated: a record can span several days/projects/tasks, so none of
+    # those has one single value at record level anymore.
     _ensure_columns(conn, "expenses", [
         "link_method TEXT",
         "matched_timecard_id INTEGER",
@@ -703,17 +705,21 @@ def _create_expenses_table(conn):
         "matched_name TEXT",
         "matched_period TEXT",
         "matched_subject TEXT",
+        # Completes the (sender, period, subject, received) key that
+        # identifies one timecard RECORD (see _fill_sender_timecard_match) --
+        # without it, two records from the same sender/period/subject (e.g.
+        # the same week resent) couldn't be told apart when resolving a
+        # linked expense back to its day-rows for invoicing.
+        "matched_received TEXT",
         "matched_day TEXT",
         "matched_project_number TEXT",
         "matched_project_name TEXT",
         "matched_task_name TEXT",
         # expense_date is the LATEST date among this report's own Expense
         # Item lines (see extractor_service._expense_header_fields) --
-        # the anchor both matching paths key on. matched_date is the
-        # derived real calendar date of the timecard day-entry actually
-        # picked (see _derive_timecard_date) -- equal to expense_date
-        # whenever link_method isn't "none", kept alongside it so a
-        # mismatch would be visible rather than silently assumed.
+        # the anchor _fill_sender_timecard_match checks against each
+        # candidate record's period. matched_date is no longer populated
+        # (see above) -- kept as a column for backward compatibility.
         "expense_date TEXT",
         "matched_date TEXT",
         # "Amount"/currency are the report's own reported total, kept as-is
@@ -1409,21 +1415,13 @@ def _expense_amount(value):
         return None
 
 
-# A timecard row's own "day" ("Tuesday, 26 May") never carries a year --
-# "period" ("01/01/2026 - 01/07/2026") is the only place one lives. Mirrors
-# extractor_service's identically-named helpers exactly (same text shape,
-# read here from DB columns instead of freshly parsed text) -- kept as a
-# small, self-contained duplicate rather than an import so this module's
-# only DB-facing timecard-matching logic doesn't reach into the extractor.
-_MONTH_ABBR = {
-    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
-    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
-}
+# A timecard record's "period" ("01/01/2026 - 01/07/2026") is what a
+# report's expense_date is now checked against -- not a specific day
+# anymore (see _fill_sender_timecard_match).
 _period_range_pattern = re.compile(
     r"(?P<sm>\d{1,2})/(?P<sd>\d{1,2})/(?P<sy>\d{2,4})\s*-\s*"
     r"(?P<em>\d{1,2})/(?P<ed>\d{1,2})/(?P<ey>\d{2,4})"
 )
-_day_text_pattern = re.compile(r"(?P<weekday>[A-Za-z]+),\s*(?P<dom>\d{1,2})\s+(?P<month>[A-Za-z]+)")
 
 
 def _full_year(year_str):
@@ -1431,43 +1429,18 @@ def _full_year(year_str):
     return year if year > 99 else 2000 + year
 
 
-def _derive_timecard_date(day_text, period_text):
-    """Recovers the real calendar date a timecard row refers to, by
-    combining its own 'day' text with the year(s) implied by its 'period'.
-    Returns a 'YYYY-MM-DD' string, or None if either piece can't be parsed.
-    See extractor_service._derive_timecard_date for the full reasoning
-    (year-boundary weeks, etc) -- identical logic, mirrored here."""
-    day_match = _day_text_pattern.search(day_text or "")
-    period_match = _period_range_pattern.search(period_text or "")
-    if not day_match or not period_match:
-        return None
-
-    month = _MONTH_ABBR.get(day_match.group("month").strip().upper())
-    if not month:
-        return None
-    dom = int(day_match.group("dom"))
-
+def _period_bounds(period_text):
+    """('01/01/2026 - 01/07/2026') -> (date(2026,1,1), date(2026,1,7)), or
+    (None, None) if period_text doesn't parse."""
+    match = _period_range_pattern.search(period_text or "")
+    if not match:
+        return None, None
     try:
-        start = date(_full_year(period_match.group("sy")), int(period_match.group("sm")), int(period_match.group("sd")))
-        end = date(_full_year(period_match.group("ey")), int(period_match.group("em")), int(period_match.group("ed")))
+        start = date(_full_year(match.group("sy")), int(match.group("sm")), int(match.group("sd")))
+        end = date(_full_year(match.group("ey")), int(match.group("em")), int(match.group("ed")))
+        return start, end
     except ValueError:
-        start = end = None
-
-    candidate_years = [start.year, end.year] if start and end else [_full_year(period_match.group("sy"))]
-    candidates = []
-    for year in dict.fromkeys(candidate_years):
-        try:
-            candidates.append(date(year, month, dom))
-        except ValueError:
-            continue
-    if not candidates:
-        return None
-
-    if start and end:
-        in_range = [c for c in candidates if start <= c <= end]
-        if in_range:
-            return in_range[0].isoformat()
-    return candidates[0].isoformat()
+        return None, None
 
 
 def _fetch_live_usd_rates():
@@ -1569,73 +1542,91 @@ def _expense_to_row(entry: dict) -> tuple:
         entry.get("amount_usd"),
         entry.get("expense_date"),
         entry.get("matched_date"),
+        entry.get("matched_received"),
     )
 
 
-def _fill_fallback_timecard_match(conn, entry):
+def _fill_sender_timecard_match(conn, entry):
     """
-    Fills in an expense entry's matched_* fields when extract_expense found
-    no timecard day matching this report's expense_date in the expense's
-    own email (entry has no "link_method" yet) -- the highest-priority
-    match is always a same-email date match (stamped by extract_expense
-    itself); this only runs for entries that didn't get one.
+    Fills in an expense entry's matched_* fields by linking it to a whole
+    timecard RECORD submitted by the same sender -- not to a specific day
+    within one, which is how this used to work (see git history for the
+    old day/date-based version).
 
-    Searches EVERY one of the sender's own approved timecard rows (across
-    all their timecard emails, not just the expense's own) for one whose
-    derived real calendar date (see _derive_timecard_date) equals this
-    report's expense_date, and takes the latest-received match when more
-    than one qualifies.
+    A "record" here is one submitted timecard: the group of per-day rows in
+    timecards_approved that share the same (sender, period, subject,
+    received) -- those four fields are identical across every day-row
+    extracted out of a single approved-timecard email, so grouping on them
+    recovers "one submission" out of the day-level table without needing a
+    separate table for it.
 
-    Mutates entry in place. Sets link_method to "fallback_date_match" when
-    a same-date row is found; "none" otherwise -- no expense_date to match
-    on, an unknown sender, or no row of the sender's lands on that date at
-    all. Deliberately doesn't fall further back to "just the sender's last
-    record regardless of date": attaching an expense to an unrelated day
-    would be a worse answer than leaving it unlinked.
+    Preference order, among the sender's own records:
+      1. A record whose period ("MM/DD/YYYY - MM/DD/YYYY") contains this
+         report's expense_date. If more than one does (overlapping
+         periods), the most-recently-received one wins.
+      2. If none of the sender's records has a period containing
+         expense_date (including when expense_date itself is unknown),
+         fall back to that sender's single most-recently-received record.
+      3. If the sender has no timecard record at all, link_method is
+         "none" and nothing else is filled.
+
+    Mutates entry in place. Sets link_method to "period_match" or
+    "latest_fallback" accordingly. Day-specific fields that made sense for
+    the old per-day match -- matched_timecard_id, matched_day, matched_date,
+    matched_project_number, matched_project_name, matched_task_name -- have
+    no single value at record level (a record can span several days,
+    projects and tasks) and are simply left unset (NULL) here.
     """
     sender = entry.get("sender")
-    expense_date = entry.get("expense_date")
-    if not sender or not expense_date:
+    if not sender:
         entry["link_method"] = "none"
         return
 
-    candidates = conn.execute("""
-        SELECT id, day, "Project Number", "Project Name", "Task Name",
-               name, person_number, period, subject, sender, received
+    records = conn.execute("""
+        SELECT sender, period, subject, received, name, person_number
         FROM timecards_approved
         WHERE sender = ?
+        GROUP BY sender, period, subject, received
     """, (sender,)).fetchall()
+
+    if not records:
+        entry["link_method"] = "none"
+        return
+
+    expense_date_str = entry.get("expense_date")
+    expense_date = None
+    if expense_date_str:
+        try:
+            expense_date = date.fromisoformat(expense_date_str)
+        except ValueError:
+            expense_date = None
+
+    containing = []
+    if expense_date is not None:
+        for row in records:
+            start, end = _period_bounds(row[1])
+            if start and end and start <= expense_date <= end:
+                containing.append(row)
+
+    pool = containing if containing else records
+    link_method = "period_match" if containing else "latest_fallback"
 
     best = None
     best_received = None
-    for row in candidates:
-        (tc_id, day, project_number, project_name, task_name,
-         name, person_number, period, subject, tc_sender, received) = row
-        if _derive_timecard_date(day, period) != expense_date:
-            continue
-        parsed_received = _parse_received(received)
+    for row in pool:
+        parsed_received = _parse_received(row[3])
         if best is None or (parsed_received is not None and (best_received is None or parsed_received > best_received)):
             best = row
             best_received = parsed_received
 
-    if best is None:
-        entry["link_method"] = "none"
-        return
-
-    (tc_id, day, project_number, project_name, task_name,
-     name, person_number, period, subject, tc_sender, _received) = best
-    entry["link_method"] = "fallback_date_match"
-    entry["matched_timecard_id"] = tc_id
+    tc_sender, period, subject, received, name, person_number = best
+    entry["link_method"] = link_method
     entry["matched_sender"] = tc_sender
     entry["matched_person_number"] = person_number
     entry["matched_name"] = name
     entry["matched_period"] = period
     entry["matched_subject"] = subject
-    entry["matched_day"] = day
-    entry["matched_date"] = expense_date
-    entry["matched_project_number"] = project_number
-    entry["matched_project_name"] = project_name
-    entry["matched_task_name"] = task_name
+    entry["matched_received"] = received
 
 
 def save_expenses(entries: list):
@@ -1644,10 +1635,9 @@ def save_expenses(entries: list):
     row per report. Keyed on expense_report: re-reading the same report
     refreshes its existing row in place rather than inserting a duplicate.
 
-    Each entry that extract_expense didn't already match to a same-email,
-    same-date timecard (no "link_method" set) gets the cross-email,
-    same-date fallback applied here, where the DB it needs to search
-    actually lives (see _fill_fallback_timecard_match).
+    Every entry is linked here to the timecard record submitted by the
+    same sender (see _fill_sender_timecard_match) -- extract_expense no
+    longer does any matching itself.
 
     Each entry also gets amount_usd filled in here: its own reported
     amount/currency converted with the live rate in effect right now (see
@@ -1662,8 +1652,7 @@ def save_expenses(entries: list):
     try:
         _create_expenses_table(conn)
         for entry in entries:
-            if not entry.get("link_method"):
-                _fill_fallback_timecard_match(conn, entry)
+            _fill_sender_timecard_match(conn, entry)
             entry["amount_usd"] = _to_usd(
                 conn, _expense_amount(entry.get("report_total")), entry.get("report_currency")
             )
@@ -1674,8 +1663,8 @@ def save_expenses(entries: list):
              link_method, matched_timecard_id, matched_sender, matched_person_number,
              matched_name, matched_period, matched_subject, matched_day,
              matched_project_number, matched_project_name, matched_task_name, amount_usd,
-             expense_date, matched_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             expense_date, matched_date, matched_received)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(expense_report) DO UPDATE SET
                 "Project Number" = excluded."Project Number",
                 "Project Name" = excluded."Project Name",
@@ -1699,6 +1688,7 @@ def save_expenses(entries: list):
                 matched_project_name = excluded.matched_project_name,
                 matched_task_name = excluded.matched_task_name,
                 amount_usd = excluded.amount_usd,
+                matched_received = excluded.matched_received,
                 expense_date = excluded.expense_date,
                 matched_date = excluded.matched_date
         """, [_expense_to_row(e) for e in entries])
@@ -2131,53 +2121,65 @@ def export_summary_csv_range(start_date: str, end_date: str, output_path: str, p
 def _linked_expenses_by_timecard(conn, timecard_ids):
     """
     {timecard_row_id: total_linked_expense_amount_usd} for the given
-    timecards_approved ids, out of every expense linked to one of them
-    (see extractor_service.extract_expense / storage_service.save_expenses
-    for how that link is made). Covers both link_method kinds:
-      - "fallback_date_match" -- matched_timecard_id IS that row's real id.
-      - "same_email" -- no real id (that path never persists a row for the
-        in-email timecard text -- see extract_expense's docstring), so it's
-        resolved back to a real id here by matching the same identifying
-        fields (sender/subject/day/person_number) against these rows
-        instead.
+    timecards_approved ids, out of every expense linked to one of them (see
+    storage_service._fill_sender_timecard_match for how that link is made).
+
+    Linking now happens at the RECORD level (sender+period+subject+received
+    -- one submitted timecard, which is usually several day-rows), not to
+    one specific day-row. To resolve a linked expense back to real ids here:
+    every row in timecard_ids is grouped by that same (sender, period,
+    subject, received) key, each expense (link_method != 'none') is matched
+    to the group sharing its matched_sender/matched_period/matched_subject/
+    matched_received, and that expense's amount_usd is added to the group's
+    running total.
+
+    Each record's total is then attributed to a single representative
+    day-row -- the lowest id in the group -- with every other day-row in
+    that same record left out of the returned dict entirely. This is
+    deliberate: export_act_invoice_overview_range writes one Expense row
+    per day-row and SUMs them for the invoice total, so putting the same
+    record-level total on every one of its days would multiply it by
+    however many days that timecard covered.
 
     Sums amount_usd, not the report's own raw "Amount" -- two reports on
     the same record aren't necessarily in the same currency, so adding
     their face-value amounts together would be meaningless. amount_usd is
     already each report's own amount converted at the rate in effect when
     it was scanned (see _to_usd), so summing it is a real total. A record
-    with more than one linked expense (rare) therefore gets both added
-    together here rather than one silently overwriting the other -- and a
-    report that couldn't be converted (amount_usd is NULL) contributes
-    nothing rather than sinking the whole sum.
+    with more than one linked expense therefore gets both added together
+    here rather than one silently overwriting the other -- and a report
+    that couldn't be converted (amount_usd is NULL) contributes nothing
+    rather than sinking the whole sum.
     """
     if not timecard_ids:
         return {}
 
     placeholders = ",".join("?" * len(timecard_ids))
-    totals = {}
+    rows = conn.execute(f"""
+        SELECT id, sender, period, subject, received FROM timecards_approved
+        WHERE id IN ({placeholders})
+    """, timecard_ids).fetchall()
 
-    for tc_id, amount_usd in conn.execute(f"""
-        SELECT matched_timecard_id, amount_usd FROM expenses
-        WHERE link_method = 'fallback_date_match' AND matched_timecard_id IN ({placeholders})
-    """, timecard_ids):
-        totals[tc_id] = (totals.get(tc_id) or 0) + (amount_usd or 0)
+    # One representative id per (sender, period, subject, received) group --
+    # the lowest id in that group -- to attribute the whole record's linked
+    # total to a single day-row rather than every day-row in it.
+    representative_id = {}
+    for tc_id, sender, period, subject, received in rows:
+        key = (sender, period, subject, received)
+        if key not in representative_id or tc_id < representative_id[key]:
+            representative_id[key] = tc_id
 
-    same_email_expenses = conn.execute("""
-        SELECT matched_sender, matched_subject, matched_day, matched_person_number, amount_usd
-        FROM expenses WHERE link_method = 'same_email'
+    linked = conn.execute("""
+        SELECT matched_sender, matched_period, matched_subject, matched_received, amount_usd
+        FROM expenses WHERE link_method != 'none'
     """).fetchall()
-    if same_email_expenses:
-        rows = conn.execute(f"""
-            SELECT id, sender, subject, day, person_number FROM timecards_approved
-            WHERE id IN ({placeholders})
-        """, timecard_ids).fetchall()
-        by_descriptor = {(sender, subject, day, person_number): tc_id
-                         for tc_id, sender, subject, day, person_number in rows}
-        for m_sender, m_subject, m_day, m_person, amount_usd in same_email_expenses:
-            tc_id = by_descriptor.get((m_sender, m_subject, m_day, m_person))
-            if tc_id is not None:
-                totals[tc_id] = (totals.get(tc_id) or 0) + (amount_usd or 0)
+
+    totals = {}
+    for m_sender, m_period, m_subject, m_received, amount_usd in linked:
+        key = (m_sender, m_period, m_subject, m_received)
+        tc_id = representative_id.get(key)
+        if tc_id is not None:
+            totals[tc_id] = (totals.get(tc_id) or 0) + (amount_usd or 0)
 
     return totals
 
