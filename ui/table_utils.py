@@ -12,14 +12,16 @@ from PySide6.QtCore import Qt
 # the status tables' UNIQUE key); the preferred order puts the columns people
 # actually scan first, and anything new on the table shows up after them
 # automatically rather than needing to be listed.
-HIDDEN_COLUMNS = {"id", "timecard_id", "received_month"}
+HIDDEN_COLUMNS = {"id", "timecard_id", "received_month", "matched_timecard_id"}
 PREFERRED_COLUMN_ORDER = [
     "status", "subject", "Project Number", "Project Name", "Task Name",
     "Date", "Qty", "rate",
     # Expense-report columns (only present on the expenses grid; harmless on
     # the timecard grids, where order_columns filters them out as absent).
-    "expense_type", "Amount", "currency", "description", "receipt",
-    "submitted_by", "approved_by", "approved_on", "expense_report", "item",
+    "expense_report", "Amount", "currency", "amount_usd", "expense_date", "submitted_by",
+    "link_method", "matched_name", "matched_person_number", "matched_period",
+    "matched_day", "matched_date", "matched_project_number", "matched_project_name",
+    "matched_task_name", "matched_sender", "matched_subject",
 ]
 HEADER_LABELS = {
     "status": "Status",
@@ -36,17 +38,22 @@ HEADER_LABELS = {
     "is_exported": "Exported",
     # Expenses grid
     "expense_report": "Expense Report",
-    "item": "Item",
-    "expense_type": "Expense Type",
     "Amount": "Amount",
     "currency": "Currency",
-    "description": "Description",
-    "receipt": "Receipt",
+    "amount_usd": "Amount (USD)",
+    "expense_date": "Expense Date",
     "submitted_by": "Submitted By",
-    "approved_by": "Approved By",
-    "approved_on": "Approved On",
-    "report_total": "Report Total",
-    "report_currency": "Report Currency",
+    "link_method": "Matched Via",
+    "matched_sender": "Matched Sender",
+    "matched_person_number": "Matched Person Number",
+    "matched_name": "Matched Name",
+    "matched_period": "Matched Period",
+    "matched_subject": "Matched Subject",
+    "matched_day": "Matched Day",
+    "matched_date": "Matched Date",
+    "matched_project_number": "Matched Project Number",
+    "matched_project_name": "Matched Project Name",
+    "matched_task_name": "Matched Task Name",
 }
 MAX_COLUMN_WIDTH = 320
 
