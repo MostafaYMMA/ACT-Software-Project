@@ -31,3 +31,18 @@ def get_custom_range(start_date, end_date):
         end_date = end_date.replace(hour=23, minute=59, second=59, microsecond=999999)
 
     return start_date, end_date
+
+
+def get_since_last_export_range(last_export_date, now=None):
+    """
+    (start, end) for "scan/finalize everything since the last export" --
+    start is midnight of last_export_date ('YYYY-MM-DD'), end is now.
+    start is None (no lower bound at all) if nothing's ever been
+    exported yet -- there's no boundary to start from on the very first
+    run, so the caller gets everything currently reachable instead.
+    """
+    now = now or datetime.now()
+    if not last_export_date:
+        return None, now
+    start = datetime.strptime(last_export_date, "%Y-%m-%d")
+    return start, now

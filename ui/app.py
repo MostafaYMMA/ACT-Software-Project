@@ -29,6 +29,7 @@ from ui.transition import FadeStackedWidget
 from ui.notification_banner import NotificationBanner
 from ui.notification_settings import notification_settings
 from ui.Pages.Dashboard import DashboardPage
+from ui.Pages.CurrentSheet import CurrentSheetPage
 from ui.Pages.History import HistoryPage
 from ui.Pages.Records import RecordsPage
 from ui.Pages.Late import LatePage
@@ -67,6 +68,7 @@ _RECORDS_TILT_DEG = -8.0
 _HISTORY_REWIND_DEG = -28.0
 _SETTINGS_SPIN_DEG = 90.0
 _LATE_POP_SCALE = 1.12
+_SHEET_LIFT_SCALE = 1.15
 
 # Shared vertical rhythm for the rail and the panel: same top margin,
 # same reserved header height, same row height, same spacing between
@@ -248,6 +250,8 @@ class IconRailButton(QPushButton):
             self._play_shake()
         elif self.icon_key == "settings":
             self._animate_rotation(_SETTINGS_SPIN_DEG, QEasingCurve.Type.InOutQuad, RAIL_ICON_ANIM_MS + 80)
+        elif self.icon_key == "sheet":
+            self._animate_scale(_SHEET_LIFT_SCALE, QEasingCurve.Type.OutBack, RAIL_ICON_ANIM_MS)
         else:
             self._animate_scale(_DASHBOARD_POP_SCALE, QEasingCurve.Type.OutBack, RAIL_ICON_ANIM_MS)
 
@@ -519,6 +523,7 @@ class MainWindow(QWidget):
         self.stack = FadeStackedWidget(content_area)
         self.pages = {
             "Dashboard": DashboardPage(),
+            "CurrentSheet": CurrentSheetPage(),
             "Records": RecordsPage(),
             "History": HistoryPage(),
             "Late": LatePage(),
@@ -535,6 +540,7 @@ class MainWindow(QWidget):
         # a generic shape.
         nav_items = [
             ("dashboard", "Dashboard", "Dashboard"),
+            ("sheet", "Current Sheet", "CurrentSheet"),
             ("records", "Records", "Records"),
             ("export", "Export History", "History"),
             ("late", "Late", "Late"),

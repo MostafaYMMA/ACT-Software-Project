@@ -5,7 +5,7 @@ via ui/notification_settings.py). That threshold drives both the
 banner in ui/app.py and the Late tab (ui/Pages/Late.py).
 """
 
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QComboBox, QFrame, QLineEdit
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QComboBox, QFrame
 from PySide6.QtCore import Qt
 
 from ui.theme_manager import theme_manager
@@ -13,10 +13,8 @@ from ui.theme_utils import apply_live_style
 from ui.toggle_switch import ToggleSwitch, SUN_ICON, MOON_ICON
 from ui.switch import Switch
 from ui.notification_settings import notification_settings
-from ui.sync_partner_settings import sync_partner_settings
 
 BELL_ICON = "\U0001F514"
-SYNC_ICON = "\U0001F501"
 HOURS_PER_DAY = 24
 
 
@@ -100,50 +98,6 @@ class SettingsPage(QWidget):
         threshold_row.addStretch()
         layout.addLayout(threshold_row)
 
-        sync_divider = QFrame()
-        sync_divider.setFixedHeight(1)
-        apply_live_style(sync_divider, lambda c: f"background-color: {c['BORDER']};")
-        layout.addWidget(sync_divider)
-
-        # -- Cross-device sync partner ------------------------------------
-        # Where Update/Finalize on the Export History page send their sync
-        # mail (see services/sync_service.py + services/outlook_service.py).
-        # Persisted via ui/sync_partner_settings.py so it isn't re-typed
-        # every session.
-        sync_label = QLabel("Sync")
-        apply_live_style(sync_label, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 11px; font-weight: 700;")
-        layout.addWidget(sync_label)
-
-        sync_row = QHBoxLayout()
-        sync_row.setSpacing(10)
-
-        sync_icon_label = QLabel(SYNC_ICON)
-        sync_icon_label.setStyleSheet("font-size: 15px;")
-        sync_row.addWidget(sync_icon_label)
-
-        sync_text = QLabel("Other user's email (for Update/Finalize on Export History)")
-        sync_text.setWordWrap(True)
-        apply_live_style(sync_text, lambda c: f"color: {c['TEXT_PRIMARY']}; font-size: 13px;")
-        sync_row.addWidget(sync_text, stretch=1)
-
-        layout.addLayout(sync_row)
-
-        self._partner_email_edit = QLineEdit(sync_partner_settings.partner_email)
-        self._partner_email_edit.setPlaceholderText("their.email@company.com")
-        self._partner_email_edit.editingFinished.connect(self._on_partner_email_edited)
-        apply_live_style(self._partner_email_edit, lambda c: f"""
-            QLineEdit {{
-                border: 1px solid {c['BORDER']};
-                border-radius: 6px;
-                padding: 6px 8px;
-                font-size: 13px;
-                background: {c['SURFACE']};
-                color: {c['TEXT_PRIMARY']};
-            }}
-            QLineEdit:focus {{ border: 1px solid {c['ACCENT']}; }}
-        """)
-        layout.addWidget(self._partner_email_edit)
-
         layout.addStretch()
 
         self._load_threshold_into_controls(notification_settings.threshold_hours)
@@ -184,9 +138,6 @@ class SettingsPage(QWidget):
     def _on_notify_toggled(self, checked):
         notification_settings.set_enabled(checked)
         self._update_threshold_enabled(checked)
-
-    def _on_partner_email_edited(self):
-        sync_partner_settings.set_partner_email(self._partner_email_edit.text())
 
     def _on_threshold_changed(self, _value):
         multiplier = HOURS_PER_DAY if self._threshold_unit.currentText() == "Days" else 1
