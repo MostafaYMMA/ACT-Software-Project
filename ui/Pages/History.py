@@ -22,6 +22,11 @@ _FILENAME_SLUGS = {
     "hospitality": "hospitality",
 }
 
+# Accent used for the QDateEdit calendar popups on this page, so they read
+# as the same "orange" filter UI as the Records page's date filter instead
+# of Qt's default blue.
+_CALENDAR_ACCENT = "#FF7A00"
+
 
 def _last_month_range(today=None):
     """Returns (first_day, last_day) of the calendar month before today,
@@ -31,6 +36,45 @@ def _last_month_range(today=None):
     last_day_prev_month = first_of_this_month - timedelta(days=1)
     first_day_prev_month = last_day_prev_month.replace(day=1)
     return first_day_prev_month, last_day_prev_month
+
+
+def _apply_orange_calendar_style(date_edit):
+    """Restyles a QDateEdit's popup QCalendarWidget (created lazily once
+    setCalendarPopup(True) is set) to use the app's orange accent instead
+    of Qt's default blue, so it visually matches the Records page's date
+    filter. Purely cosmetic -- the QDateEdit/QCalendarWidget widgets and
+    all the .date()/.setDate() calls elsewhere in this file are untouched,
+    so none of the export/finalize logic changes."""
+    calendar = date_edit.calendarWidget()
+    apply_live_style(calendar, lambda c: f"""
+        QCalendarWidget QWidget {{
+            background-color: {c['SURFACE']}; color: {c['TEXT_PRIMARY']};
+        }}
+        QCalendarWidget QToolButton {{
+            background-color: transparent; color: {c['TEXT_PRIMARY']};
+            font-weight: 700; font-size: 13px; icon-size: 16px; padding: 4px;
+        }}
+        QCalendarWidget QToolButton:hover {{
+            background-color: {_CALENDAR_ACCENT}; color: white; border-radius: 4px;
+        }}
+        QCalendarWidget QMenu {{
+            background-color: {c['SURFACE']}; color: {c['TEXT_PRIMARY']};
+        }}
+        QCalendarWidget QSpinBox {{
+            background-color: {c['SURFACE']}; color: {c['TEXT_PRIMARY']};
+            selection-background-color: {_CALENDAR_ACCENT};
+        }}
+        #qt_calendar_navigationbar {{
+            background-color: {c['SURFACE']};
+        }}
+        QCalendarWidget QAbstractItemView:enabled {{
+            background-color: {c['BG']}; color: {c['TEXT_PRIMARY']};
+            selection-background-color: {_CALENDAR_ACCENT}; selection-color: white;
+        }}
+        QCalendarWidget QAbstractItemView:disabled {{
+            color: {c['TEXT_SECONDARY']};
+        }}
+    """)
 
 
 class _UpdateWorker(QObject):
@@ -184,7 +228,7 @@ class HistoryPage(QWidget):
                 background: {c['SURFACE']};
                 color: {c['TEXT_PRIMARY']};
             }}
-            QDateEdit:focus {{ border: 1px solid {c['ACCENT']}; }}
+            QDateEdit:focus {{ border: 1px solid {_CALENDAR_ACCENT}; }}
             QDateEdit::drop-down {{ border: none; width: 18px; }}
         """
 
@@ -193,6 +237,7 @@ class HistoryPage(QWidget):
         self.from_date.setDisplayFormat("yyyy-MM-dd")
         self.from_date.setDate(QDate.currentDate().addMonths(-1))
         apply_live_style(self.from_date, date_edit_style)
+        _apply_orange_calendar_style(self.from_date)
         controls_row.addWidget(self.from_date)
 
         to_label = QLabel("to")
@@ -204,6 +249,7 @@ class HistoryPage(QWidget):
         self.to_date.setDisplayFormat("yyyy-MM-dd")
         self.to_date.setDate(QDate.currentDate())
         apply_live_style(self.to_date, date_edit_style)
+        _apply_orange_calendar_style(self.to_date)
         controls_row.addWidget(self.to_date)
 
         range_btn = QPushButton("Export Range")
