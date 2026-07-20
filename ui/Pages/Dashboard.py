@@ -1,9 +1,11 @@
+from datetime import datetime
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy,
-    QButtonGroup,
+    QDateEdit, QButtonGroup,
 )
-from PySide6.QtCore import Qt, Signal, QThread, QObject, QPropertyAnimation, QEasingCurve, Property
+from PySide6.QtCore import Qt, Signal, QThread, QObject, QPropertyAnimation, QEasingCurve, Property, QDate
 
 from ui.theme_manager import theme_manager
 from ui.theme_utils import apply_live_style
@@ -18,7 +20,7 @@ from storage_service import (
     get_expense_rows, get_expense_count, get_expense_columns,
     get_last_export_date,
 )
-from date_utils import get_since_last_export_range
+from date_utils import get_since_last_export_range, get_this_month_range, get_custom_range
 
 CARD_ANIM_MS = 220
 
@@ -240,12 +242,91 @@ class DashboardPage(QWidget):
         header_row.addWidget(self.scan_btn)
         layout.addLayout(header_row)
 
-        # Scan window is no longer picked by hand -- it's always "since
-        # the last finalize/export, through now" (see
-        # date_utils.get_since_last_export_range), so the same window
-        # Scan Inbox covers is exactly what Finalize will later close
-        # out. A small label makes that window visible without needing
-        # controls to set it.
+        # Period row: choose which "received on" window Scan Inbox covers
+        # (and which window the stat cards/table below are currently
+        # filtered to). "Since Last Export" is the new default -- it's
+        # exactly the window Finalize will close out, so leaving it
+        # selected keeps Scan Inbox and Finalize describing the same
+        # period. This Month / Custom Range are the original manual
+        # options, for scanning something other than the current open
+        # period (re-checking an old month, etc).
+        period_row = QHBoxLayout()
+        period_row.setSpacing(8)
+
+        period_label = QLabel("Scan period:")
+        apply_live_style(period_label, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 12px;")
+        period_row.addWidget(period_label)
+
+        self.since_export_btn = QPushButton("Since Last Export")
+        self.since_export_btn.setObjectName("periodToggle")
+        self.since_export_btn.setCheckable(True)
+        self.since_export_btn.setChecked(True)
+        self.since_export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        period_row.addWidget(self.since_export_btn)
+
+        self.this_month_btn = QPushButton("This Month")
+        self.this_month_btn.setObjectName("periodToggle")
+        self.this_month_btn.setCheckable(True)
+        self.this_month_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        period_row.addWidget(self.this_month_btn)
+
+        self.custom_range_btn = QPushButton("Custom Range")
+        self.custom_range_btn.setObjectName("periodToggle")
+        self.custom_range_btn.setCheckable(True)
+        self.custom_range_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        period_row.addWidget(self.custom_range_btn)
+
+        self._period_group = QButtonGroup(self)
+        self._period_group.setExclusive(True)
+        self._period_group.addButton(self.since_export_btn)
+        self._period_group.addButton(self.this_month_btn)
+        self._period_group.addButton(self.custom_range_btn)
+
+        today = QDate.currentDate()
+        month_start = QDate(today.year(), today.month(), 1)
+
+        self.from_date_label = QLabel("From")
+        apply_live_style(self.from_date_label, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 12px;")
+        period_row.addWidget(self.from_date_label)
+
+        self.from_date_edit = QDateEdit(month_start)
+        self.from_date_edit.setCalendarPopup(True)
+        self.from_date_edit.setMaximumDate(today)
+        self.from_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.from_date_edit.setMinimumWidth(120)
+        period_row.addWidget(self.from_date_edit)
+
+        self.to_date_label = QLabel("To")
+        apply_live_style(self.to_date_label, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 12px;")
+        period_row.addWidget(self.to_date_label)
+
+        self.to_date_edit = QDateEdit(today)
+        self.to_date_edit.setCalendarPopup(True)
+        self.to_date_edit.setMaximumDate(today)
+        self.to_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.to_date_edit.setMinimumWidth(120)
+        period_row.addWidget(self.to_date_edit)
+
+        # Keep from <= to at all times, in either direction of edit.
+        self.from_date_edit.dateChanged.connect(self._on_from_date_changed)
+        self.to_date_edit.dateChanged.connect(self._on_to_date_changed)
+
+        self.custom_range_btn.toggled.connect(self._update_period_controls_enabled)
+        self._update_period_controls_enabled()
+
+        # The period picker doubles as a live filter on whatever's already
+        # in the DB, not just a gate on the next scan -- changing it
+        # re-queries immediately so the stat cards/table always reflect
+        # the currently selected window.
+        self.since_export_btn.toggled.connect(self._on_period_changed)
+        self.this_month_btn.toggled.connect(self._on_period_changed)
+        self.custom_range_btn.toggled.connect(self._on_period_changed)
+        self.from_date_edit.dateChanged.connect(self._on_period_changed)
+        self.to_date_edit.dateChanged.connect(self._on_period_changed)
+
+        period_row.addStretch()
+        layout.addLayout(period_row)
+
         self.period_hint = QLabel("")
         apply_live_style(self.period_hint, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 12px;")
         layout.addWidget(self.period_hint)
@@ -363,11 +444,40 @@ class DashboardPage(QWidget):
         self._rows_loading_overlay.reposition()
         self._fit_columns()
 
+    def _on_from_date_changed(self, qdate):
+        if qdate > self.to_date_edit.date():
+            self.to_date_edit.setDate(qdate)
+
+    def _on_to_date_changed(self, qdate):
+        if qdate < self.from_date_edit.date():
+            self.from_date_edit.setDate(qdate)
+
+    def _update_period_controls_enabled(self):
+        is_custom = self.custom_range_btn.isChecked()
+        for widget in (self.from_date_label, self.from_date_edit, self.to_date_label, self.to_date_edit):
+            widget.setEnabled(is_custom)
+
     def _get_selected_period(self):
-        """(start, end) datetimes covering everything since the last
-        finalize/export through now -- see date_utils.get_since_last_export_range.
-        Also updates the on-screen hint so the window is visible even
-        though there's nothing left to pick by hand."""
+        """(start, end) datetimes for whichever period option is
+        currently selected. "Since Last Export" (the default) mirrors
+        what Finalize will close out (see date_utils.
+        get_since_last_export_range); This Month / Custom Range are
+        manual overrides for scanning something else. Also updates the
+        on-screen hint so the active window is always visible."""
+        if self.this_month_btn.isChecked():
+            start, end = get_this_month_range()
+            self.period_hint.setText(f"Scanning this month: {start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')}.")
+            return start, end
+
+        if self.custom_range_btn.isChecked():
+            from_qdate = self.from_date_edit.date()
+            to_qdate = self.to_date_edit.date()
+            start = datetime(from_qdate.year(), from_qdate.month(), from_qdate.day())
+            end = datetime(to_qdate.year(), to_qdate.month(), to_qdate.day())
+            start, end = get_custom_range(start, end)
+            self.period_hint.setText(f"Scanning {start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')} (custom range).")
+            return start, end
+
         start, end = get_since_last_export_range(get_last_export_date())
         if start is None:
             self.period_hint.setText(f"Scanning everything through {end.strftime('%Y-%m-%d')} (nothing finalized yet).")
@@ -402,6 +512,19 @@ class DashboardPage(QWidget):
             return
         self._refresh_stat_cards()
         self._load_status_rows(getattr(self, "_selected_status_key", "approve"))
+
+    def _on_period_changed(self, *_args):
+        # Fires while the widgets are still being constructed (initial
+        # setChecked calls, etc.) and on every keystroke/clamp of the date
+        # editors -- only act once there's actually data on screen to
+        # refilter.
+        if not getattr(self, "_has_scanned", False):
+            self._get_selected_period()  # still worth refreshing the hint text even before the first scan
+            return
+        self._refresh_stat_cards()
+        selected_key = getattr(self, "_selected_status_key", None)
+        if selected_key is not None:
+            self._load_status_rows(selected_key)
 
     def _is_rows_loading(self):
         thread = getattr(self, "_rows_thread", None)

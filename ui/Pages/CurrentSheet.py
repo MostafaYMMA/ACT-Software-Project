@@ -18,9 +18,12 @@ local refresh.
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QButtonGroup, QMenu,
+    QStyledItemDelegate, QStyleOptionViewItem, QStyle,
 )
 from PySide6.QtCore import Qt, QSize, QTimer
 from PySide6.QtGui import QColor, QPixmap, QIcon, QPainter, QPen
+
+from ui.theme_manager import theme_manager
 
 from ui.theme_utils import apply_live_style
 from ui.loading_overlay import LoadingOverlay
@@ -56,7 +59,7 @@ _HIGHLIGHT_PALETTE = [
 # color itself -- a solid fill would fight with the row's own text/
 # selection contrast; a light wash reads as "tagged" without hurting
 # legibility.
-_HIGHLIGHT_ROW_TINT_ALPHA = 55
+_HIGHLIGHT_ROW_TINT_ALPHA = 90
 
 
 def _swatch_icon(color_hex):
@@ -104,6 +107,56 @@ class _HighlightButton(QPushButton):
                 lambda checked=False, c=color_hex: self.on_pick(self.row_status, self.row_id, c)
             )
         menu.exec(self.mapToGlobal(self.rect().bottomLeft()))
+
+
+class _HighlightAwareDelegate(QStyledItemDelegate):
+    """Paints table cells entirely by hand instead of delegating to the
+    base class's usual stylesheet-driven painting.
+
+    ui/theme.py sets a GLOBAL, app-wide "QTableWidget::item { ... }" rule
+    (applied once via QApplication.setStyleSheet() in main.py) that every
+    table in the app inherits, including this one -- and that's enough to
+    trigger a well-known Qt quirk where stylesheet-driven item painting
+    silently ignores Qt::BackgroundRole. item.setBackground() "succeeds"
+    (the data is genuinely stored) but the built-in paint path never
+    draws it. Since that global rule also supplies real, needed styling
+    (padding, selection color, etc.) for every OTHER table in the app, it
+    can't just be removed -- so instead this delegate bypasses the
+    stylesheet's item-painting step entirely, but only for THIS table
+    (installed via setItemDelegate below), leaving every other page's
+    tables untouched.
+    """
+
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+
+        painter.save()
+
+        if opt.state & QStyle.StateFlag.State_Selected:
+            painter.fillRect(opt.rect, opt.palette.highlight())
+            text_color = opt.palette.highlightedText().color()
+        else:
+            background = index.data(Qt.ItemDataRole.BackgroundRole)
+            if background is not None:
+                painter.fillRect(opt.rect, background)
+            foreground = index.data(Qt.ItemDataRole.ForegroundRole)
+            if foreground is not None:
+                text_color = foreground.color() if hasattr(foreground, "color") else QColor(foreground)
+            else:
+                text_color = opt.palette.text().color()
+
+        text = index.data(Qt.ItemDataRole.DisplayRole)
+        if text:
+            painter.setPen(text_color)
+            painter.setFont(opt.font)
+            alignment = index.data(Qt.ItemDataRole.TextAlignmentRole)
+            if not alignment:
+                alignment = int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+            padded_rect = opt.rect.adjusted(6, 0, -6, 0)
+            painter.drawText(padded_rect, int(alignment), str(text))
+
+        painter.restore()
 
 
 class CurrentSheetPage(QWidget):
@@ -179,6 +232,8 @@ class CurrentSheetPage(QWidget):
         configure_grid(self.table)
         self.table.setEditTriggers(QTableWidget.EditTrigger.DoubleClicked)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._highlight_delegate = _HighlightAwareDelegate(self.table)
+        self.table.setItemDelegate(self._highlight_delegate)
         self._populating_table = False
         self._displayed_columns = []
         self._displayed_rows = []
@@ -188,12 +243,19 @@ class CurrentSheetPage(QWidget):
                 border: 1px solid {c['BORDER']}; background: {c['BG']}; color: {c['TEXT_PRIMARY']};
                 gridline-color: {c['BORDER']};
             }}
-            QTableWidget::item {{ color: {c['TEXT_PRIMARY']}; }}
             QHeaderView::section {{
                 background-color: {c['SURFACE']}; color: {c['TEXT_PRIMARY']};
                 padding: 6px; border: none; font-weight: 700;
             }}
         """)
+        # Re-populates on a theme switch, now that item text color is set
+        # explicitly in code rather than via the QTableWidget::item QSS
+        # rule removed above (that rule, though it only set `color`, was
+        # enough to trigger a well-known Qt quirk where stylesheet-driven
+        # item painting silently ignores Qt::BackgroundRole -- i.e.
+        # item.setBackground() "succeeds" but is never actually drawn,
+        # which is why highlighted rows never showed a tint).
+        theme_manager.theme_changed.connect(lambda _mode: self.refresh())
         table_container_layout.addWidget(self.table)
         layout.addWidget(table_container, stretch=1)
 
@@ -237,6 +299,7 @@ class CurrentSheetPage(QWidget):
         columns = self._columns_for(rows)
         self._displayed_columns = columns
         self._displayed_rows = rows
+        text_color = QColor(theme_manager.colors()["TEXT_PRIMARY"])
 
         self._populating_table = True
         try:
@@ -262,6 +325,7 @@ class CurrentSheetPage(QWidget):
                         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     else:
                         item = QTableWidgetItem("" if value is None else str(value))
+                        item.setForeground(text_color)
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     if tint is not None:
                         item.setBackground(tint)
