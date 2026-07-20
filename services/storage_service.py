@@ -721,6 +721,12 @@ def _create_expenses_table(conn):
         # candidate record's period. matched_date is no longer populated
         # (see above) -- kept as a column for backward compatibility.
         "expense_date TEXT",
+        # Earliest of the report's own Expense Item dates (see
+        # extractor_service._expense_header_fields) -- together with
+        # expense_date (the latest) these bound the report's own span, which
+        # _fill_sender_timecard_match requires a candidate record's period to
+        # fully contain.
+        "expense_date_start TEXT",
         "matched_date TEXT",
         # "Amount"/currency are the report's own reported total, kept as-is
         # for traceability; amount_usd is that same total converted with
@@ -1541,6 +1547,7 @@ def _expense_to_row(entry: dict) -> tuple:
         entry.get("matched_task_name"),
         entry.get("amount_usd"),
         entry.get("expense_date"),
+        entry.get("expense_date_start"),
         entry.get("matched_date"),
         entry.get("matched_received"),
     )
@@ -1561,12 +1568,17 @@ def _fill_sender_timecard_match(conn, entry):
     separate table for it.
 
     Preference order, among the sender's own records:
-      1. A record whose period ("MM/DD/YYYY - MM/DD/YYYY") contains this
-         report's expense_date. If more than one does (overlapping
-         periods), the most-recently-received one wins.
-      2. If none of the sender's records has a period containing
-         expense_date (including when expense_date itself is unknown),
-         fall back to that sender's single most-recently-received record.
+      1. A record whose period ("MM/DD/YYYY - MM/DD/YYYY") fully contains
+         this report's own span, [expense_date_start, expense_date] (a
+         report listing several Expense Item dates, e.g. a multi-day trip,
+         must have ALL of those dates -- not just the latest one -- fall
+         inside a single timecard period to count; a report with only one
+         date collapses to a single-day span). If more than one record's
+         period contains that span (overlapping periods), the
+         most-recently-received one wins.
+      2. If none of the sender's records has a period containing that full
+         span (including when the span itself is unknown), fall back to
+         that sender's single most-recently-received record.
       3. If the sender has no timecard record at all, link_method is
          "none" and nothing else is filled.
 
@@ -1593,19 +1605,24 @@ def _fill_sender_timecard_match(conn, entry):
         entry["link_method"] = "none"
         return
 
-    expense_date_str = entry.get("expense_date")
-    expense_date = None
-    if expense_date_str:
+    def _parse_iso_date(value):
+        if not value:
+            return None
         try:
-            expense_date = date.fromisoformat(expense_date_str)
+            return date.fromisoformat(value)
         except ValueError:
-            expense_date = None
+            return None
+
+    expense_end = _parse_iso_date(entry.get("expense_date"))
+    expense_start = _parse_iso_date(entry.get("expense_date_start"))
+    if expense_start is None:
+        expense_start = expense_end  # single-date report (or span unknown, if expense_end is also None)
 
     containing = []
-    if expense_date is not None:
+    if expense_start is not None and expense_end is not None:
         for row in records:
             start, end = _period_bounds(row[1])
-            if start and end and start <= expense_date <= end:
+            if start and end and start <= expense_start and expense_end <= end:
                 containing.append(row)
 
     pool = containing if containing else records
@@ -1663,8 +1680,8 @@ def save_expenses(entries: list):
              link_method, matched_timecard_id, matched_sender, matched_person_number,
              matched_name, matched_period, matched_subject, matched_day,
              matched_project_number, matched_project_name, matched_task_name, amount_usd,
-             expense_date, matched_date, matched_received)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             expense_date, expense_date_start, matched_date, matched_received)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(expense_report) DO UPDATE SET
                 "Project Number" = excluded."Project Number",
                 "Project Name" = excluded."Project Name",
@@ -1690,6 +1707,7 @@ def save_expenses(entries: list):
                 amount_usd = excluded.amount_usd,
                 matched_received = excluded.matched_received,
                 expense_date = excluded.expense_date,
+                expense_date_start = excluded.expense_date_start,
                 matched_date = excluded.matched_date
         """, [_expense_to_row(e) for e in entries])
         conn.commit()
