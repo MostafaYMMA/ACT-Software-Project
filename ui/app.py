@@ -17,9 +17,9 @@ Layout:
 
 import os
 
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame
-from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QPointF, QEvent, Signal, QSize, Property, QObject
-from PySide6.QtGui import QPixmap, QColor, QPainter
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame, QGraphicsDropShadowEffect
+from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QPointF, QRectF, QEvent, Signal, QSize, Property, QObject
+from PySide6.QtGui import QPixmap, QColor, QPainter, QPen, QPainterPath
 
 from ui.theme_manager import theme_manager
 from ui.theme_utils import apply_live_style
@@ -77,6 +77,31 @@ RAIL_TOP_MARGIN = 16
 HEADER_BLOCK_HEIGHT = 56
 ROW_HEIGHT = 44        # matches IconRailButton's fixed size
 ROW_SPACING = 8
+
+# Purely decorative texture painted over the sliding Sidebar panel's
+# orange background, so it reads as its own surface rather than a flat
+# fill identical to the icon rail. Faint white diagonal hairlines -
+# opacity kept low so it never competes with the labels on top.
+_SIDEBAR_TEXTURE_COLOR = QColor(255, 255, 255, 16)
+_SIDEBAR_TEXTURE_SPACING = 14
+# A dark line drawn 1px below/right of each texture hairline before the
+# light line itself, so each hairline reads as very slightly engraved
+# instead of flat-printed on top of the orange.
+_SIDEBAR_TEXTURE_SHADOW_COLOR = QColor(0, 0, 0, 30)
+_SIDEBAR_TEXTURE_SHADOW_OFFSET = 1
+
+# Rounded corners + drop shadow for the sliding Sidebar panel, and the
+# "bubble" that pops in behind each PanelLabelRow on hover. All purely
+# decorative - none of this changes sizing, positioning, or the
+# show/hide/animate logic MainWindow already drives.
+_SIDEBAR_CORNER_RADIUS = 14
+_SIDEBAR_SHADOW_BLUR = 28
+_SIDEBAR_SHADOW_OFFSET = (0, 4)
+_SIDEBAR_SHADOW_COLOR = QColor(0, 0, 0, 90)
+
+_BUBBLE_RADIUS = 8
+_BUBBLE_IN_MS = 220
+_BUBBLE_OUT_MS = 160
 
 
 def _load_scaled_pixmap(path, target_width):
@@ -316,6 +341,23 @@ class _NavHoverLink(QObject):
         self.icon_button.play_leave_animation()
 
 
+def _right_rounded_path(w, h, radius):
+    """QPainterPath for a w x h rect with only the top-right and
+    bottom-right corners rounded. Used for the fixed icon rail, whose
+    left/top/bottom edges sit flush against the window frame and so
+    shouldn't be rounded - only the edge facing the content area should
+    read as a curve."""
+    path = QPainterPath()
+    path.moveTo(0, 0)
+    path.lineTo(w - radius, 0)
+    path.arcTo(w - 2 * radius, 0, 2 * radius, 2 * radius, 90, -90)
+    path.lineTo(w, h - radius)
+    path.arcTo(w - 2 * radius, h - 2 * radius, 2 * radius, 2 * radius, 0, -90)
+    path.lineTo(0, h)
+    path.closeSubpath()
+    return path
+
+
 class IconRail(QFrame):
     """Slim, always-docked strip: ACT logo mark on top, then icon-only
     versions of the same nav items as the labeled panel. No search icon -
@@ -327,7 +369,13 @@ class IconRail(QFrame):
         self.setObjectName("iconRail")
         self.setFixedWidth(RAIL_WIDTH)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
-        apply_live_style(self, lambda c: f"background-color: {QColor(c['ACCENT']).darker(112).name()};")
+        # Background is hand-painted in paintEvent below (see there) so
+        # its right edge can be genuinely curved - a plain stylesheet
+        # fill would stay a square rect underneath any rounding drawn on
+        # top of it. Still re-renders instantly on theme toggle, same as
+        # the old apply_live_style version did.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        theme_manager.theme_changed.connect(lambda _mode=None: self.update())
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, RAIL_TOP_MARGIN, 0, 16)
@@ -362,6 +410,15 @@ class IconRail(QFrame):
 
         layout.addStretch()
 
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = _right_rounded_path(self.width(), self.height(), _SIDEBAR_CORNER_RADIUS)
+        fill = QColor(theme_manager.colors()["ACCENT"]).darker(112)
+        painter.setClipPath(path)
+        painter.fillPath(path, fill)
+        painter.end()
+
 
 class PanelLabelRow(QFrame):
     """One row in the expanded panel: label only, no icon - the icon
@@ -383,6 +440,12 @@ class PanelLabelRow(QFrame):
         # plays its paired icon's animation instead of the label doing
         # anything on its own.
         self.hover_link = None
+        # Animated 0.0-1.0 value driving the hover "bubble" - see
+        # bubble_scale property + paintEvent below. Kept separate from
+        # hover_link, which only ever triggers the paired rail icon's
+        # animation, not this row's own visuals.
+        self._bubble_scale = 0.0
+        self._bubble_anim = None
 
         row_layout = QHBoxLayout(self)
         row_layout.setContentsMargins(14, 0, 14, 0)
@@ -394,10 +457,49 @@ class PanelLabelRow(QFrame):
         row_layout.addWidget(self.text_label, alignment=Qt.AlignmentFlag.AlignVCenter)
         row_layout.addStretch()
 
-        apply_live_style(self, lambda c: f"""
-            QFrame#panelLabelRow {{ background: transparent; border-radius: 8px; }}
-            QFrame#panelLabelRow:hover {{ background-color: {QColor(c['ACCENT']).lighter(115).name()}; }}
-        """)
+        apply_live_style(self, lambda c: "QFrame#panelLabelRow { background: transparent; }")
+
+    # -- animatable property: how "popped in" the hover bubble is --
+    def _get_bubble_scale(self):
+        return self._bubble_scale
+
+    def _set_bubble_scale(self, value):
+        self._bubble_scale = value
+        self.update()
+
+    bubble_scale = Property(float, _get_bubble_scale, _set_bubble_scale)
+
+    def _animate_bubble(self, target):
+        anim = QPropertyAnimation(self, b"bubble_scale", self)
+        anim.setStartValue(self._bubble_scale)
+        anim.setEndValue(target)
+        if target > 0:
+            anim.setDuration(_BUBBLE_IN_MS)
+            anim.setEasingCurve(QEasingCurve.Type.OutBack)
+        else:
+            anim.setDuration(_BUBBLE_OUT_MS)
+            anim.setEasingCurve(QEasingCurve.Type.InCubic)
+        anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+        self._bubble_anim = anim  # prevent garbage collection mid-animation
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._bubble_scale <= 0:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        full = self.rect()
+        w = full.width() * self._bubble_scale
+        h = full.height() * self._bubble_scale
+        bubble_rect = QRectF(
+            full.center().x() - w / 2, full.center().y() - h / 2, w, h
+        )
+        fill = QColor(theme_manager.colors()["ACCENT"]).lighter(120)
+        fill.setAlphaF(min(1.0, 0.35 + 0.55 * self._bubble_scale))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(fill)
+        painter.drawRoundedRect(bubble_rect, _BUBBLE_RADIUS, _BUBBLE_RADIUS)
+        painter.end()
 
     def mousePressEvent(self, event):
         self.clicked.emit(self.key)
@@ -406,11 +508,13 @@ class PanelLabelRow(QFrame):
     def enterEvent(self, event):
         if self.hover_link is not None:
             self.hover_link.enter()
+        self._animate_bubble(1.0)
         super().enterEvent(event)
 
     def leaveEvent(self, event):
         if self.hover_link is not None:
             self.hover_link.leave()
+        self._animate_bubble(0.0)
         super().leaveEvent(event)
 
 
@@ -429,6 +533,17 @@ class Sidebar(QFrame):
         self.setFixedWidth(SIDEBAR_WIDTH)
         self.on_select = on_select
         self.buttons = {}
+
+        # Corners are rounded by hand in paintEvent below (see there for
+        # why), so the widget itself needs to allow per-pixel transparency
+        # instead of always being treated as a fully opaque rectangle.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(_SIDEBAR_SHADOW_BLUR)
+        shadow.setOffset(*_SIDEBAR_SHADOW_OFFSET)
+        shadow.setColor(_SIDEBAR_SHADOW_COLOR)
+        self.setGraphicsEffect(shadow)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, RAIL_TOP_MARGIN, 0, 16)
@@ -465,6 +580,44 @@ class Sidebar(QFrame):
             self.buttons[key] = row
 
         layout.addStretch()
+
+    def paintEvent(self, event):
+        # Paints the panel itself instead of relying on the #sidebar QSS
+        # rule in theme.py, so the corners can be genuinely rounded (a
+        # stylesheet border-radius on an opaque widget still leaves
+        # square corners underneath) and the shadow effect above has real
+        # transparent pixels outside the rounded shape to follow. The
+        # fill color still comes from the same ACCENT theme color as
+        # before - only how it's painted has changed.
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        path = QPainterPath()
+        path.addRoundedRect(
+            QRectF(self.rect()), _SIDEBAR_CORNER_RADIUS, _SIDEBAR_CORNER_RADIUS
+        )
+        painter.setClipPath(path)
+        painter.fillPath(path, QColor(theme_manager.colors()["ACCENT"]))
+
+        # Faint diagonal hairline texture on top, clipped to the same
+        # rounded shape so it never pokes out past the corners. Each
+        # hairline gets a 1px dark "shadow" line just below/right of it
+        # first, then the light line drawn on top - reads as a slight
+        # groove rather than a flat white line sitting on the orange.
+        shadow_pen = QPen(_SIDEBAR_TEXTURE_SHADOW_COLOR)
+        shadow_pen.setWidth(1)
+        highlight_pen = QPen(_SIDEBAR_TEXTURE_COLOR)
+        highlight_pen.setWidth(1)
+        offset = _SIDEBAR_TEXTURE_SHADOW_OFFSET
+        w, h = self.width(), self.height()
+        x = -h
+        while x < w:
+            painter.setPen(shadow_pen)
+            painter.drawLine(x + offset, h + offset, x + h + offset, offset)
+            painter.setPen(highlight_pen)
+            painter.drawLine(x, h, x + h, 0)
+            x += _SIDEBAR_TEXTURE_SPACING
+        painter.end()
 
 
 class MainWindow(QWidget):
