@@ -130,6 +130,27 @@ def _header_fields(text):
     }
 
 
+def _merge_header_fields(texts):
+    """Document-level name/period/person_number for one EMAIL, resolved once
+    across ALL of its text sources (body + matching attachments) rather than
+    separately per source -- so a day-entry's identity doesn't depend on
+    which particular text blob happened to contain the labelled header line.
+    PDFs squeeze "Period Person Number Time Card Status" onto one line that
+    a plain-text email body covering the same timecard often doesn't
+    reproduce; resolving per-source used to give the body's day-entries a
+    different (blank) person_number than the attachment's day-entries for
+    the same real day, so both got inserted as separate, permanently
+    duplicated rows instead of one being recognized as the other's update.
+    First non-empty value found wins, in text order (body first)."""
+    merged = {"name": None, "period": None, "person_number": None}
+    for text in texts:
+        fields = _header_fields(text)
+        for key, value in fields.items():
+            if not merged[key] and value:
+                merged[key] = value
+    return merged
+
+
 def _day_blocks(text):
     """Split text into (day, block_text) chunks, one per day header found."""
     cutoff = _summary_cutoff_pattern.search(text)
@@ -202,9 +223,10 @@ def extract(email):
         if att.get("matches_keyword"):
             texts.append(att.get("text") or "")
 
+    header_fields = _merge_header_fields(texts)
+
     entries = []
     for text in texts:
-        header_fields = _header_fields(text)
         for day, block in _day_blocks(text):
             entry = _parse_block(day, block)
             if entry is None:
@@ -303,10 +325,12 @@ def _expense_item_dates(chunk):
 
 def _expense_header_fields(text):
     """Pull one report's header fields out of its text chunk. Any field not
-    found comes back None rather than failing the others. expense_date is
-    the LATEST date found among this report's own Expense Item lines (a
-    report can list several, e.g. a multi-day trip) -- the anchor used to
-    find which specific timecard day it should be billed against."""
+    found comes back None rather than failing the others. expense_date and
+    expense_date_start are the LATEST and EARLIEST dates found among this
+    report's own Expense Item lines (a report can list several, e.g. a
+    multi-day trip) -- together they form the report's own span, which
+    _fill_sender_timecard_match requires a timecard record's period to fully
+    contain (not just touch a single day of)."""
     status = _exp_status_pattern.search(text)
     submitted = _exp_submitted_pattern.search(text)
     report = _exp_report_pattern.search(text)
@@ -323,6 +347,7 @@ def _expense_header_fields(text):
         "project_code": project.group("code").strip() if project else None,
         "project_name": project.group("name").strip() if project else None,
         "expense_date": max(item_dates) if item_dates else None,
+        "expense_date_start": min(item_dates) if item_dates else None,
     }
 
 
@@ -404,10 +429,10 @@ def extract_expense(email):
     (i.e. which sender/period submission it belongs to) is NOT done here --
     see storage_service.save_expenses/_fill_sender_timecard_match, which
     matches purely on the report's sender email against the sender of each
-    timecard record on file (preferring the record whose period contains
-    this report's expense_date, falling back to that sender's most
-    recently received record). This function only extracts each report's
-    own fields.
+    timecard record on file (preferring the record whose period fully
+    contains this report's [expense_date_start, expense_date] span, falling
+    back to that sender's most recently received record). This function
+    only extracts each report's own fields.
     """
     mail_item = email["mail_item"]
     subject = email.get("subject") or ""
