@@ -27,6 +27,49 @@ CARD_ANIM_MS = 220
 # rejected and the cell reverts to what the database holds.
 _NUMERIC_COLUMNS = {"rate", "Qty"}
 
+# Accent used for the QDateEdit calendar popups on this page, so they read
+# as the same "orange" filter UI as the Records/History pages instead of
+# Qt's default blue.
+_CALENDAR_ACCENT = "#FF7A00"
+
+
+def _apply_orange_calendar_style(date_edit):
+    """Restyles a QDateEdit's popup QCalendarWidget (created lazily once
+    setCalendarPopup(True) is set) to use the app's orange accent instead
+    of Qt's default blue. Purely cosmetic -- the QDateEdit widget and all
+    the .date()/.setDate()/dateChanged wiring elsewhere in this file are
+    untouched, so none of the scan/filter logic changes."""
+    calendar = date_edit.calendarWidget()
+    apply_live_style(calendar, lambda c: f"""
+        QCalendarWidget QWidget {{
+            background-color: {c['SURFACE']}; color: {c['TEXT_PRIMARY']};
+        }}
+        QCalendarWidget QToolButton {{
+            background-color: transparent; color: {c['TEXT_PRIMARY']};
+            font-weight: 700; font-size: 13px; icon-size: 16px; padding: 4px;
+        }}
+        QCalendarWidget QToolButton:hover {{
+            background-color: {_CALENDAR_ACCENT}; color: white; border-radius: 4px;
+        }}
+        QCalendarWidget QMenu {{
+            background-color: {c['SURFACE']}; color: {c['TEXT_PRIMARY']};
+        }}
+        QCalendarWidget QSpinBox {{
+            background-color: {c['SURFACE']}; color: {c['TEXT_PRIMARY']};
+            selection-background-color: {_CALENDAR_ACCENT};
+        }}
+        #qt_calendar_navigationbar {{
+            background-color: {c['SURFACE']};
+        }}
+        QCalendarWidget QAbstractItemView:enabled {{
+            background-color: {c['BG']}; color: {c['TEXT_PRIMARY']};
+            selection-background-color: {_CALENDAR_ACCENT}; selection-color: white;
+        }}
+        QCalendarWidget QAbstractItemView:disabled {{
+            color: {c['TEXT_SECONDARY']};
+        }}
+    """)
+
 
 class StatCard(QFrame):
     clicked = Signal()
@@ -281,6 +324,7 @@ class DashboardPage(QWidget):
         self.from_date_edit.setMaximumDate(today)
         self.from_date_edit.setDisplayFormat("yyyy-MM-dd")
         self.from_date_edit.setMinimumWidth(120)
+        _apply_orange_calendar_style(self.from_date_edit)
         period_row.addWidget(self.from_date_edit)
 
         self.to_date_label = QLabel("To")
@@ -292,6 +336,7 @@ class DashboardPage(QWidget):
         self.to_date_edit.setMaximumDate(today)
         self.to_date_edit.setDisplayFormat("yyyy-MM-dd")
         self.to_date_edit.setMinimumWidth(120)
+        _apply_orange_calendar_style(self.to_date_edit)
         period_row.addWidget(self.to_date_edit)
 
         # Keep from <= to at all times, in either direction of edit.
