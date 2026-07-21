@@ -1,8 +1,10 @@
 # SharePoint Update / View Current / Finalize — Architecture Spec
 
-> **Status:** Design-approved, not yet implemented.
-> **Audience:** An engineer or coding agent implementing this feature end-to-end.
-> **Goal of this doc:** contain enough detail that an implementer can build the feature exactly as intended without re-deriving decisions. Where a decision has already been made, it is stated as a rule, not an option.
+> **Status:** Implemented (see `services/sharepoint_service.py`, `services/sync_service.py`, `ui/Pages/History.py`, `ui/Pages/Settings.py`).
+> **Audience:** An engineer or coding agent working on this feature.
+> **Goal of this doc:** contain enough detail to work on the feature without re-deriving decisions. Where a decision has already been made, it is stated as a rule, not an option.
+>
+> **Update:** the email-snapshot sync channel referenced throughout §9 below (`sync_service.push_updates`/`finalize_month`, `outlook_service.py`, `storage_service.apply_incoming_snapshot`) has since been **removed entirely**. This SharePoint channel is now the app's only cross-device sync mechanism — §9's "co-existence" framing is historical context for why some design choices (e.g. per-device-own-rows Excel files, a separate boundary marker) were made, not a description of two channels still running side by side.
 
 ---
 
@@ -10,7 +12,7 @@
 
 Three UI buttons — **Update**, **View Current**, **Finalize** — that move approved timecard data from the local SQLite DB into per-device Excel files kept in a **local OneDrive/SharePoint-synced folder**, merge those files for review, and close out a period by printing the merged result and starting a fresh empty sheet.
 
-This is a **second, independent sync channel that co-exists with the existing email-snapshot sync** (`services/sync_service.py`). It does **not** replace it and must not interfere with it. See §9 for the co-existence rules.
+This was originally built as a second, independent sync channel alongside an email-snapshot sync (`services/sync_service.py`). That email channel has since been removed (see the note above) — this is now the only sync channel in the app. §9 below is kept for the historical reasoning behind some of its design choices.
 
 ### The lifecycle (mirrors the existing email `finalize_month` loop)
 
@@ -110,9 +112,18 @@ All three hang off **`services/sync_service.py`** as new functions (parallel to 
 
 1. Call `sharepoint_update(...)` first (so this device's contribution is fresh).
 2. Read **all** `current_*.xlsx` files in `sharepoint_folder` (every device, including this one's just-written file).
-3. **Merge + dedup** them into an in-memory table. Dedup key: reuse the system-wide identity **`(day, "Project Number", "Task Name", person_number, received_month)`** (the same tuple `storage_service._save_row` uses). Do not invent a new key. On duplicate, keep one deterministically (e.g. the first seen, or newest by a timestamp column if present — pick one and document it in the code).
-4. **Display only.** Return the merged rows to the UI for rendering in a Qt table/preview. **Write nothing.** No file on disk changes as a result of View Current. This is the explicit intent: viewing never mutates the current sheet or any device file.
-5. Return `{"rows": [...], "sources": [<filenames merged>]}`.
+3. **Merge + dedup** them into an in-memory table. Dedup key: reuse the system-wide identity **`(day, "Project Number", "Task Name", person_number, received_month)`** (the same tuple `storage_service._save_row` uses). Do not invent a new key. On duplicate, keep one deterministically (the first one seen, in sorted-filename device order — see `sharepoint_service.merge_device_sheets`).
+4. `sharepoint_view_current` itself still **writes nothing** — it only reads and returns `{"rows": [...], "sources": [<filenames merged>]}`. Each row is tagged with `_origin_device_id` (parsed from which `current_*.xlsx` it came from) so the UI can tell which rows are this device's own.
+5. **The UI window it opens is no longer read-only** (see §6.2.1) — this function's own read-only guarantee is unchanged; the editing happens one layer up, in `ui/Pages/History.py`.
+
+#### 6.2.1 View Current window — editing (added after initial implementation)
+
+The View Current button opens a window (`ui/Pages/History.py`'s `_CurrentSheetDialog`) showing the merged rows from step 3/4 above, with two editable things:
+
+- **Rate** (per row) and a **highlight-color** tag (per row, purely local — see `highlight_color` column, `storage_service.py`) — nothing else is editable. Day/project/task/hours/etc. reflect what was actually scanned and stay read-only.
+- **Only editable on rows this device scanned itself** — i.e. `row["_origin_device_id"] == get_device_id()`, which is the only case where a local DB record exists to attach the edit to (`storage_service.find_record_id`, matched by the same identity tuple as §6.2 step 3). A row that only exists because another device scanned it shows read-only in this window; there is nothing local to edit.
+- Edits are held in memory while the window is open. **On close, if there are pending edits:** a "Confirm changes" Save/Discard/Cancel prompt appears. **Save** writes each edit to the local DB (`storage_service.update_status_record_field`) and then calls `sharepoint_update(...)` once more, so this device's `current_<device_id>.xlsx` — and therefore the shared folder — reflects the edit immediately rather than waiting for an unrelated future Update click. **Discard** closes without touching the DB or the shared folder. **Cancel** keeps the window open.
+- This is the one place SharePoint-adjacent UI code writes to the timecard tables — it does so through the exact same `update_status_record_field` path the (now-removed) email-sync Dashboard rate edit used, not a new write path, and only ever for rows this device already owns in its own DB.
 
 ### 6.3 Finalize — `sharepoint_finalize(progress_callback=None, project_type=None, printer=None)`
 
@@ -175,6 +186,7 @@ The email channel (`sync_service.push_updates` / `finalize_month`, `storage_serv
 | Print | `services/sharepoint_service.py` | Excel COM `PrintOut`. |
 | 3 buttons + Confirm/Cancel dialog | `ui/` | Reuse the in-house themed widgets (`nav_button.py`, etc. — see `CLAUDE.md` UI section). Buttons call `sync_service` with a `progress_callback`. |
 | `sharepoint_folder` setting | wherever app settings live (check `ui/` first) | Absolute path to synced folder. |
+| Link → local path resolution (§13) | `services/onedrive_link_resolver.py` | Reads OneDrive's own registry sync records — no Graph API. `ui/Pages/Settings.py` calls this to fill in `sharepoint_folder`. |
 
 ---
 
@@ -182,14 +194,15 @@ The email channel (`sync_service.push_updates` / `finalize_month`, `storage_serv
 
 - [ ] Clicking **Update** twice in a row produces byte-for-similar identical data in `current_<device>.xlsx` — no duplicated rows. (RULE 1)
 - [ ] The device's Excel contains only rows this device scanned (`origin = device_id`) within `received >= boundary_date`.
-- [ ] **View Current** displays the merged, deduped set of all `current_*.xlsx` and writes nothing to disk (device files and DB unchanged afterward).
+- [ ] `sharepoint_view_current` (the function) displays the merged, deduped set of all `current_*.xlsx` and writes nothing to disk on its own (device files and DB unchanged if the window is closed with no edits made, or edits are Discarded).
 - [ ] View Current runs Update first; Finalize runs View Current first.
+- [ ] In the View Current window, rate/highlight are editable only on rows this device scanned itself (§6.2.1); a row from another device is read-only there.
+- [ ] Closing the View Current window with pending edits prompts Save/Discard/Cancel; Save writes to the local DB and re-publishes this device's `current_<device_id>.xlsx`; Discard and Cancel touch nothing (Cancel also keeps the window open).
 - [ ] **Finalize** shows a Confirm/Cancel; Cancel does nothing at all (no print, no boundary change, no reset).
 - [ ] Finalize on Confirm literally prints the merged sheet to a printer.
 - [ ] After a successful Finalize, `boundary.json` holds today's date, and every device's next Update yields an **empty** current sheet (headers only) — including a second device that never clicked Finalize.
 - [ ] A failed print leaves the period **open**: boundary unchanged, no reset, error surfaced.
 - [ ] Missing/unset `sharepoint_folder` → clear error, no crash, no files written elsewhere.
-- [ ] The existing email sync (`push_updates` / `finalize_month`) still works unchanged; `last_export_date` and `boundary.json` remain independent.
 - [ ] SharePoint code never writes timecard tables — it only reads them and writes files + `boundary.json`.
 
 ---
@@ -198,5 +211,44 @@ The email channel (`sync_service.push_updates` / `finalize_month`, `storage_serv
 
 - Microsoft Graph / real cloud upload / OAuth — transport is the local synced folder only.
 - Merging into a single shared workbook that multiple devices write to — rejected (conflict-copy hell); excel-per-device is the chosen model.
-- Reconciling / unifying the email boundary with the SharePoint boundary — they are intentionally separate.
+- Reconciling / unifying the email boundary with the SharePoint boundary — they are intentionally separate (moot now that the email channel is gone, see the note at the top of this doc, but the boundary.json mechanism itself is unchanged).
 - Any change to the timecard dedup identity tuple — reuse the existing one.
+
+---
+
+## 13. Link-to-local-folder resolution (convenience, added after initial implementation)
+
+**Problem this solves:** users kept trying to paste a SharePoint "Copy Link" web URL into the `sharepoint_folder` setting, because "SharePoint" reads as "a link", not "a disk path". §3 already made the transport decision (local folder, no Graph API) — this section adds a UI convenience that fills in that local path FROM a pasted link, without changing the transport decision at all.
+
+### 13.1 What it is NOT
+
+- **Not the Graph API.** No network call, no OAuth, no Azure AD app registration, no sign-in. If a real engineer or agent picks this up assuming it calls out to `graph.microsoft.com`, that is wrong — it never does.
+- **Not a replacement for `sharepoint_folder`.** The resolved local path is written into the exact same `sharepoint_folder` setting §3 already defines. `sync_service`/`sharepoint_service` never see the link — they only ever see the resolved local path, exactly as before this section existed.
+
+### 13.2 How it actually works
+
+OneDrive's desktop client already keeps its own local record of every SharePoint/OneDrive library it has synced on this Windows account, in the registry:
+
+```
+HKEY_CURRENT_USER\SOFTWARE\SyncEngines\Providers\OneDrive\<GUID>
+    UrlNamespace   -- the library's SharePoint URL, e.g. https://contoso.sharepoint.com/sites/TeamSite
+    MountPoint     -- the local folder OneDrive chose for it, e.g. C:\Users\me\Contoso\TeamSite - Documents
+    DisplayName    -- human-readable library name
+```
+
+`services/onedrive_link_resolver.py` reads this (`list_onedrive_sync_registrations`), then given a pasted link:
+
+1. Parses the link's host + path.
+2. Matches it against the registrations: same host, then longest matching URL-path prefix (so a tenant with several synced libraries resolves to the *right* one, not just "the first OneDrive library found").
+3. **Best-effort sub-folder extraction:** a SharePoint "library view" link (`.../Forms/AllItems.aspx?id=%2Fsites%2F...%2FSubFolder`) encodes the exact server-relative folder path in its `id` query parameter — when present, this is decoded and appended to the matched `MountPoint`, resolving all the way down to a specific sub-folder rather than just the library root. A "Copy Link" share link's path is an opaque resource id instead (no folder path recoverable from it at all) — for that shape, resolution stops at the library's top-level synced folder, which is still correct, just less precise.
+4. Verifies the resolved path actually exists on disk (`os.path.isdir`) before returning it — OneDrive being paused, signed out, or still syncing surfaces as a clear error here, not a folder path that turns out not to exist when Update runs.
+
+Never guesses silently: an ambiguous match (same host, no path overlap, more than one candidate) or a registration whose `MountPoint` doesn't currently exist raises `OneDriveLinkResolutionError` with a message that always ends by pointing back at manual Browse.
+
+### 13.3 UI (`ui/Pages/Settings.py`, `ui/sharepoint_settings.py`)
+
+- A "Paste a link..." field + **Resolve** button sits above the existing manual folder field/Browse button, framed as "fills in the field below" rather than as a separate/competing setting.
+- On success: fills the existing folder `QLineEdit` and calls the same `sharepoint_settings.set_folder(...)` the manual path/Browse flow already uses — one settings key, one source of truth (`sharepoint_folder`), regardless of how it got populated.
+- On failure: shows the resolver's message inline (red), and does **not** touch the folder field — whatever was there (even if blank) is left alone, so a failed resolve can never silently blank out a working config.
+- The pasted link itself is persisted separately (`sharepoint_onedrive_link` in `ui/sharepoint_settings.py`) purely so the link field is pre-filled next time — nothing downstream of Settings ever reads it; only the resolved `sharepoint_folder` matters to `sync_service`/`sharepoint_service`.
+- Manual Browse/typed-path entry is unchanged and remains the guaranteed fallback when resolution fails (e.g. a machine where OneDrive isn't installed, or the registry shape differs from what's documented above — this registry layout is OneDrive's own undocumented internal bookkeeping, not a public API, so treat §13.2's exact value names as best-effort/subject-to-drift across OneDrive client versions).
