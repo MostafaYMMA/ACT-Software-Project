@@ -11,7 +11,7 @@ from ui.project_type_settings import project_type_settings
 from ui.sync_partner_settings import sync_partner_settings
 from storage_service import (
     get_export_history, export_act_invoice_overview_range, get_last_export_date,
-    PROJECT_TYPE_LABELS,
+    get_active_export_path, PROJECT_TYPE_LABELS,
 )
 from sync_service import update_with_other_user, finalize_month
 
@@ -98,17 +98,16 @@ class _FinalizeWorker(QObject):
     progress = Signal(str)
     finished = Signal(dict)
 
-    def __init__(self, recipient_email, start_date, end_date, output_path, project_type):
+    def __init__(self, recipient_email, start_date, end_date, project_type):
         super().__init__()
         self.recipient_email = recipient_email
         self.start_date = start_date
         self.end_date = end_date
-        self.output_path = output_path
         self.project_type = project_type
 
     def run(self):
         result = finalize_month(
-            self.recipient_email, self.start_date, self.end_date, self.output_path,
+            self.recipient_email, self.start_date, self.end_date,
             project_type=self.project_type, progress_callback=self.progress.emit,
         )
         self.finished.emit(result)
@@ -169,12 +168,17 @@ class HistoryPage(QWidget):
         layout.addLayout(type_row)
 
         # --- Cross-device sync controls (Update / Finalize) ---
-        # Update: pulls in anything the other user has sent, then pushes
-        # this device's own new scans out to them -- both apps converge on
-        # the same live picture of the current (not-yet-finalized) period.
-        # Finalize: one last update pass, then exports the real file and
-        # notifies the other user, which is what actually closes the
-        # period on BOTH machines (see services/sync_service.py).
+        # Update: pulls in anything the other user has sent, pushes this
+        # device's own data out to them, and tops up the active export
+        # file with any approved record that isn't in it yet (creating
+        # that file the first time) -- so both apps converge on the same
+        # live picture of the current, not-yet-finalized period, and the
+        # sheet grows with it. It does NOT read the inbox; that's Scan
+        # Inbox's job, and Update works off what Scan Inbox stored.
+        # Finalize: one last Update pass, then the file being filled is
+        # closed out as the final export and the app points at a fresh
+        # one -- which is what closes the period on BOTH machines
+        # (see services/sync_service.py).
         sync_row = QHBoxLayout()
         sync_row.setSpacing(10)
 
@@ -192,6 +196,13 @@ class HistoryPage(QWidget):
 
         sync_row.addStretch()
         layout.addLayout(sync_row)
+
+        # Which file Update is currently topping up -- otherwise the only
+        # way to know where the rows are going is the status line of the
+        # last Update, which is gone the moment anything else is clicked.
+        self.active_export_label = QLabel("")
+        apply_live_style(self.active_export_label, lambda c: f"font-size: 12px; color: {c['TEXT_SECONDARY']};")
+        layout.addWidget(self.active_export_label)
 
         # --- Export controls ---
         controls_row = QHBoxLayout()
@@ -304,25 +315,15 @@ class HistoryPage(QWidget):
     # -----------------------------------------------------------------
     # Cross-device sync: Update / Finalize
     # -----------------------------------------------------------------
-    def _require_partner_email(self):
-        email = sync_partner_settings.partner_email
-        if not email:
-            QMessageBox.warning(
-                self, "No sync partner set",
-                "Set the other user's email address in Settings first "
-                "(Settings -> Sync) before using Update or Finalize.",
-            )
-            return None
-        return email
-
     def _set_sync_controls_enabled(self, enabled):
         self.update_btn.setEnabled(enabled)
         self.finalize_btn.setEnabled(enabled)
 
     def _on_update_clicked(self):
-        email = self._require_partner_email()
-        if not email:
-            return
+        # No partner email is not an error: the export half of Update is
+        # local work on local data and still runs. Only the mail half is
+        # skipped, which the status line says (see _on_update_finished).
+        email = sync_partner_settings.partner_email
         self._set_sync_controls_enabled(False)
         self.status_label.setText("Updating...")
 
@@ -341,18 +342,42 @@ class HistoryPage(QWidget):
     def _on_update_finished(self, result):
         self._set_sync_controls_enabled(True)
         push = result.get("push", {})
+        reason = push.get("reason")
         if push.get("sent"):
-            self.status_label.setText(f"Update sent ({push.get('rows_sent', 0)} row(s)) and any incoming updates applied.")
-        elif push.get("reason") == "nothing to send":
-            self.status_label.setText("Up to date - nothing new to send, and any incoming updates were applied.")
+            sync_text = f"Update sent ({push.get('rows_sent', 0)} row(s)) and any incoming updates applied."
+        elif reason == "no sync partner":
+            sync_text = "No sync partner set - export updated locally only."
+        elif reason == "sync failed":
+            sync_text = "Couldn't reach Outlook to sync with the other user - export updated locally anyway."
+        elif reason == "nothing to send":
+            sync_text = "Up to date - nothing new to send, and any incoming updates were applied."
         else:
-            self.status_label.setText("Incoming updates applied, but sending this device's update failed - check Outlook.")
+            sync_text = "Incoming updates applied, but sending this device's update failed - check Outlook."
+
+        # The export half: whether the sheet was created just now or topped
+        # up, and by how much -- "nothing new" being a perfectly normal
+        # outcome to report, not a failure.
+        export = result.get("export") or {}
+        if export.get("created"):
+            export_text = f" Created {export.get('path')} with {export.get('total_rows', 0)} row(s)."
+        elif export.get("new_rows"):
+            export_text = (
+                f" Added {export['new_rows']} new row(s) to {export.get('path')} "
+                f"({export.get('total_rows', 0)} in total)."
+            )
+        elif export:
+            export_text = f" No new records for {export.get('path')}."
+        else:
+            export_text = ""
+
+        self.status_label.setText(sync_text + export_text)
         self.refresh()
 
     def _on_finalize_clicked(self):
-        email = self._require_partner_email()
-        if not email:
-            return
+        # As with Update, no partner is not a blocker -- closing the sheet
+        # is local. The confirmation below says plainly that nobody will
+        # be told, since that IS a meaningful difference for finalizing.
+        email = sync_partner_settings.partner_email
 
         start_str = self.from_date.date().toString("yyyy-MM-dd")
         end_str = self.to_date.date().toString("yyyy-MM-dd")
@@ -360,12 +385,20 @@ class HistoryPage(QWidget):
             QMessageBox.warning(self, "Invalid range", "The 'from' date must be before the 'to' date.")
             return
 
+        active_path = get_active_export_path()
         confirm = QMessageBox.question(
             self, "Finalize this period?",
-            f"This exports and closes out {start_str} to {end_str}"
+            f"This closes out {start_str} to {end_str}"
             f"{' for ' + PROJECT_TYPE_LABELS[project_type_settings.project_type] if project_type_settings.project_type else ''}.\n\n"
-            "One last check for updates runs first, then the sheet is exported and "
-            f"{email} is notified so both apps agree the period is closed.\n\n"
+            "One last Update runs first, then "
+            + (f"{active_path} is closed as the final export"
+               if active_path else "the export sheet is created and closed")
+            + (f" and {email} is notified so both apps agree the period is closed."
+               if email else
+               ".\n\nNo sync partner is set, so nobody will be notified - the period "
+               "closes on this machine only.")
+            + "\n\nFrom then on, Update starts filling a NEW sheet -- this one won't "
+            "be added to again.\n\n"
             "Are you sure you want to finalize?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -373,18 +406,12 @@ class HistoryPage(QWidget):
         if confirm != QMessageBox.StandardButton.Yes:
             return
 
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save final export as", self._default_name(start_str, end_str), "Excel files (*.xlsx)"
-        )
-        if not path:
-            return  # user cancelled the save dialog -- nothing has happened yet, safe to just stop here
-
         self._set_sync_controls_enabled(False)
         self.status_label.setText("Finalizing...")
 
         self._finalize_thread = QThread(self)
         self._finalize_worker = _FinalizeWorker(
-            email, start_str, end_str, path, project_type_settings.project_type
+            email, start_str, end_str, project_type_settings.project_type
         )
         self._finalize_worker.moveToThread(self._finalize_thread)
 
@@ -400,16 +427,29 @@ class HistoryPage(QWidget):
         self._set_sync_controls_enabled(True)
         row_count = result.get("row_count", 0)
         notified = result.get("notified")
-        self.status_label.setText(f"Finalized - {row_count} row(s) exported.")
+        path = result.get("path", "")
+        self.status_label.setText(
+            f"Finalized {path} - {row_count} row(s). The next Update starts a new sheet."
+        )
         if notified:
             QMessageBox.information(
                 self, "Finalized",
-                f"Exported {row_count} row(s) and notified the other user - the period is now closed on both apps.",
+                f"Closed {path} with {row_count} row(s) and notified the other user - the period is now "
+                "closed on both apps.\n\nThe next Update will create and start filling a new sheet.",
+            )
+        elif not sync_partner_settings.partner_email:
+            # Not a failure -- there was nobody to notify in the first
+            # place, so don't dress it up as one.
+            QMessageBox.information(
+                self, "Finalized",
+                f"Closed {path} with {row_count} row(s).\n\nNo sync partner is set, so nobody was "
+                "notified - the period is closed on this machine only.\n\n"
+                "The next Update will create and start filling a new sheet.",
             )
         else:
             QMessageBox.warning(
                 self, "Finalized locally, but notification failed",
-                f"Exported {row_count} row(s) locally, but the notification email to the other user failed to send "
+                f"Closed {path} with {row_count} row(s) locally, but the notification email to the other user failed to send "
                 "(check that Outlook is running). The period is closed here, but their app doesn't know that yet -- "
                 "you may need to resend, or have them run Update once you're able to notify them.",
             )
@@ -476,6 +516,12 @@ class HistoryPage(QWidget):
     # Export history log
     # -----------------------------------------------------------------
     def refresh(self):
+        active = get_active_export_path()
+        self.active_export_label.setText(
+            f"Currently filling: {active}" if active
+            else "No sheet open yet - the next Update will create one."
+        )
+
         last = get_last_export_date()
         self.last_export_btn.setEnabled(bool(last))
         self.last_export_btn.setToolTip(
