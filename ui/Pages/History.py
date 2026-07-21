@@ -5,18 +5,23 @@ from PySide6.QtWidgets import (
     QHeaderView, QPushButton, QDateEdit, QFileDialog, QMessageBox, QButtonGroup,
     QDialog, QMenu,
 )
-from PySide6.QtCore import Qt, QDate, QThread, QObject, Signal
+from PySide6.QtCore import Qt, QDate, QThread, QObject, Signal, QSettings
 from PySide6.QtGui import QBrush, QColor
 
 from ui.theme_utils import apply_live_style
 from ui.project_type_settings import project_type_settings
+from ui.sync_partner_settings import sync_partner_settings
 from ui.sharepoint_settings import sharepoint_settings
+from ui.profile_circle import SETTINGS_ORG, SETTINGS_APP
 from storage_service import (
     get_export_history, export_act_invoice_overview_range, get_last_export_date,
     PROJECT_TYPE_LABELS, SNAPSHOT_COLUMNS, get_device_id, find_record_id,
     update_status_record_field,
 )
-from sync_service import sharepoint_update, sharepoint_view_current, sharepoint_finalize
+from sync_service import (
+    update_with_other_user, finalize_month, local_update, local_finalize,
+    sharepoint_update, sharepoint_view_current, sharepoint_finalize,
+)
 from sharepoint_service import SharePointFolderError
 
 # Reverse of storage_service._STATUS_LABELS -- that dict is private
@@ -50,6 +55,13 @@ _FILENAME_SLUGS = {
 # as the same "orange" filter UI as the Records page's date filter instead
 # of Qt's default blue.
 _CALENDAR_ACCENT = "#FF7A00"
+
+# Same key ui/Pages/Settings.py's Sync switch writes to -- when False, the
+# EMAIL sync's Update/Finalize skip the partner-email requirement entirely
+# and run local-only (see sync_service.local_update / local_finalize).
+# Only affects the email-sync section below -- SharePoint sync is
+# independent of this switch.
+SYNC_ENABLED_KEY = "sync_enabled"
 
 
 def _last_month_range(today=None):
@@ -100,6 +112,89 @@ def _apply_orange_calendar_style(date_edit):
         }}
     """)
 
+
+# ----------------------------------------------------------------------
+# Email / partner sync workers (Update / Finalize send mail to one other
+# user -- see ui/sync_partner_settings.py + services/sync_service.py's
+# update_with_other_user/finalize_month, and local_update/local_finalize
+# for the sync-off, local-scan-only path).
+# ----------------------------------------------------------------------
+
+class _UpdateWorker(QObject):
+    progress = Signal(str)
+    finished = Signal(dict)
+
+    def __init__(self, recipient_email, project_type):
+        super().__init__()
+        self.recipient_email = recipient_email
+        self.project_type = project_type
+
+    def run(self):
+        result = update_with_other_user(
+            self.recipient_email, project_type=self.project_type,
+            progress_callback=self.progress.emit,
+        )
+        self.finished.emit(result)
+
+
+class _LocalUpdateWorker(QObject):
+    """Sync-off equivalent of _UpdateWorker: no recipient email, no
+    pull/push, just a local inbox scan (sync_service.local_update)."""
+    progress = Signal(str)
+    finished = Signal(dict)
+
+    def run(self):
+        result = local_update(progress_callback=self.progress.emit)
+        self.finished.emit(result)
+
+
+class _FinalizeWorker(QObject):
+    progress = Signal(str)
+    finished = Signal(dict)
+
+    def __init__(self, recipient_email, start_date, end_date, output_path, project_type):
+        super().__init__()
+        self.recipient_email = recipient_email
+        self.start_date = start_date
+        self.end_date = end_date
+        self.output_path = output_path
+        self.project_type = project_type
+
+    def run(self):
+        result = finalize_month(
+            self.recipient_email, self.start_date, self.end_date, self.output_path,
+            project_type=self.project_type, progress_callback=self.progress.emit,
+        )
+        self.finished.emit(result)
+
+
+class _LocalFinalizeWorker(QObject):
+    """Sync-off equivalent of _FinalizeWorker: no recipient email, no
+    pull/notify, just a local scan + export (sync_service.local_finalize)."""
+    progress = Signal(str)
+    finished = Signal(dict)
+
+    def __init__(self, start_date, end_date, output_path, project_type):
+        super().__init__()
+        self.start_date = start_date
+        self.end_date = end_date
+        self.output_path = output_path
+        self.project_type = project_type
+
+    def run(self):
+        result = local_finalize(
+            self.start_date, self.end_date, self.output_path,
+            project_type=self.project_type, progress_callback=self.progress.emit,
+        )
+        self.finished.emit(result)
+
+
+# ----------------------------------------------------------------------
+# SharePoint folder sync workers (Update / View Current / Finalize read
+# and write files in a shared, locally-synced SharePoint/OneDrive folder
+# -- see ui/sharepoint_settings.py + services/sync_service.py's
+# sharepoint_update/sharepoint_view_current/sharepoint_finalize).
+# ----------------------------------------------------------------------
 
 class _SharePointUpdateWorker(QObject):
     progress = Signal(str)
@@ -391,10 +486,18 @@ class _CurrentSheetDialog(QDialog):
 class HistoryPage(QWidget):
     """Export controls (last month / custom date range, both filtering
     by the date each email was RECEIVED - see storage_service._to_row)
-    plus a log of every export ever produced (name + date), newest first."""
+    plus a log of every export ever produced (name + date), newest first.
+
+    Two independent sync systems live on this page (see the section
+    headers below): SharePoint folder sync (Update / View Current /
+    Finalize against a shared synced folder) and email/partner sync
+    (Update / Finalize that mail one other user directly, with an
+    on/off switch from the Settings page)."""
 
     def __init__(self):
         super().__init__()
+        self._settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 20, 28, 20)
         layout.setSpacing(14)
@@ -443,11 +546,10 @@ class HistoryPage(QWidget):
         layout.addLayout(type_row)
 
         # --- SharePoint file sync controls (Update / View Current / Finalize) ---
-        # The app's only cross-device sync channel -- see
+        # Reads/writes files in a shared, locally-synced OneDrive/SharePoint
+        # folder (set in Settings -> SharePoint). See
         # services/sync_service.py's sharepoint_update/
-        # sharepoint_view_current/sharepoint_finalize and
-        # SHAREPOINT_SYNC_SPEC.md. Reads/writes files in a shared, locally-
-        # synced OneDrive/SharePoint folder (set in Settings -> SharePoint).
+        # sharepoint_view_current/sharepoint_finalize.
         sharepoint_section_label = QLabel("SharePoint Sync (shared folder)")
         apply_live_style(sharepoint_section_label, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 11px; font-weight: 700;")
         layout.addWidget(sharepoint_section_label)
@@ -487,6 +589,39 @@ class HistoryPage(QWidget):
 
         sharepoint_row.addStretch()
         layout.addLayout(sharepoint_row)
+
+        # --- Email/partner sync controls (Update / Finalize) ---
+        # Update: pulls in anything the other user has sent, then pushes
+        # this device's own new scans out to them -- both apps converge on
+        # the same live picture of the current (not-yet-finalized) period.
+        # Finalize: one last update pass, then exports the real file and
+        # notifies the other user, which is what actually closes the
+        # period on BOTH machines (see services/sync_service.py).
+        # Both buttons check _sync_enabled() (the Settings page's Sync
+        # switch) first -- when sync is off, they skip the partner-email
+        # requirement and run local-only (see _LocalUpdateWorker /
+        # _LocalFinalizeWorker above). Independent of SharePoint sync above.
+        email_sync_section_label = QLabel("Email Sync (single partner)")
+        apply_live_style(email_sync_section_label, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 11px; font-weight: 700;")
+        layout.addWidget(email_sync_section_label)
+
+        sync_row = QHBoxLayout()
+        sync_row.setSpacing(10)
+
+        self.update_btn = QPushButton("Update")
+        self.update_btn.setObjectName("secondaryButton")
+        self.update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_btn.clicked.connect(self._on_update_clicked)
+        sync_row.addWidget(self.update_btn)
+
+        self.finalize_btn = QPushButton("Finalize")
+        self.finalize_btn.setObjectName("primaryButton")
+        self.finalize_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.finalize_btn.clicked.connect(self._on_finalize_clicked)
+        sync_row.addWidget(self.finalize_btn)
+
+        sync_row.addStretch()
+        layout.addLayout(sync_row)
 
         # --- Export controls ---
         controls_row = QHBoxLayout()
@@ -583,7 +718,7 @@ class HistoryPage(QWidget):
         self.refresh()
 
     # -----------------------------------------------------------------
-    # Export actions
+    # Project type filter
     # -----------------------------------------------------------------
     def _on_project_type_toggled(self, project_type):
         project_type_settings.set_project_type(project_type)
@@ -726,6 +861,179 @@ class HistoryPage(QWidget):
             f"as of {result.get('boundary_date')} -- every device starts fresh on their next Update.",
         )
 
+    # -----------------------------------------------------------------
+    # Email/partner sync: Update / Finalize (with the sync on/off switch)
+    # -----------------------------------------------------------------
+    def _sync_enabled(self):
+        """The Settings page's Sync switch. Only gates the email/partner
+        sync below -- SharePoint sync above is independent of it."""
+        return self._settings.value(SYNC_ENABLED_KEY, True, type=bool)
+
+    def _require_partner_email(self):
+        email = sync_partner_settings.partner_email
+        if not email:
+            QMessageBox.warning(
+                self, "No sync partner set",
+                "Set the other user's email address in Settings first "
+                "(Settings -> Sync) before using Update or Finalize.",
+            )
+            return None
+        return email
+
+    def _set_sync_controls_enabled(self, enabled):
+        self.update_btn.setEnabled(enabled)
+        self.finalize_btn.setEnabled(enabled)
+
+    def _on_update_clicked(self):
+        if self._sync_enabled():
+            email = self._require_partner_email()
+            if not email:
+                return
+
+            self._set_sync_controls_enabled(False)
+            self.status_label.setText("Updating...")
+
+            self._update_thread = QThread(self)
+            self._update_worker = _UpdateWorker(email, project_type_settings.project_type)
+            self._update_worker.moveToThread(self._update_thread)
+
+            self._update_thread.started.connect(self._update_worker.run)
+            self._update_worker.progress.connect(self.status_label.setText)
+            self._update_worker.finished.connect(self._on_update_finished)
+            self._update_worker.finished.connect(self._update_thread.quit)
+            self._update_thread.finished.connect(self._update_thread.deleteLater)
+
+            self._update_thread.start()
+        else:
+            # Sync is off -- no partner email needed, just scan this
+            # device's own inbox.
+            self._set_sync_controls_enabled(False)
+            self.status_label.setText("Updating (sync is off - local scan only)...")
+
+            self._update_thread = QThread(self)
+            self._update_worker = _LocalUpdateWorker()
+            self._update_worker.moveToThread(self._update_thread)
+
+            self._update_thread.started.connect(self._update_worker.run)
+            self._update_worker.progress.connect(self.status_label.setText)
+            self._update_worker.finished.connect(self._on_local_update_finished)
+            self._update_worker.finished.connect(self._update_thread.quit)
+            self._update_thread.finished.connect(self._update_thread.deleteLater)
+
+            self._update_thread.start()
+
+    def _on_update_finished(self, result):
+        self._set_sync_controls_enabled(True)
+        push = result.get("push", {})
+        if push.get("sent"):
+            self.status_label.setText(f"Update sent ({push.get('rows_sent', 0)} row(s)) and any incoming updates applied.")
+        elif push.get("reason") == "nothing to send":
+            self.status_label.setText("Up to date - nothing new to send, and any incoming updates were applied.")
+        else:
+            self.status_label.setText("Incoming updates applied, but sending this device's update failed - check Outlook.")
+        self.refresh()
+
+    def _on_local_update_finished(self, _result):
+        self._set_sync_controls_enabled(True)
+        self.status_label.setText("Inbox scanned locally. Sync is off, so nothing was sent to another user.")
+        self.refresh()
+
+    def _on_finalize_clicked(self):
+        start_str = self.from_date.date().toString("yyyy-MM-dd")
+        end_str = self.to_date.date().toString("yyyy-MM-dd")
+        if start_str > end_str:
+            QMessageBox.warning(self, "Invalid range", "The 'from' date must be before the 'to' date.")
+            return
+
+        sync_on = self._sync_enabled()
+        email = None
+        if sync_on:
+            email = self._require_partner_email()
+            if not email:
+                return
+
+        scope_text = (
+            " for " + PROJECT_TYPE_LABELS[project_type_settings.project_type]
+            if project_type_settings.project_type else ""
+        )
+        message = f"This exports and closes out {start_str} to {end_str}{scope_text}.\n\n"
+        if sync_on:
+            message += (
+                "One last check for updates runs first, then the sheet is exported and "
+                f"{email} is notified so both apps agree the period is closed.\n\n"
+            )
+        else:
+            message += (
+                "Sync is currently off, so this closes out the period locally only - "
+                "no other user will be notified.\n\n"
+            )
+        message += "Are you sure you want to finalize?"
+
+        confirm = QMessageBox.question(
+            self, "Finalize this period?", message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save final export as", self._default_name(start_str, end_str), "Excel files (*.xlsx)"
+        )
+        if not path:
+            return  # user cancelled the save dialog -- nothing has happened yet, safe to just stop here
+
+        self._set_sync_controls_enabled(False)
+        self.status_label.setText("Finalizing...")
+
+        self._finalize_thread = QThread(self)
+        if sync_on:
+            self._finalize_worker = _FinalizeWorker(
+                email, start_str, end_str, path, project_type_settings.project_type
+            )
+        else:
+            self._finalize_worker = _LocalFinalizeWorker(
+                start_str, end_str, path, project_type_settings.project_type
+            )
+        self._finalize_worker.moveToThread(self._finalize_thread)
+
+        self._finalize_thread.started.connect(self._finalize_worker.run)
+        self._finalize_worker.progress.connect(self.status_label.setText)
+        self._finalize_worker.finished.connect(self._on_finalize_finished)
+        self._finalize_worker.finished.connect(self._finalize_thread.quit)
+        self._finalize_thread.finished.connect(self._finalize_thread.deleteLater)
+
+        self._finalize_thread.start()
+
+    def _on_finalize_finished(self, result):
+        self._set_sync_controls_enabled(True)
+        row_count = result.get("row_count", 0)
+        notified = result.get("notified")
+        self.status_label.setText(f"Finalized - {row_count} row(s) exported.")
+        if notified is None:
+            # Sync was off -- nothing was ever attempted, so this isn't a
+            # failure, just the expected local-only outcome.
+            QMessageBox.information(
+                self, "Finalized",
+                f"Exported {row_count} row(s) locally. Sync is off, so no other user was notified.",
+            )
+        elif notified:
+            QMessageBox.information(
+                self, "Finalized",
+                f"Exported {row_count} row(s) and notified the other user - the period is now closed on both apps.",
+            )
+        else:
+            QMessageBox.warning(
+                self, "Finalized locally, but notification failed",
+                f"Exported {row_count} row(s) locally, but the notification email to the other user failed to send "
+                "(check that Outlook is running). The period is closed here, but their app doesn't know that yet -- "
+                "you may need to resend, or have them run Update once you're able to notify them.",
+            )
+        self.refresh()
+
+    # -----------------------------------------------------------------
+    # Plain export controls
+    # -----------------------------------------------------------------
     def _use_last_export_start(self):
         """Set the 'from' date to where the last export reached. The 'to'
         date is left as-is for the user to choose before Export Range."""

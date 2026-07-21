@@ -3,8 +3,17 @@ Settings page: light/dark toggle, plus the stale-threshold controls
 (enable/disable + how many hours old counts as "late", both persisted
 via ui/notification_settings.py). That threshold drives both the
 banner in ui/app.py and the Late tab (ui/Pages/Late.py).
+
+Sync section: an email address + enable/disable switch for Update/Finalize
+on the Export History page. The email itself is still persisted via
+ui/sync_partner_settings.py (untouched, unchanged). The on/off switch is a
+separate "sync_enabled" flag persisted directly via QSettings in this file
+-- when off, the email field is disabled here so it reads as "sync is
+turned off" rather than just an empty field.
 """
 
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QComboBox, QFrame, QLineEdit
+from PySide6.QtCore import Qt, QSettings
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QComboBox, QFrame, QLineEdit,
     QPushButton, QFileDialog,
@@ -16,6 +25,8 @@ from ui.theme_utils import apply_live_style
 from ui.toggle_switch import ToggleSwitch, SUN_ICON, MOON_ICON
 from ui.switch import Switch
 from ui.notification_settings import notification_settings
+from ui.sync_partner_settings import sync_partner_settings
+from ui.profile_circle import SETTINGS_ORG, SETTINGS_APP
 from ui.sharepoint_settings import sharepoint_settings
 from onedrive_link_resolver import resolve_local_path_from_link, OneDriveLinkResolutionError
 
@@ -23,6 +34,10 @@ BELL_ICON = "\U0001F514"
 FOLDER_ICON = "\U0001F4C1"
 LINK_ICON = "\U0001F517"
 HOURS_PER_DAY = 24
+
+# Persisted the same way every other per-user toggle in this app already is
+# (see Records.py's search history for the same QSettings(org, app) pattern).
+SYNC_ENABLED_KEY = "sync_enabled"
 
 
 class SettingsPage(QWidget):
@@ -32,6 +47,8 @@ class SettingsPage(QWidget):
         layout.setContentsMargins(28, 24, 28, 24)
         layout.setSpacing(20)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        self._settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
 
         title = QLabel("Settings")
         apply_live_style(title, lambda c: f"color: {c['TEXT_PRIMARY']}; font-size: 20px; font-weight: 700;")
@@ -105,6 +122,45 @@ class SettingsPage(QWidget):
         threshold_row.addStretch()
         layout.addLayout(threshold_row)
 
+        sync_divider = QFrame()
+        sync_divider.setFixedHeight(1)
+        apply_live_style(sync_divider, lambda c: f"background-color: {c['BORDER']};")
+        layout.addWidget(sync_divider)
+
+        # -- Cross-device sync partner ------------------------------------
+        # Where Update/Finalize on the Export History page send their sync
+        # mail (see services/sync_service.py + services/outlook_service.py).
+        # The email is persisted via ui/sync_partner_settings.py so it isn't
+        # re-typed every session; the on/off switch below is a separate flag
+        # (SYNC_ENABLED_KEY) that just controls whether that field -- and
+        # therefore sync -- is currently active.
+        sync_label = QLabel("Sync")
+        apply_live_style(sync_label, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 11px; font-weight: 700;")
+        layout.addWidget(sync_label)
+
+        sync_row = QHBoxLayout()
+        sync_row.setSpacing(10)
+
+        self._sync_icon_label = QLabel(SYNC_ICON)
+        self._sync_icon_label.setStyleSheet("font-size: 15px;")
+        sync_row.addWidget(self._sync_icon_label)
+
+        self._sync_text = QLabel("Other user's email (for Update/Finalize on Export History)")
+        self._sync_text.setWordWrap(True)
+        apply_live_style(self._sync_text, lambda c: f"color: {c['TEXT_PRIMARY']}; font-size: 13px;")
+        sync_row.addWidget(self._sync_text, stretch=1)
+
+        sync_enabled = self._settings.value(SYNC_ENABLED_KEY, True, type=bool)
+        self._sync_switch = Switch(checked=sync_enabled)
+        self._sync_switch.toggled.connect(self._on_sync_toggled)
+        sync_row.addWidget(self._sync_switch)
+
+        layout.addLayout(sync_row)
+
+        self._partner_email_edit = QLineEdit(sync_partner_settings.partner_email)
+        self._partner_email_edit.setPlaceholderText("their.email@company.com")
+        self._partner_email_edit.editingFinished.connect(self._on_partner_email_edited)
+        apply_live_style(self._partner_email_edit, lambda c: f"""
         sharepoint_divider = QFrame()
         sharepoint_divider.setFixedHeight(1)
         apply_live_style(sharepoint_divider, lambda c: f"background-color: {c['BORDER']};")
@@ -246,6 +302,7 @@ class SettingsPage(QWidget):
 
         self._load_threshold_into_controls(notification_settings.threshold_hours)
         self._update_threshold_enabled(notification_settings.enabled)
+        self._update_sync_enabled(sync_enabled)
 
         self._update_labels(theme_manager.mode)
         theme_manager.theme_changed.connect(self._update_labels)
@@ -279,10 +336,21 @@ class SettingsPage(QWidget):
         self._threshold_spin.setEnabled(enabled)
         self._threshold_unit.setEnabled(enabled)
 
+    def _update_sync_enabled(self, enabled):
+        self._sync_icon_label.setEnabled(enabled)
+        self._sync_text.setEnabled(enabled)
+        self._partner_email_edit.setEnabled(enabled)
+
     def _on_notify_toggled(self, checked):
         notification_settings.set_enabled(checked)
         self._update_threshold_enabled(checked)
 
+    def _on_sync_toggled(self, checked):
+        self._settings.setValue(SYNC_ENABLED_KEY, checked)
+        self._update_sync_enabled(checked)
+
+    def _on_partner_email_edited(self):
+        sync_partner_settings.set_partner_email(self._partner_email_edit.text())
     def _on_resolve_sharepoint_link(self):
         link = self._sharepoint_link_edit.text()
         sharepoint_settings.set_link(link)

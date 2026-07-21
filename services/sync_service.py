@@ -187,4 +187,43 @@ def sharepoint_finalize(folder, progress_callback=None, project_type=None, print
     report("Resetting this device's current sheet...")
     sharepoint_update(folder, progress_callback=progress_callback, project_type=project_type)
 
+    return {"row_count": row_count, "notified": sent}
+
+
+# ----------------------------------------------------------------------
+# Local-only equivalents, used when the "Sync" switch on the Settings
+# page is turned off (see ui/Pages/Settings.py's SYNC_ENABLED_KEY and
+# ui/Pages/History.py's _sync_enabled()). Same end results as the
+# functions above -- new mail gets scanned in, a Finalize still exports
+# and closes out the period locally -- just with no pull from, push to,
+# or notification of another device, and therefore no partner email
+# required at all.
+# ----------------------------------------------------------------------
+
+def local_update(progress_callback=None):
+    """Sync-off equivalent of the 'Update' button: scans this device's
+    own inbox (same as Scan Inbox), with no pull from or push to another
+    device."""
+    sync_cards(progress_callback=progress_callback)
+    return {"scanned": True}
+
+
+def local_finalize(start_date, end_date, output_path, project_type=None, progress_callback=None):
+    """Sync-off equivalent of 'Finalize': scans this device's own inbox,
+    then exports and closes out the period locally -- no pull, no
+    notification. notified is deliberately None (not False) so the UI
+    can tell "sync is off, nothing was attempted" apart from "sync is on
+    and the notification failed to send"."""
+
+    def report(msg):
+        print(msg)
+        if progress_callback:
+            progress_callback(msg)
+
+    sync_cards(progress_callback=progress_callback)
+
+    report("Exporting final sheet...")
+    row_count = export_act_invoice_overview_range(start_date, end_date, output_path, project_type=project_type)
+
+    return {"row_count": row_count, "notified": None}
     return {"printed": True, "boundary_date": new_boundary, "rows_printed": len(rows)}
