@@ -979,6 +979,51 @@ def get_device_id():
         conn.close()
 
 
+def _next_outgoing_seq(conn):
+    """
+    Increments and returns THIS device's outgoing snapshot counter.
+    Every call to build_outgoing_snapshot() burns one of these -- it's
+    what lets the other side tell "I already have everything through
+    seq 8" apart from "here's a stale seq 5 that arrived late", so a pile
+    of queued sync mails collapses to "apply only the newest one" with no
+    reordering logic needed on the receiving end (see
+    apply_incoming_snapshot).
+    """
+    row = conn.execute(
+        "SELECT value FROM app_state WHERE key = 'sync_outgoing_seq'"
+    ).fetchone()
+    current = int(row[0]) if row and row[0] else 0
+    new_value = current + 1
+    conn.execute(
+        "INSERT INTO app_state (key, value) VALUES ('sync_outgoing_seq', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (str(new_value),),
+    )
+    return new_value
+
+
+def get_last_applied_seq(sender_device_id):
+    """The highest snapshot seq already applied FROM sender_device_id, or
+    0 if none has ever been applied. Per-sender, so this device can sync
+    with more than one other device without them stepping on each other's
+    sequence numbers."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT value FROM app_state WHERE key = ?",
+            (f"sync_applied_seq:{sender_device_id}",),
+        ).fetchone()
+        return int(row[0]) if row and row[0] else 0
+    finally:
+        conn.close()
+
+
+def _set_last_applied_seq(conn, sender_device_id, seq):
+    conn.execute(
+        "INSERT INTO app_state (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (f"sync_applied_seq:{sender_device_id}", str(seq)),
+    )
 
 
 def get_last_export_date():
@@ -1809,19 +1854,30 @@ def build_outgoing_snapshot(project_type=None, since_date=_UNSET):
     """
     Packages everything THIS device has scanned itself (origin = this
     device's id -- see save_cards) for the current open period into a
-    dict, rendered by the SharePoint file channel (see
-    services/sharepoint_service.py) to this device's own
+    dict ready to be mailed to the other user and handed to their
+    apply_incoming_snapshot() -- or, via the SharePoint file channel (see
+    services/sharepoint_service.py), rendered to this device's own
     current_<device_id>.xlsx.
 
     since_date controls where the open period starts:
-      - omitted entirely -> defaults to get_last_export_date().
+      - omitted entirely -> defaults to get_last_export_date() (the email
+        sync channel's boundary), so that flow is unchanged.
       - explicitly passed (including None, meaning "no lower bound -- the
         beginning of time") -> used as-is. This is how the SharePoint
-        channel passes its own, independent boundary.json boundary_date.
+        channel passes its own, independent boundary.json boundary_date
+        instead of the email channel's last_export_date -- the two
+        boundaries must stay separate.
 
     Deliberately excludes any row this device only knows about because it
     was itself synced in from the OTHER device -- each device only ever
-    publishes what it originally scanned.
+    publishes what it originally scanned. The other side already has
+    anything it sent; re-sending it back would just make every payload
+    grow forever and teach the other side nothing new.
+
+    "seq" in the returned dict is a monotonically increasing per-device
+    outgoing counter (see _next_outgoing_seq) -- only meaningful to the
+    email channel's apply_incoming_snapshot supersede check; the
+    SharePoint channel ignores it entirely.
     """
     device_id = get_device_id()
     period_start = get_last_export_date() if since_date is _UNSET else since_date
@@ -1846,15 +1902,209 @@ def build_outgoing_snapshot(project_type=None, since_date=_UNSET):
             columns = [desc[0] for desc in cursor.description]
             for raw in cursor.fetchall():
                 rows.append(_row_dict_to_entry(dict(zip(columns, raw)), status_label))
+
+        seq = _next_outgoing_seq(conn)
+        conn.commit()
     finally:
         conn.close()
 
     return {
         "device_id": device_id,
+        "seq": seq,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "period_start": period_start,
         "rows": rows,
     }
+
+
+def apply_incoming_snapshot(payload):
+    """
+    Merges another device's build_outgoing_snapshot() payload into this
+    database. Safe to call more than once with the same payload, and safe
+    if payloads from the same sender arrive out of order -- it's only
+    actually applied when its seq is strictly newer than the last one
+    already applied FROM THAT SENDER (see get_last_applied_seq); an
+    older or repeated one is silently skipped rather than reprocessed.
+
+    That's a deliberate design choice, not just deduplication: because
+    each snapshot is the sender's FULL current-period picture rather than
+    a delta, the newest one queued from a given sender is always a
+    superset of any older one still sitting unprocessed -- so if several
+    sync mails from the same device pile up (e.g. this laptop was closed
+    for a few days), applying only the newest and discarding the rest is
+    correct, not lossy.
+
+    Returns a dict describing what happened, for the caller (the email
+    import step) to log/surface to the user.
+    """
+    if not payload:
+        return {"applied": False, "reason": "empty payload"}
+
+    device_id = payload.get("device_id")
+    incoming_seq = payload.get("seq") or 0
+    if not device_id:
+        return {"applied": False, "reason": "missing device_id"}
+
+    last_applied = get_last_applied_seq(device_id)
+    if incoming_seq <= last_applied:
+        return {
+            "applied": False, "reason": "superseded",
+            "seq": incoming_seq, "last_applied": last_applied,
+        }
+
+    rows = payload.get("rows") or []
+
+    # The timecard data itself (day/project/task/status/etc) goes through
+    # the exact same path a real scan uses -- see save_cards -- just
+    # tagged with the SENDER's device id as origin instead of ours, which
+    # is what keeps this device from ever re-broadcasting it back out.
+    save_cards(rows, origin=device_id)
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rates_applied = 0
+        for entry in rows:
+            if not entry.get("rate_updated_at"):
+                continue
+            if _apply_rate_if_newer(
+                conn,
+                status_label=entry.get("status"),
+                natural_key=_row_key(_to_row(entry)),
+                rate=entry.get("rate"),
+                updated_at=entry.get("rate_updated_at"),
+                updated_by=entry.get("rate_updated_by"),
+            ):
+                rates_applied += 1
+
+        _set_last_applied_seq(conn, device_id, incoming_seq)
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "applied": True, "seq": incoming_seq,
+        "rows_merged": len(rows), "rates_applied": rates_applied,
+    }
+
+
+def _apply_rate_if_newer(conn, status_label, natural_key, rate, updated_at, updated_by):
+    """
+    The shared last-write-wins merge behind BOTH the per-row rate carried
+    inside a snapshot and a standalone rate-update message (see
+    build_rate_update_payload/apply_rate_update below). Only overwrites
+    the locally stored rate if the incoming edit is strictly newer than
+    whatever timestamp is already stored -- an incoming edit that's the
+    same age or older than the local one is left alone, so replaying an
+    old message (or two devices' clocks disagreeing by a few seconds)
+    can't undo a genuinely newer local edit.
+    """
+    table_name = STATUS_TABLES.get(status_label)
+    if table_name is None or rate is None or not updated_at:
+        return False
+
+    row = conn.execute(
+        f'SELECT id, rate_updated_at FROM "{table_name}" '
+        f'WHERE day = ? AND "Project Number" = ? AND "Task Name" = ? '
+        f'AND person_number = ? AND received_month = ?',
+        natural_key,
+    ).fetchone()
+    if row is None:
+        return False  # the timecard itself hasn't landed here -- nothing to attach a rate to
+
+    record_id, stored_updated_at = row
+    incoming_parsed = _parse_received(updated_at)
+    stored_parsed = _parse_received(stored_updated_at) if stored_updated_at else None
+    if incoming_parsed is not None and stored_parsed is not None and stored_parsed >= incoming_parsed:
+        return False
+
+    conn.execute(
+        f'UPDATE "{table_name}" SET rate = ?, rate_updated_at = ?, rate_updated_by = ? WHERE id = ?',
+        (rate, updated_at, updated_by, record_id),
+    )
+    return True
+
+
+def build_rate_update_payload(status_key, record_id):
+    """
+    A small standalone message for ONE rate edit, meant to be sent right
+    after the edit happens rather than waiting for the next full scan/
+    snapshot -- the point is the other user seeing a rate you just typed
+    in without needing to Scan Inbox first. Returns None if record_id
+    doesn't exist.
+    """
+    table_name = STATUS_TABLES.get(_STATUS_LABELS.get(status_key, "Approved"))
+    if table_name is None:
+        return None
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            f'SELECT day, "Project Number", "Task Name", person_number, received_month, '
+            f'rate, rate_updated_at, rate_updated_by FROM "{table_name}" WHERE id = ?',
+            (record_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+
+    day, project_number, task_name, person_number, received_month, rate, rate_updated_at, rate_updated_by = row
+    return {
+        "device_id": get_device_id(),
+        "status": _STATUS_LABELS.get(status_key, "Approved"),
+        "natural_key": [day, project_number, task_name, person_number, received_month],
+        "rate": rate,
+        "rate_updated_at": rate_updated_at,
+        "rate_updated_by": rate_updated_by,
+    }
+
+
+def apply_rate_update(payload):
+    """Applies one standalone rate-update message (see
+    build_rate_update_payload). Returns True if it actually changed
+    anything (i.e. it was newer than what's already stored)."""
+    if not payload:
+        return False
+    natural_key = tuple(payload.get("natural_key") or ())
+    if len(natural_key) != 5:
+        return False
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        applied = _apply_rate_if_newer(
+            conn,
+            status_label=payload.get("status"),
+            natural_key=natural_key,
+            rate=payload.get("rate"),
+            updated_at=payload.get("rate_updated_at"),
+            updated_by=payload.get("rate_updated_by"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return applied
+
+
+def record_finalize_from_other_device(name, end_date):
+    """
+    Applied when THIS device receives a "finalize" sync message from the
+    other user (see sync_service.pull_updates) -- logs their export into
+    THIS device's own export_history and advances THIS device's
+    last_export_date to match theirs.
+
+    This is what makes the finalize boundary SHARED state instead of
+    something each machine tracks independently: without it, the device
+    that didn't click Finalize would keep treating the just-closed period
+    as still open, and any timecard received in the last few days of it
+    would get scanned into what it thinks is next month's data instead.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        _record_export(conn, name)
+        _set_last_export_date(conn, end_date)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def export_to_csv(output_path="output.csv"):

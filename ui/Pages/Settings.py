@@ -12,13 +12,11 @@ separate "sync_enabled" flag persisted directly via QSettings in this file
 turned off" rather than just an empty field.
 """
 
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QComboBox, QFrame, QLineEdit
-from PySide6.QtCore import Qt, QSettings
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QComboBox, QFrame, QLineEdit,
     QPushButton, QFileDialog,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSettings
 
 from ui.theme_manager import theme_manager
 from ui.theme_utils import apply_live_style
@@ -31,6 +29,7 @@ from ui.sharepoint_settings import sharepoint_settings
 from onedrive_link_resolver import resolve_local_path_from_link, OneDriveLinkResolutionError
 
 BELL_ICON = "\U0001F514"
+SYNC_ICON = "\U0001F501"
 FOLDER_ICON = "\U0001F4C1"
 LINK_ICON = "\U0001F517"
 HOURS_PER_DAY = 24
@@ -161,6 +160,18 @@ class SettingsPage(QWidget):
         self._partner_email_edit.setPlaceholderText("their.email@company.com")
         self._partner_email_edit.editingFinished.connect(self._on_partner_email_edited)
         apply_live_style(self._partner_email_edit, lambda c: f"""
+            QLineEdit {{
+                border: 1px solid {c['BORDER']};
+                border-radius: 6px;
+                padding: 6px 8px;
+                font-size: 13px;
+                background: {c['SURFACE']};
+                color: {c['TEXT_PRIMARY']};
+            }}
+            QLineEdit:focus {{ border: 1px solid {c['ACCENT']}; }}
+        """)
+        layout.addWidget(self._partner_email_edit)
+
         sharepoint_divider = QFrame()
         sharepoint_divider.setFixedHeight(1)
         apply_live_style(sharepoint_divider, lambda c: f"background-color: {c['BORDER']};")
