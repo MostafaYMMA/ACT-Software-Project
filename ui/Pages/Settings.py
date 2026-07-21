@@ -14,6 +14,11 @@ turned off" rather than just an empty field.
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QComboBox, QFrame, QLineEdit
 from PySide6.QtCore import Qt, QSettings
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QComboBox, QFrame, QLineEdit,
+    QPushButton, QFileDialog,
+)
+from PySide6.QtCore import Qt
 
 from ui.theme_manager import theme_manager
 from ui.theme_utils import apply_live_style
@@ -22,9 +27,12 @@ from ui.switch import Switch
 from ui.notification_settings import notification_settings
 from ui.sync_partner_settings import sync_partner_settings
 from ui.profile_circle import SETTINGS_ORG, SETTINGS_APP
+from ui.sharepoint_settings import sharepoint_settings
+from onedrive_link_resolver import resolve_local_path_from_link, OneDriveLinkResolutionError
 
 BELL_ICON = "\U0001F514"
-SYNC_ICON = "\U0001F501"
+FOLDER_ICON = "\U0001F4C1"
+LINK_ICON = "\U0001F517"
 HOURS_PER_DAY = 24
 
 # Persisted the same way every other per-user toggle in this app already is
@@ -153,6 +161,56 @@ class SettingsPage(QWidget):
         self._partner_email_edit.setPlaceholderText("their.email@company.com")
         self._partner_email_edit.editingFinished.connect(self._on_partner_email_edited)
         apply_live_style(self._partner_email_edit, lambda c: f"""
+        sharepoint_divider = QFrame()
+        sharepoint_divider.setFixedHeight(1)
+        apply_live_style(sharepoint_divider, lambda c: f"background-color: {c['BORDER']};")
+        layout.addWidget(sharepoint_divider)
+
+        # -- SharePoint folder (Update / View Current / Finalize on Export History) --
+        # A local, OneDrive/SharePoint-synced folder PATH is what the sync
+        # channel actually uses -- transport for it is plain file copies
+        # into this path (see services/sharepoint_service.py); there is no
+        # Graph API/OAuth involved, so nothing here ever "uploads" over
+        # the internet directly -- the OneDrive desktop client does that
+        # on its own once a file lands in the synced folder. The link
+        # field below is a convenience for FILLING IN this path -- it
+        # doesn't replace it.
+        sharepoint_label = QLabel("SharePoint Sync")
+        apply_live_style(sharepoint_label, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 11px; font-weight: 700;")
+        layout.addWidget(sharepoint_label)
+
+        # -- Resolve the folder from a pasted link (convenience) ----------
+        # Purely local (see services/onedrive_link_resolver.py): matches
+        # the pasted link against OneDrive's OWN record, in the Windows
+        # registry, of what it has already synced on this PC, and fills
+        # in the folder field below automatically. No Graph API, no
+        # OAuth, no sign-in, no network call -- if OneDrive hasn't
+        # already synced this library on this machine, this can't find
+        # it (Browse/manual entry below always still works as a fallback).
+        link_row = QHBoxLayout()
+        link_row.setSpacing(10)
+
+        link_icon_label = QLabel(LINK_ICON)
+        link_icon_label.setStyleSheet("font-size: 15px;")
+        link_row.addWidget(link_icon_label)
+
+        link_text = QLabel("Paste a SharePoint/OneDrive link to fill in the folder below automatically")
+        link_text.setWordWrap(True)
+        apply_live_style(link_text, lambda c: f"color: {c['TEXT_PRIMARY']}; font-size: 13px;")
+        link_row.addWidget(link_text, stretch=1)
+
+        layout.addLayout(link_row)
+
+        link_input_row = QHBoxLayout()
+        link_input_row.setSpacing(10)
+
+        self._sharepoint_link_edit = QLineEdit(sharepoint_settings.link)
+        self._sharepoint_link_edit.setPlaceholderText("https://yourcompany.sharepoint.com/sites/...")
+        self._sharepoint_link_edit.setToolTip(
+            "A normal SharePoint/OneDrive web link. Resolved to the matching LOCAL synced folder using "
+            "OneDrive's own sync records on this PC -- no sign-in, no network call, works offline."
+        )
+        apply_live_style(self._sharepoint_link_edit, lambda c: f"""
             QLineEdit {{
                 border: 1px solid {c['BORDER']};
                 border-radius: 6px;
@@ -163,7 +221,82 @@ class SettingsPage(QWidget):
             }}
             QLineEdit:focus {{ border: 1px solid {c['ACCENT']}; }}
         """)
-        layout.addWidget(self._partner_email_edit)
+        link_input_row.addWidget(self._sharepoint_link_edit, stretch=1)
+
+        resolve_btn = QPushButton("Resolve")
+        resolve_btn.setObjectName("primaryButton")
+        resolve_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        resolve_btn.setToolTip("Find the local synced folder that matches this link and fill it in below")
+        resolve_btn.clicked.connect(self._on_resolve_sharepoint_link)
+        link_input_row.addWidget(resolve_btn)
+
+        layout.addLayout(link_input_row)
+
+        self._link_status_is_error = False
+        self._sharepoint_link_status = QLabel("")
+        self._sharepoint_link_status.setWordWrap(True)
+        # apply_live_style returns the callable it wired up to
+        # theme_changed -- kept so _on_resolve_sharepoint_link can re-run
+        # it immediately after flipping _link_status_is_error, instead of
+        # waiting for the next theme toggle to pick up the new color.
+        self._refresh_link_status_style = apply_live_style(
+            self._sharepoint_link_status,
+            lambda c: f"color: {'#E05252' if self._link_status_is_error else c['TEXT_SECONDARY']}; font-size: 11px;",
+        )
+        layout.addWidget(self._sharepoint_link_status)
+
+        # -- ...or set/verify the folder path directly ---------------------
+        sharepoint_row = QHBoxLayout()
+        sharepoint_row.setSpacing(10)
+
+        sharepoint_icon_label = QLabel(FOLDER_ICON)
+        sharepoint_icon_label.setStyleSheet("font-size: 15px;")
+        sharepoint_row.addWidget(sharepoint_icon_label)
+
+        sharepoint_text = QLabel("...or set the local folder path directly (not a web link)")
+        sharepoint_text.setWordWrap(True)
+        apply_live_style(sharepoint_text, lambda c: f"color: {c['TEXT_PRIMARY']}; font-size: 13px;")
+        sharepoint_row.addWidget(sharepoint_text, stretch=1)
+
+        layout.addLayout(sharepoint_row)
+
+        folder_row = QHBoxLayout()
+        folder_row.setSpacing(10)
+
+        self._sharepoint_folder_edit = QLineEdit(sharepoint_settings.folder)
+        self._sharepoint_folder_edit.setPlaceholderText(r"C:\Users\you\Company\Timecards - Current")
+        self._sharepoint_folder_edit.setToolTip(
+            "A local folder path, not a SharePoint web URL -- e.g. "
+            r"C:\Users\you\CompanyName\Timecards - Current"
+        )
+        self._sharepoint_folder_edit.editingFinished.connect(self._on_sharepoint_folder_edited)
+        apply_live_style(self._sharepoint_folder_edit, lambda c: f"""
+            QLineEdit {{
+                border: 1px solid {c['BORDER']};
+                border-radius: 6px;
+                padding: 6px 8px;
+                font-size: 13px;
+                background: {c['SURFACE']};
+                color: {c['TEXT_PRIMARY']};
+            }}
+            QLineEdit:focus {{ border: 1px solid {c['ACCENT']}; }}
+        """)
+        folder_row.addWidget(self._sharepoint_folder_edit, stretch=1)
+
+        browse_btn = QPushButton("Browse...")
+        browse_btn.setObjectName("secondaryButton")
+        browse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        browse_btn.setToolTip("Pick the local synced folder instead of typing/pasting the path")
+        browse_btn.clicked.connect(self._on_browse_sharepoint_folder)
+        folder_row.addWidget(browse_btn)
+
+        layout.addLayout(folder_row)
+
+        self._sharepoint_folder_warning = QLabel("")
+        self._sharepoint_folder_warning.setWordWrap(True)
+        apply_live_style(self._sharepoint_folder_warning, lambda c: "color: #E05252; font-size: 11px;")
+        self._sharepoint_folder_warning.setVisible(False)
+        layout.addWidget(self._sharepoint_folder_warning)
 
         layout.addStretch()
 
@@ -218,6 +351,53 @@ class SettingsPage(QWidget):
 
     def _on_partner_email_edited(self):
         sync_partner_settings.set_partner_email(self._partner_email_edit.text())
+    def _on_resolve_sharepoint_link(self):
+        link = self._sharepoint_link_edit.text()
+        sharepoint_settings.set_link(link)
+
+        try:
+            folder = resolve_local_path_from_link(link)
+        except OneDriveLinkResolutionError as exc:
+            self._link_status_is_error = True
+            self._sharepoint_link_status.setText(str(exc))
+            self._refresh_link_status_style()
+            return
+
+        self._link_status_is_error = False
+        self._sharepoint_link_status.setText(f"Resolved to: {folder}")
+        self._refresh_link_status_style()
+
+        self._sharepoint_folder_edit.setText(folder)
+        self._warn_if_sharepoint_folder_looks_like_url(folder)
+        sharepoint_settings.set_folder(folder)
+
+    def _on_sharepoint_folder_edited(self):
+        value = self._sharepoint_folder_edit.text()
+        self._warn_if_sharepoint_folder_looks_like_url(value)
+        sharepoint_settings.set_folder(value)
+
+    def _warn_if_sharepoint_folder_looks_like_url(self, value):
+        """Catches the most common mistake here -- pasting a SharePoint
+        "Copy Link" web URL instead of the local synced folder path --
+        right where it's entered, instead of letting it silently fail
+        much later when SharePoint Update can't find/write the folder."""
+        looks_like_url = value.strip().lower().startswith(("http://", "https://"))
+        self._sharepoint_folder_warning.setText(
+            "That looks like a web link, not a local folder path. This field needs the path to the "
+            "folder on THIS PC where OneDrive already syncs that SharePoint library -- see the note above."
+            if looks_like_url else ""
+        )
+        self._sharepoint_folder_warning.setVisible(looks_like_url)
+
+    def _on_browse_sharepoint_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select the local OneDrive-synced SharePoint folder", sharepoint_settings.folder or ""
+        )
+        if not folder:
+            return  # user cancelled
+        self._sharepoint_folder_edit.setText(folder)
+        self._warn_if_sharepoint_folder_looks_like_url(folder)
+        sharepoint_settings.set_folder(folder)
 
     def _on_threshold_changed(self, _value):
         multiplier = HOURS_PER_DAY if self._threshold_unit.currentText() == "Days" else 1
