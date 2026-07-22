@@ -1,3 +1,4 @@
+import os
 from datetime import date, timedelta
 
 from PySide6.QtWidgets import (
@@ -18,8 +19,10 @@ from storage_service import (
     get_active_export_path, PROJECT_TYPE_LABELS, SNAPSHOT_COLUMNS,
     get_device_id, find_record_id, update_status_record_field,
 )
+from ui.sync_workers import (
+    UpdateWorker, LocalUpdateWorker, FinalizeWorker, LocalFinalizeWorker,
+)
 from sync_service import (
-    update_with_other_user, finalize_month, local_update, local_finalize,
     sharepoint_update, sharepoint_view_current, sharepoint_finalize,
 )
 from sharepoint_service import SharePointFolderError
@@ -113,114 +116,21 @@ def _apply_orange_calendar_style(date_edit):
     """)
 
 
-# ----------------------------------------------------------------------
-# Email / partner sync workers (Update / Finalize send mail to one other
-# user -- see ui/sync_partner_settings.py + services/sync_service.py's
-# update_with_other_user/finalize_month, and local_update/local_finalize
-# for the sync-off, local-scan-only path).
-# ----------------------------------------------------------------------
-
-# Every worker below emits EITHER finished or failed, never neither: the
-# page disables its buttons when one starts and only re-enables them in
-# those two handlers, so an exception escaping run() would leave Update and
-# Finalize greyed out for the rest of the session (and the QThread never
-# quit, since quit is wired to those same signals). Same shape as the
-# SharePoint workers further down.
-
-class _UpdateWorker(QObject):
-    progress = Signal(str)
-    finished = Signal(dict)
-    failed = Signal(str)
-
-    def __init__(self, recipient_email, project_type):
-        super().__init__()
-        self.recipient_email = recipient_email
-        self.project_type = project_type
-
-    def run(self):
-        try:
-            result = update_with_other_user(
-                self.recipient_email, project_type=self.project_type,
-                progress_callback=self.progress.emit,
-            )
-        except Exception as exc:
-            self.failed.emit(str(exc))
-            return
-        self.finished.emit(result)
-
-
-class _LocalUpdateWorker(QObject):
-    """Sync-off equivalent of _UpdateWorker: no recipient email, no
-    pull/push, just a local inbox scan (sync_service.local_update)."""
-    progress = Signal(str)
-    finished = Signal(dict)
-    failed = Signal(str)
-
-    def __init__(self, project_type):
-        super().__init__()
-        self.project_type = project_type
-
-    def run(self):
-        try:
-            result = local_update(
-                project_type=self.project_type, progress_callback=self.progress.emit,
-            )
-        except Exception as exc:
-            self.failed.emit(str(exc))
-            return
-        self.finished.emit(result)
-
-
-class _FinalizeWorker(QObject):
-    progress = Signal(str)
-    finished = Signal(dict)
-    failed = Signal(str)
-
-    def __init__(self, recipient_email, start_date, end_date, project_type):
-        super().__init__()
-        self.recipient_email = recipient_email
-        self.start_date = start_date
-        self.end_date = end_date
-        self.project_type = project_type
-
-    def run(self):
-        try:
-            result = finalize_month(
-                self.recipient_email, self.start_date, self.end_date,
-                project_type=self.project_type, progress_callback=self.progress.emit,
-            )
-        except Exception as exc:
-            self.failed.emit(str(exc))
-            return
-        self.finished.emit(result)
-
-
-class _LocalFinalizeWorker(QObject):
-    """Sync-off equivalent of _FinalizeWorker: no recipient email, no
-    pull/notify, just a local scan + closing out the active export sheet
-    (sync_service.local_finalize). As with _FinalizeWorker there is no
-    output_path -- the file closed is whichever one Update has been
-    filling."""
-    progress = Signal(str)
-    finished = Signal(dict)
-    failed = Signal(str)
-
-    def __init__(self, start_date, end_date, project_type):
-        super().__init__()
-        self.start_date = start_date
-        self.end_date = end_date
-        self.project_type = project_type
-
-    def run(self):
-        try:
-            result = local_finalize(
-                self.start_date, self.end_date,
-                project_type=self.project_type, progress_callback=self.progress.emit,
-            )
-        except Exception as exc:
-            self.failed.emit(str(exc))
-            return
-        self.finished.emit(result)
+# The Email / partner sync workers (Update / Finalize) now live in
+# ui/sync_workers.py so the Current Sheet page can put an Update button on
+# screen driven by the very same code -- see the imports at the top of this
+# file. Their behaviour is unchanged; only where they're defined moved.
+#
+# main's copy of these classes was dropped in the merge rather than this
+# one: the import block above already resolved to ui.sync_workers, so
+# main's bodies would have had no update_with_other_user/local_update/
+# finalize_month/local_finalize to call. Main's ONE behavioural change
+# here -- _LocalUpdateWorker taking a project_type -- is carried over into
+# ui/sync_workers.py instead, which is where the class now lives.
+_UpdateWorker = UpdateWorker
+_LocalUpdateWorker = LocalUpdateWorker
+_FinalizeWorker = FinalizeWorker
+_LocalFinalizeWorker = LocalFinalizeWorker
 
 
 # ----------------------------------------------------------------------
@@ -749,6 +659,10 @@ class HistoryPage(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        # Double-click opens the exported file itself. itemDoubleClicked
+        # (not cellDoubleClicked) so an empty area of the table is a no-op.
+        self.table.itemDoubleClicked.connect(self._on_export_row_activated)
+        self._export_paths = []
         apply_live_style(self.table, lambda c: f"""
             QTableWidget {{
                 border: 1px solid {c['BORDER']}; background: {c['BG']}; color: {c['TEXT_PRIMARY']};
@@ -1201,6 +1115,45 @@ class HistoryPage(QWidget):
     # -----------------------------------------------------------------
     # Export history log
     # -----------------------------------------------------------------
+    def _on_export_row_activated(self, item):
+        """Opens the exported file for the double-clicked row in whatever
+        app the OS associates with it.
+
+        The file is NOT assumed to still be there: an export can be moved,
+        renamed, deleted, or sit on a network/USB drive that isn't mounted
+        right now, and rows logged before the path column existed have no
+        path at all. Each of those gets its own message rather than an
+        exception out of os.startfile."""
+        row_index = item.row()
+        path = self._export_paths[row_index] if row_index < len(self._export_paths) else None
+        name = self.table.item(row_index, 0)
+        name = name.text() if name else "this export"
+
+        if not path:
+            QMessageBox.information(
+                self, "No file recorded",
+                f"{name} was exported before the app started recording where files were "
+                "saved, so there's no location to open. Exports from now on will open.",
+            )
+            return
+
+        if not os.path.exists(path):
+            QMessageBox.warning(
+                self, "File not found",
+                f"{name} is no longer at:\n\n{path}\n\n"
+                "It may have been moved, renamed or deleted, or it may be on a drive "
+                "that isn't connected right now. The history entry is kept either way.",
+            )
+            return
+
+        try:
+            os.startfile(path)  # Windows-only, like the rest of this app (Outlook COM)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Couldn't open the file",
+                f"Windows refused to open:\n\n{path}\n\n{exc}",
+            )
+
     def refresh(self):
         # Per division: each has its own rolling sheet, so this has to
         # follow the toggle rather than always showing the "All" one.
@@ -1220,11 +1173,20 @@ class HistoryPage(QWidget):
         )
 
         rows = get_export_history()
+        # Kept alongside the table so _on_export_row_activated can find the
+        # file for a row -- the path isn't shown as a column (it's long and
+        # says nothing the filename doesn't), so the row index is the link.
+        self._export_paths = [path for _name, _date, path in rows]
         self.table.setRowCount(len(rows))
-        for row_index, (name, date_str) in enumerate(rows):
+        for row_index, (name, date_str, path) in enumerate(rows):
             for col_index, value in enumerate((name, date_str)):
                 item = QTableWidgetItem(value)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setToolTip(
+                    f"Double-click to open {path}" if path
+                    else "This export was logged before file paths were recorded, "
+                         "so there's no file to open."
+                )
                 self.table.setItem(row_index, col_index, item)
 
     def showEvent(self, event):

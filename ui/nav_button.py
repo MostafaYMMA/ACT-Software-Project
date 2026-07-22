@@ -27,11 +27,14 @@ ICON_ANIM_MS = 180
 # its label rather than being a generic shape:
 #   dashboard -> tiled panels (a dashboard is made of panels/widgets)
 #   records   -> a document with rows (a "record" is a row of data)
+#   current_sheet -> a spreadsheet grid with one cell filled in (a working
+#                sheet you mark up, not just another list of records)
 #   export    -> a clock with a return arrow (history, not just "refresh")
 #   late      -> a clock with an exclamation mark (overdue, not a
 #                generic hazard triangle - which is what read as an
 #                unrelated "yellow warning" before)
-#   settings  -> a gear
+#   settings  -> a toothed cog (it spins on hover, so it has to actually
+#                look like something that turns)
 _ICONS = {
     "dashboard": """
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
@@ -49,6 +52,14 @@ _ICONS = {
           <line x1="7.5" y1="17" x2="13" y2="17" stroke="white" stroke-width="1.8" stroke-linecap="round"/>
         </svg>
     """,
+    "current_sheet": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+          <rect x="3" y="4" width="18" height="16" rx="2" fill="none" stroke="white" stroke-width="1.8"/>
+          <line x1="3" y1="9" x2="21" y2="9" stroke="white" stroke-width="1.8"/>
+          <line x1="9" y1="9" x2="9" y2="20" stroke="white" stroke-width="1.8"/>
+          <rect x="10.2" y="10.2" width="9.6" height="3.4" rx="0.8" fill="white"/>
+        </svg>
+    """,
     "export": """
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
           <circle cx="11.5" cy="12.5" r="8" fill="none" stroke="white" stroke-width="1.8"/>
@@ -64,11 +75,17 @@ _ICONS = {
           <line x1="9" y1="2.5" x2="15" y2="2.5" stroke="white" stroke-width="1.8" stroke-linecap="round"/>
         </svg>
     """,
+    # A real toothed cog: solid body with eight square teeth around it and
+    # a cut-out hub, rather than the thin spoked circle this used to be
+    # (which read as a sun/asterisk more than a gear). Drawn as one filled
+    # path with evenodd so the hub is a genuine hole -- that matters because
+    # the icon is rotated on hover (see app.py's _SETTINGS_SPIN_DEG), and a
+    # hole stays a hole under rotation while a hub drawn in the background
+    # colour would smear.
     "settings": """
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-          <circle cx="12" cy="12" r="3.3" fill="none" stroke="white" stroke-width="1.8"/>
-          <path d="M12 2.5v3.1M12 18.4v3.1M21.5 12h-3.1M5.6 12h-3.1M18.4 5.6l-2.2 2.2M7.8 16.2l-2.2 2.2M18.4 18.4l-2.2-2.2M7.8 7.8 5.6 5.6"
-                fill="none" stroke="white" stroke-width="1.8" stroke-linecap="round"/>
+          <path fill-rule="evenodd" clip-rule="evenodd" fill="white"
+                d="M10.3 1.8h3.4l.35 2.6a8.2 8.2 0 0 1 1.87.78l2.1-1.6 2.4 2.4-1.6 2.1c.33.58.6 1.21.78 1.87l2.6.35v3.4l-2.6.35a8.2 8.2 0 0 1-.78 1.87l1.6 2.1-2.4 2.4-2.1-1.6a8.2 8.2 0 0 1-1.87.78l-.35 2.6h-3.4l-.35-2.6a8.2 8.2 0 0 1-1.87-.78l-2.1 1.6-2.4-2.4 1.6-2.1a8.2 8.2 0 0 1-.78-1.87l-2.6-.35v-3.4l2.6-.35c.18-.66.45-1.29.78-1.87l-1.6-2.1 2.4-2.4 2.1 1.6c.58-.33 1.21-.6 1.87-.78zM12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7z"/>
         </svg>
     """,
 }

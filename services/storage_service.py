@@ -918,6 +918,46 @@ def init_db():
         )
     """)
 
+    # The Current Sheet: a working copy of the approved timecards that the
+    # user edits and colour-codes by hand, sitting between the raw scan and
+    # the final export. Same relationship to timecards_approved that
+    # invoice_lines has -- linked by a UNIQUE timecard_id, seeded once from
+    # the scanned values and never overwritten afterwards (see
+    # sync_current_sheet), so nothing typed here is lost on a re-scan.
+    #
+    # row_color is a hex string like "#FFD966", or NULL for "no colour".
+    # It carries no meaning to any other part of the app: nothing reads it
+    # to decide behaviour, nothing sets it automatically. It exists purely
+    # so the user can mark rows for their own purposes.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS current_sheet (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timecard_id INTEGER UNIQUE,
+            day TEXT,
+            "Date" TEXT,
+            "Project Number" TEXT,
+            "Project Name" TEXT,
+            "Task Name" TEXT,
+            "Qty" TEXT,
+            rate REAL DEFAULT 0,
+            name TEXT,
+            person_number TEXT,
+            period TEXT,
+            subject TEXT,
+            sender TEXT,
+            received TEXT,
+            row_color TEXT
+        )
+    """)
+    # A colour is shared state: both users see the same highlights, so two
+    # people can colour the same row and the merge needs a rule. Same
+    # last-write-wins stamps the rate edits already use (see
+    # _apply_rate_if_newer) -- who set it and when, so an old payload
+    # replayed later can't undo a newer local choice.
+    _ensure_columns(conn, "current_sheet", [
+        "color_updated_at TEXT", "color_updated_by TEXT",
+    ])
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS export_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -925,6 +965,11 @@ def init_db():
             date TEXT
         )
     """)
+    # Added after the fact: rows written before this column existed keep a
+    # NULL path and can't be opened from the History page (there's nothing
+    # to open -- only the bare filename was ever stored). New rows carry the
+    # full path from here on.
+    _ensure_columns(conn, "export_history", ["path TEXT"])
 
     # Which approved timecard rows have been written into a rolling export
     # sheet, and which sheet (see rebuild_active_export). finalized = 0 is
@@ -974,18 +1019,26 @@ def init_db():
 init_db()
 
 
-def _record_export(conn, name: str):
+def _record_export(conn, name: str, full_path: str = None):
+    """
+    Logs one export. full_path is the absolute path the file was actually
+    written to -- without it a history row is just a bare filename, with no
+    way left to find the file it names (the folder the user chose in the
+    save dialog is gone). It's what the History page opens on double-click.
+    """
     conn.execute(
-        "INSERT INTO export_history (name, date) VALUES (?, ?)",
-        (name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        "INSERT INTO export_history (name, date, path) VALUES (?, ?, ?)",
+        (name, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), full_path),
     )
 
 
 def get_export_history():
-    """Returns (name, date) rows for every export ever done, newest first."""
+    """Returns (name, date, path) rows for every export ever done, newest
+    first. path is None for rows logged before it was recorded -- callers
+    must handle that rather than assuming a file to open."""
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
-        "SELECT name, date FROM export_history ORDER BY date DESC, id DESC"
+        "SELECT name, date, path FROM export_history ORDER BY date DESC, id DESC"
     ).fetchall()
     conn.close()
     return rows
@@ -1346,6 +1399,112 @@ def _prune_invoice_lines(conn):
     """)
 
 
+def sync_current_sheet(conn):
+    """
+    Adds one current_sheet row per timecards_approved entry, for any entry
+    not already linked (via timecard_id). Only ever INSERTs (OR IGNORE on
+    the timecard_id UNIQUE key) -- exactly the approach _sync_invoice_lines
+    takes, and deliberately NOT the delete-and-rebuild _rebuild_summary
+    uses.
+
+    That distinction is the whole point of this table: an existing row is
+    never touched, so every cell the user has corrected by hand and every
+    colour they've set survives each later scan intact. A re-scan can only
+    ever ADD rows here.
+    """
+    rows = conn.execute("""
+        SELECT id, day, "Date", "Project Number", "Project Name", "Task Name",
+               "Qty", rate, name, person_number, period, subject, sender, received
+        FROM timecards_approved
+    """).fetchall()
+
+    conn.executemany("""
+        INSERT OR IGNORE INTO current_sheet
+        (timecard_id, day, "Date", "Project Number", "Project Name", "Task Name",
+         "Qty", rate, name, person_number, period, subject, sender, received, row_color)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+    """, rows)
+
+
+def get_current_sheet_rows():
+    """Every current_sheet row as a dict, newest work-date first. Includes
+    the internal id and timecard_id -- the UI needs the id to save an edit,
+    and table_utils.HIDDEN_COLUMNS already keeps both off screen."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cursor = conn.execute('SELECT * FROM current_sheet')
+        columns = [desc[0] for desc in cursor.description]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+    rows.sort(key=lambda r: r.get("Date") or "", reverse=True)
+    return rows
+
+
+def update_current_sheet_field(row_id, column, value):
+    """
+    Writes one cell edit from the Current Sheet grid back to its row
+    (identified by current_sheet.id). Mirrors update_status_record_field:
+    the column must actually exist on the table -- column names can't be
+    bound as SQL parameters, so this check is what keeps the interpolation
+    safe -- and the internal columns are refused. Returns True when a row
+    was updated; False for an unknown/refused column or a missing id.
+
+    Edits stay in current_sheet. They are deliberately NOT written back to
+    timecards_approved: this table is a working copy, and the scanned
+    record is the record of what actually arrived.
+    """
+    if column in ("id", "timecard_id", "row_color"):
+        return False
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        valid_columns = {row[1] for row in conn.execute('PRAGMA table_info("current_sheet")')}
+        if column not in valid_columns:
+            return False
+        try:
+            cursor = conn.execute(
+                f'UPDATE current_sheet SET "{column}" = ? WHERE id = ?',
+                (value, row_id),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def set_current_sheet_row_color(row_id, hex_color):
+    """
+    Sets (or with hex_color=None clears) one row's colour, stamping who
+    set it and when.
+
+    Those stamps are what let the colour travel to the other user: it
+    rides out in the next snapshot and is merged there last-write-wins
+    (see _apply_color_if_newer), exactly like a rate edit. Clearing a
+    colour is an edit too -- it stamps as well, so "I removed that
+    highlight" beats an older "I set it" rather than the row quietly
+    staying coloured on the other machine.
+
+    Kept apart from update_current_sheet_field, which refuses row_color,
+    so a stray cell edit can never write a colour and vice versa. Returns
+    True when a row was updated.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cursor = conn.execute(
+            "UPDATE current_sheet SET row_color = ?, color_updated_at = ?, color_updated_by = ? "
+            "WHERE id = ?",
+            (hex_color, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), get_device_id(), row_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
 def _dedupe_latest_across_statuses(grouped):
     """
     Collapses entries sharing the same _row_key down to the single
@@ -1533,6 +1692,9 @@ def save_cards(entries: list, origin=None):
         _rebuild_summary(conn)
         _rebuild_project_type_tables(conn)
         _sync_invoice_lines(conn)
+        # Seeds a Current Sheet row for any newly-approved entry. Never
+        # updates an existing one -- see sync_current_sheet.
+        sync_current_sheet(conn)
         # Comment out the next line to KEEP the invoice line of an entry whose
         # approval was later revoked (it moved to Pending/Rejected), instead of
         # deleting it. The trade either way:
@@ -1920,7 +2082,7 @@ def export_expenses_to_csv(output_path="expenses.csv"):
             writer = csv.writer(f)
             writer.writerow(columns)
             writer.writerows(cursor.fetchall())
-        _record_export(conn, os.path.basename(output_path))
+        _record_export(conn, os.path.basename(output_path), os.path.abspath(output_path))
         conn.commit()
     finally:
         conn.close()
@@ -1940,6 +2102,12 @@ def _row_dict_to_entry(row_dict, status_label):
     rate/rate_updated_at/rate_updated_by ride along as extra keys that
     _to_row() itself ignores -- they're just carried through to the
     rendered current-sheet xlsx for reference.
+
+    row_color/color_updated_at/color_updated_by ride along the same way,
+    but unlike the rate stamps they ARE merged on the far side (see
+    _apply_color_if_newer) -- that's what makes a highlight one user sets
+    show up for the other. They're only ever present on Approved rows;
+    the Current Sheet exists for approved timecards only.
     """
     return {
         "day": row_dict.get("day"),
@@ -1959,6 +2127,9 @@ def _row_dict_to_entry(row_dict, status_label):
         "rate": row_dict.get("rate"),
         "rate_updated_at": row_dict.get("rate_updated_at"),
         "rate_updated_by": row_dict.get("rate_updated_by"),
+        "row_color": row_dict.get("row_color"),
+        "color_updated_at": row_dict.get("color_updated_at"),
+        "color_updated_by": row_dict.get("color_updated_by"),
     }
 
 
@@ -2000,6 +2171,18 @@ def build_outgoing_snapshot(project_type=None, since_date=_UNSET):
 
     conn = sqlite3.connect(DB_PATH)
     try:
+        colors_by_timecard = {
+            timecard_id: {
+                "row_color": row_color,
+                "color_updated_at": updated_at,
+                "color_updated_by": updated_by,
+            }
+            for timecard_id, row_color, updated_at, updated_by in conn.execute(
+                "SELECT timecard_id, row_color, color_updated_at, color_updated_by "
+                "FROM current_sheet WHERE color_updated_at IS NOT NULL"
+            )
+        }
+
         rows = []
         for status_label, table_name in STATUS_TABLES.items():
             clauses = ["origin = ?"]
@@ -2016,7 +2199,18 @@ def build_outgoing_snapshot(project_type=None, since_date=_UNSET):
             )
             columns = [desc[0] for desc in cursor.description]
             for raw in cursor.fetchall():
-                rows.append(_row_dict_to_entry(dict(zip(columns, raw)), status_label))
+                row_dict = dict(zip(columns, raw))
+                # The Current Sheet's colours ride out with the approved
+                # rows. Looked up rather than JOINed: current_sheet repeats
+                # "received"/"Project Name"/etc, so a join would make every
+                # one of the WHERE clauses above ambiguous. Approved only --
+                # current_sheet.timecard_id points at that table's ids, and
+                # the other two have their own independent autoincrements,
+                # so matching on the number alone would staple an unrelated
+                # row's colour on.
+                if table_name == "timecards_approved":
+                    row_dict.update(colors_by_timecard.get(row_dict.get("id"), {}))
+                rows.append(_row_dict_to_entry(row_dict, status_label))
 
         seq = _next_outgoing_seq(conn)
         conn.commit()
@@ -2091,6 +2285,23 @@ def apply_incoming_snapshot(payload):
             ):
                 rates_applied += 1
 
+        # Colours run after save_cards above, not before: save_cards is what
+        # calls sync_current_sheet, so the row a colour belongs to only
+        # exists by this point.
+        colors_applied = 0
+        for entry in rows:
+            if not entry.get("color_updated_at"):
+                continue
+            if _apply_color_if_newer(
+                conn,
+                status_label=entry.get("status"),
+                natural_key=_row_key(_to_row(entry)),
+                row_color=entry.get("row_color"),
+                updated_at=entry.get("color_updated_at"),
+                updated_by=entry.get("color_updated_by"),
+            ):
+                colors_applied += 1
+
         _set_last_applied_seq(conn, device_id, incoming_seq)
         conn.commit()
     finally:
@@ -2099,7 +2310,52 @@ def apply_incoming_snapshot(payload):
     return {
         "applied": True, "seq": incoming_seq,
         "rows_merged": len(rows), "rates_applied": rates_applied,
+        "colors_applied": colors_applied,
     }
+
+
+def _apply_color_if_newer(conn, status_label, natural_key, row_color, updated_at, updated_by):
+    """
+    Last-write-wins merge for a Current Sheet row colour, the same shape as
+    _apply_rate_if_newer: the incoming colour only lands if it's strictly
+    newer than whatever is stored, so replaying an old snapshot -- or two
+    devices' clocks drifting a few seconds apart -- can't undo a genuinely
+    newer local choice.
+
+    Unlike the rate, row_color of None is a real value ("cleared"), not
+    "nothing to say" -- the caller has already checked updated_at, which is
+    what distinguishes "this user removed the highlight" from "this row
+    never had one".
+
+    Only Approved rows carry a colour: the Current Sheet is approved-only,
+    so anything else is ignored rather than silently matched to the wrong
+    table.
+    """
+    if status_label != "Approved" or not updated_at:
+        return False
+
+    row = conn.execute(
+        'SELECT cs.id, cs.color_updated_at FROM current_sheet cs '
+        'JOIN timecards_approved t ON t.id = cs.timecard_id '
+        'WHERE t.day = ? AND t."Project Number" = ? AND t."Task Name" = ? '
+        'AND t.person_number = ? AND t.received_month = ?',
+        natural_key,
+    ).fetchone()
+    if row is None:
+        return False  # the timecard itself hasn't landed here -- nothing to colour
+
+    current_sheet_id, stored_updated_at = row
+    incoming_parsed = _parse_received(updated_at)
+    stored_parsed = _parse_received(stored_updated_at) if stored_updated_at else None
+    if incoming_parsed is not None and stored_parsed is not None and stored_parsed >= incoming_parsed:
+        return False
+
+    conn.execute(
+        "UPDATE current_sheet SET row_color = ?, color_updated_at = ?, color_updated_by = ? "
+        "WHERE id = ?",
+        (row_color, updated_at, updated_by, current_sheet_id),
+    )
+    return True
 
 
 def _apply_rate_if_newer(conn, status_label, natural_key, rate, updated_at, updated_by):
@@ -2215,7 +2471,12 @@ def record_finalize_from_other_device(name, end_date):
     """
     conn = sqlite3.connect(DB_PATH)
     try:
-        _record_export(conn, name)
+        # No path: the file was exported on the OTHER device, so there is
+        # nothing on this machine to open. pull_updates does save a copy of
+        # the attachment, but under its own name in data/received_exports --
+        # pointing this row at that copy would claim the other device's
+        # export lives here, which it doesn't.
+        _record_export(conn, name, None)
         _set_last_export_date(conn, end_date)
         conn.commit()
     finally:
@@ -2287,7 +2548,7 @@ def export_summary_csv_range(start_date: str, end_date: str, output_path: str, p
         "UPDATE timecards_approved SET is_exported = 1 WHERE id = ? AND is_exported != 1",
         [(row[0],) for row in rows],
     )
-    _record_export(conn, os.path.basename(output_path))
+    _record_export(conn, os.path.basename(output_path), os.path.abspath(output_path))
     # Remember how far this export reached, so the next one can start where
     # this one left off. Overwritten every export (see _set_last_export_date).
     _set_last_export_date(conn, end_date)
@@ -2420,7 +2681,7 @@ def export_act_invoice_overview_range(start_date: str, end_date: str, output_pat
         "UPDATE timecards_approved SET is_exported = 1 WHERE id = ? AND is_exported != 1",
         [(row[0],) for row in rows],
     )
-    _record_export(conn, os.path.basename(output_path))
+    _record_export(conn, os.path.basename(output_path), os.path.abspath(output_path))
     _set_last_export_date(conn, end_date)
     conn.commit()
     conn.close()
@@ -2757,7 +3018,7 @@ def finalize_active_export(end_date, project_type=None):
             "UPDATE timecards_approved SET is_exported = 1 WHERE id = ? AND is_exported != 1",
             [(row_id,) for row_id in ids],
         )
-        _record_export(conn, os.path.basename(path))
+        _record_export(conn, os.path.basename(path), os.path.abspath(path))
         _set_last_export_date(conn, end_date)
         # Rows marked done (not deleted -- see init_db) + no pointer =
         # the next Update opens a new file and fills it with new rows only.
@@ -2825,7 +3086,7 @@ def export_invoice_lines_to_excel(output_path=None):
         ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = max(len(column_name) + 2, 12)
 
     wb.save(output_path)
-    _record_export(conn, os.path.basename(output_path))
+    _record_export(conn, os.path.basename(output_path), os.path.abspath(output_path))
     conn.commit()
     conn.close()
     print(f"Exported to {output_path}")
@@ -2855,6 +3116,14 @@ SNAPSHOT_COLUMNS = [
     ("sender", "Sender"),
     ("rate_updated_at", "Rate Updated At"),
     ("rate_updated_by", "Rate Updated By"),
+    # Appended, never inserted: sync_payload_excel._read_rows_sheet zips
+    # this list positionally against a sheet's cells, so a new column at
+    # the END is read as None by an older build and simply ignored, while
+    # one inserted in the middle would shift every later value onto the
+    # wrong key.
+    ("row_color", "Row Colour"),
+    ("color_updated_at", "Colour Updated At"),
+    ("color_updated_by", "Colour Updated By"),
 ]
 
 

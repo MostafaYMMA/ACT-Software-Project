@@ -25,12 +25,14 @@ from ui.theme_manager import theme_manager
 from ui.theme_utils import apply_live_style
 from ui.nav_button import render_icon
 from ui.avatar import Avatar
+from ui.toggle_switch import ToggleSwitch
 from ui.transition import FadeStackedWidget
 from ui.notification_banner import NotificationBanner
 from ui.notification_settings import notification_settings
 from ui.Pages.Dashboard import DashboardPage
 from ui.Pages.History import HistoryPage
 from ui.Pages.Records import RecordsPage
+from ui.Pages.CurrentSheet import CurrentSheetPage
 from ui.Pages.Late import LatePage
 from ui.Pages.Settings import SettingsPage
 from storage_service import get_stale_status_counts
@@ -60,6 +62,8 @@ _IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 #   records   -> smaller lift + a tilt, like picking a single page off a stack
 #   export    -> swings counter-clockwise, like rewinding/turning back time
 #   late      -> a shake, since this icon exists to flag something urgent
+#   current_sheet -> lifts and tilts, mirrored from records' tilt so the
+#                two grid-like icons beside each other don't move alike
 #   settings  -> a real gear-style rotation
 _DASHBOARD_POP_SCALE = 1.22
 _RECORDS_LIFT_SCALE = 1.12
@@ -67,6 +71,8 @@ _RECORDS_TILT_DEG = -8.0
 _HISTORY_REWIND_DEG = -28.0
 _SETTINGS_SPIN_DEG = 90.0
 _LATE_POP_SCALE = 1.12
+_CURRENT_SHEET_LIFT_SCALE = 1.14
+_CURRENT_SHEET_TILT_DEG = 6.0
 
 # Shared vertical rhythm for the rail and the panel: same top margin,
 # same reserved header height, same row height, same spacing between
@@ -259,6 +265,12 @@ class IconRailButton(QPushButton):
         elif self.icon_key == "late":
             self._animate_scale(_LATE_POP_SCALE, QEasingCurve.Type.OutBack, 180)
             self._play_shake()
+        elif self.icon_key == "current_sheet":
+            # Lifts and tilts the OTHER way to records', so the two
+            # grid-ish icons sitting next to each other in the rail don't
+            # animate identically.
+            self._animate_scale(_CURRENT_SHEET_LIFT_SCALE, QEasingCurve.Type.OutBack, RAIL_ICON_ANIM_MS)
+            self._animate_rotation(_CURRENT_SHEET_TILT_DEG, QEasingCurve.Type.OutBack, RAIL_ICON_ANIM_MS)
         elif self.icon_key == "settings":
             self._animate_rotation(_SETTINGS_SPIN_DEG, QEasingCurve.Type.InOutQuad, RAIL_ICON_ANIM_MS + 80)
         else:
@@ -642,6 +654,7 @@ class MainWindow(QWidget):
         self.pages = {
             "Dashboard": DashboardPage(),
             "Records": RecordsPage(),
+            "CurrentSheet": CurrentSheetPage(),
             "History": HistoryPage(),
             "Late": LatePage(),
             "Settings": SettingsPage(),
@@ -658,6 +671,7 @@ class MainWindow(QWidget):
         nav_items = [
             ("dashboard", "Dashboard", "Dashboard"),
             ("records", "Records", "Records"),
+            ("current_sheet", "Current Sheet", "CurrentSheet"),
             ("export", "Export History", "History"),
             ("late", "Late", "Late"),
             ("settings", "Settings", "Settings"),
@@ -710,6 +724,15 @@ class MainWindow(QWidget):
         top_layout.addWidget(switch_account_btn)
 
         top_layout.addStretch()
+
+        # Light/dark toggle, immediately left of the ACT logo. NOT a second
+        # copy of the setting -- ToggleSwitch reads and writes the one
+        # theme_manager singleton and redraws itself on its theme_changed
+        # signal, so this and the Settings page's switch are two views of
+        # the same state and stay in step automatically, whichever one is
+        # clicked (see ui/toggle_switch.py).
+        top_layout.addWidget(ToggleSwitch(), alignment=Qt.AlignmentFlag.AlignVCenter)
+        top_layout.addSpacing(14)
 
         # ACT logo - top-right corner, bigger/clearer. Stored as
         # self.topbar_logo_label (not a local var) so RootWindow

@@ -12,6 +12,7 @@ from ui.theme_utils import apply_live_style
 from ui.loading_overlay import LoadingOverlay
 from ui.counting_label import CountingLabel
 from ui.table_utils import order_columns, configure_grid, set_header_labels, fit_columns
+from ui.transition import reveal_rows, stagger_fade_in
 from ui.project_type_settings import project_type_settings
 from sync_service import sync_cards
 from storage_service import (
@@ -560,6 +561,14 @@ class DashboardPage(QWidget):
             self._rows_thread = None
             return False
 
+    def showEvent(self, event):
+        # The four cards fade in left-to-right each time the page is
+        # opened. Cosmetic only -- nothing here reads or changes their
+        # values, which CountingLabel is still responsible for tweening
+        # (see StatCard.set_value).
+        super().showEvent(event)
+        stagger_fade_in(list(self.stat_cards.values()))
+
     def _set_empty_state(self):
         for key in ("approve", "pending", "reject", "expenses"):
             if key in self.stat_cards:
@@ -670,6 +679,10 @@ class DashboardPage(QWidget):
             self._populating_table = False
 
         self._fit_columns()
+        # The grid fills in top-to-bottom instead of the whole block
+        # appearing at once (see ui/transition.reveal_rows -- fixed total
+        # time, so a big scan doesn't crawl).
+        reveal_rows(self.table)
 
         self._rows_loading_overlay.stop()
         if hasattr(self, "table_title"):
