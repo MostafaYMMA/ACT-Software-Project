@@ -1,8 +1,7 @@
 """
-Singleton holding the other user's email address -- where Update/Finalize
-(see ui/Pages/History.py) send sync mail to. Persisted via QSettings, same
-pattern as ui/notification_settings.py and ui/theme_manager.py, so it
-survives restarts without needing to be re-typed every session.
+Singleton holding the partner email used for cross-device sync via Update/Finalize.
+Persisted via QSettings so it survives app restarts and is available in both
+Settings and Export History pages.
 """
 
 from PySide6.QtCore import QObject, Signal, QSettings
@@ -29,5 +28,4 @@ class SyncPartnerSettings(QObject):
         self.partner_email_changed.emit(email)
 
 
-# Import this instance everywhere - don't instantiate SyncPartnerSettings yourself.
 sync_partner_settings = SyncPartnerSettings()

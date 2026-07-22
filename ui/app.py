@@ -78,18 +78,6 @@ HEADER_BLOCK_HEIGHT = 56
 ROW_HEIGHT = 44        # matches IconRailButton's fixed size
 ROW_SPACING = 8
 
-# Purely decorative texture painted over the sliding Sidebar panel's
-# orange background, so it reads as its own surface rather than a flat
-# fill identical to the icon rail. Faint white diagonal hairlines -
-# opacity kept low so it never competes with the labels on top.
-_SIDEBAR_TEXTURE_COLOR = QColor(255, 255, 255, 16)
-_SIDEBAR_TEXTURE_SPACING = 14
-# A dark line drawn 1px below/right of each texture hairline before the
-# light line itself, so each hairline reads as very slightly engraved
-# instead of flat-printed on top of the orange.
-_SIDEBAR_TEXTURE_SHADOW_COLOR = QColor(0, 0, 0, 30)
-_SIDEBAR_TEXTURE_SHADOW_OFFSET = 1
-
 # Rounded corners + drop shadow for the sliding Sidebar panel, and the
 # "bubble" that pops in behind each PanelLabelRow on hover. All purely
 # decorative - none of this changes sizing, positioning, or the
@@ -598,25 +586,6 @@ class Sidebar(QFrame):
         )
         painter.setClipPath(path)
         painter.fillPath(path, QColor(theme_manager.colors()["ACCENT"]))
-
-        # Faint diagonal hairline texture on top, clipped to the same
-        # rounded shape so it never pokes out past the corners. Each
-        # hairline gets a 1px dark "shadow" line just below/right of it
-        # first, then the light line drawn on top - reads as a slight
-        # groove rather than a flat white line sitting on the orange.
-        shadow_pen = QPen(_SIDEBAR_TEXTURE_SHADOW_COLOR)
-        shadow_pen.setWidth(1)
-        highlight_pen = QPen(_SIDEBAR_TEXTURE_COLOR)
-        highlight_pen.setWidth(1)
-        offset = _SIDEBAR_TEXTURE_SHADOW_OFFSET
-        w, h = self.width(), self.height()
-        x = -h
-        while x < w:
-            painter.setPen(shadow_pen)
-            painter.drawLine(x + offset, h + offset, x + h + offset, offset)
-            painter.setPen(highlight_pen)
-            painter.drawLine(x, h, x + h, 0)
-            x += _SIDEBAR_TEXTURE_SPACING
         painter.end()
 
 
