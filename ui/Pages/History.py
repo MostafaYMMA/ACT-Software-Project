@@ -120,6 +120,13 @@ def _apply_orange_calendar_style(date_edit):
 # ui/sync_workers.py so the Current Sheet page can put an Update button on
 # screen driven by the very same code -- see the imports at the top of this
 # file. Their behaviour is unchanged; only where they're defined moved.
+#
+# main's copy of these classes was dropped in the merge rather than this
+# one: the import block above already resolved to ui.sync_workers, so
+# main's bodies would have had no update_with_other_user/local_update/
+# finalize_month/local_finalize to call. Main's ONE behavioural change
+# here -- _LocalUpdateWorker taking a project_type -- is carried over into
+# ui/sync_workers.py instead, which is where the class now lives.
 _UpdateWorker = UpdateWorker
 _LocalUpdateWorker = LocalUpdateWorker
 _FinalizeWorker = FinalizeWorker
@@ -684,6 +691,9 @@ class HistoryPage(QWidget):
         button = self._project_type_buttons.get(project_type)
         if button is not None:
             button.setChecked(True)
+        # Each division fills its own sheet, so the "Currently filling"
+        # line has to follow the toggle, not just the last Update.
+        self.refresh()
 
     # -----------------------------------------------------------------
     # SharePoint file sync: Update / View Current / Finalize
@@ -872,7 +882,7 @@ class HistoryPage(QWidget):
             self.status_label.setText("Updating (sync is off - local scan only)...")
 
             self._update_thread = QThread(self)
-            self._update_worker = _LocalUpdateWorker()
+            self._update_worker = _LocalUpdateWorker(project_type_settings.project_type)
             self._update_worker.moveToThread(self._update_thread)
 
             self._update_thread.started.connect(self._update_worker.run)
@@ -941,7 +951,7 @@ class HistoryPage(QWidget):
             " for " + PROJECT_TYPE_LABELS[project_type_settings.project_type]
             if project_type_settings.project_type else ""
         )
-        active_path = get_active_export_path()
+        active_path = get_active_export_path(project_type_settings.project_type)
         sheet_text = (
             f"{active_path} is closed as the final export"
             if active_path else "the export sheet is created and closed"
@@ -1145,10 +1155,14 @@ class HistoryPage(QWidget):
             )
 
     def refresh(self):
-        active = get_active_export_path()
+        # Per division: each has its own rolling sheet, so this has to
+        # follow the toggle rather than always showing the "All" one.
+        project_type = project_type_settings.project_type
+        active = get_active_export_path(project_type)
+        scope = PROJECT_TYPE_LABELS[project_type] if project_type else "All"
         self.active_export_label.setText(
-            f"Currently filling: {active}" if active
-            else "No sheet open yet - the next Update will create one."
+            f"Currently filling ({scope}): {active}" if active
+            else f"No {scope} sheet open yet - the next Update will create one."
         )
 
         last = get_last_export_date()

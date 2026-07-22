@@ -610,7 +610,9 @@ class CurrentSheetPage(QWidget):
             )
         else:
             self.status_label.setText("Updating (sync is off - local scan only)...")
-            self._update_worker = LocalUpdateWorker()
+            # Same division the sync-on branch above passes -- the toggle
+            # has to mean the same thing whichever way the Sync switch is set.
+            self._update_worker = LocalUpdateWorker(project_type_settings.project_type)
 
         self._update_thread = QThread(self)
         self._update_worker.moveToThread(self._update_thread)

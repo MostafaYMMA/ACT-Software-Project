@@ -77,6 +77,27 @@ def _ensure_columns(conn, table, column_defs):
             conn.execute(f'ALTER TABLE "{table}" ADD COLUMN {column_def}')
 
 
+# Hard rule: the "name" column must never contain a "Dear ..." salutation,
+# no matter where the value came from -- a fresh Outlook scan (extractor_
+# service.py already cleans this at the source, but a leftover/older build
+# scanning on another synced device won't), an incoming cross-device sync
+# payload (apply_incoming_snapshot -> save_cards -> _to_row, below), or a
+# manual cell edit from the Dashboard grid (update_status_record_field,
+# below). Enforcing it here, at the two actual DB-write choke points,
+# means it's structurally impossible for "Dear Riham," to land in the
+# column again regardless of which upstream path produced it.
+_dear_salutation_pattern = re.compile(
+    r"^\s*Dear\s+(?:Mr\.?|Mrs\.?|Ms\.?|Miss\.?)?\s*", re.IGNORECASE
+)
+
+
+def _sanitize_name(name):
+    if not name:
+        return name
+    name = _dear_salutation_pattern.sub("", name)
+    return name.strip().rstrip(",").strip()
+
+
 STATUS_TABLES = {
     "Approved": "timecards_approved",
     "Pending": "timecards_pending",
@@ -358,6 +379,8 @@ def update_status_record_field(status_key, record_id, column, value):
                     (value, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), get_device_id(), record_id),
                 )
             else:
+                if column == "name":
+                    value = _sanitize_name(value)
                 cursor = conn.execute(
                     f'UPDATE "{table_name}" SET "{column}" = ? WHERE id = ?',
                     (value, record_id),
@@ -1242,7 +1265,7 @@ def _to_row(entry: dict) -> tuple:
         entry.get("project_code"),
         entry.get("project_name"),
         entry.get("task"),
-        entry.get("name"),
+        _sanitize_name(entry.get("name")),
         entry.get("period"),
         # Never NULL: person_number is part of the UNIQUE key, and SQLite
         # counts every NULL as distinct from every other -- one missing
@@ -2816,16 +2839,41 @@ def _write_act_invoice_workbook(conn, rows, output_path):
 EXPORTS_DIR = os.path.join(BASE_DIR, "exports")
 
 
-def _new_active_export_path():
+# Goes into an active export's filename so the divisions' sheets don't sit
+# on top of each other in EXPORTS_DIR.
+_ACTIVE_EXPORT_SLUGS = {
+    "beverage": "food_beverage",
+    "hospitality": "hospitality",
+}
+
+
+def _active_export_path_key(project_type):
     """
-    Path for a newly opened active export: the current month, then a
-    counter. 2026-07.xlsx is July's first sheet, 2026-07_2.xlsx the one
-    opened after that was finalized, and so on -- so the name says which
-    month's work it holds, and finalizing twice in a month can't land the
-    new sheet on top of the one just closed.
+    Which app_state key holds the active sheet for this division.
+
+    One key PER division, not one shared key: All / Food & Beverage /
+    Hospitality are three independent rolling sheets that can be open at
+    the same time. A single shared pointer would mean switching the toggle
+    silently re-aimed Update at the other division's file.
+    """
+    slug = _ACTIVE_EXPORT_SLUGS.get(project_type)
+    return f"active_export_path_{slug}" if slug else "active_export_path"
+
+
+def _new_active_export_path(project_type=None):
+    """
+    Path for a newly opened active export: the current month, the division
+    (omitted for All), then a counter. 2026-07.xlsx is July's first All
+    sheet, 2026-07_food_beverage.xlsx July's first F&B one, and
+    2026-07_food_beverage_2.xlsx the one opened after that was finalized --
+    so the name says which month and division it holds, and finalizing
+    twice in a month can't land the new sheet on top of the one just closed.
     """
     os.makedirs(EXPORTS_DIR, exist_ok=True)
+    slug = _ACTIVE_EXPORT_SLUGS.get(project_type)
     base = os.path.join(EXPORTS_DIR, date.today().strftime("%Y-%m"))
+    if slug:
+        base = f"{base}_{slug}"
     path = f"{base}.xlsx"
     attempt = 2
     while os.path.exists(path):
@@ -2834,24 +2882,27 @@ def _new_active_export_path():
     return path
 
 
-def get_active_export_path():
-    """The file Update is currently filling, or None if no active export
-    has been opened yet (fresh install, or straight after a finalize)."""
+def get_active_export_path(project_type=None):
+    """The file Update is currently filling FOR THIS DIVISION, or None if
+    no active export has been opened for it yet (fresh install, or straight
+    after a finalize). Each division tracks its own -- see
+    _active_export_path_key."""
     conn = sqlite3.connect(DB_PATH)
     try:
         row = conn.execute(
-            "SELECT value FROM app_state WHERE key = 'active_export_path'"
+            "SELECT value FROM app_state WHERE key = ?",
+            (_active_export_path_key(project_type),),
         ).fetchone()
         return row[0] if row and row[0] else None
     finally:
         conn.close()
 
 
-def _set_active_export_path(conn, path):
+def _set_active_export_path(conn, path, project_type=None):
     conn.execute(
-        "INSERT INTO app_state (key, value) VALUES ('active_export_path', ?) "
+        "INSERT INTO app_state (key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (path,),
+        (_active_export_path_key(project_type), path),
     )
 
 
@@ -2867,6 +2918,12 @@ def rebuild_active_export(project_type=None):
     first Update after a Finalize) -- that's the "creates the excel the
     first time" case; every later call tops the same file up.
 
+    project_type ("beverage"/"hospitality", or None for all) picks WHICH
+    rolling sheet this is, by the same "Project Name" starts with FB/HL
+    rule as everywhere else (_project_type_clause). Each division has its
+    own file and its own open/finalize cycle, so Food & Beverage and
+    Hospitality can be filled and closed independently.
+
     Nothing here touches export_history or last_export_date: an in-progress
     file isn't an export yet. Finalize is what logs it (see
     finalize_active_export).
@@ -2876,20 +2933,25 @@ def rebuild_active_export(project_type=None):
     conn = sqlite3.connect(DB_PATH)
     try:
         row = conn.execute(
-            "SELECT value FROM app_state WHERE key = 'active_export_path'"
+            "SELECT value FROM app_state WHERE key = ?",
+            (_active_export_path_key(project_type),),
         ).fetchone()
         path = row[0] if row and row[0] else None
         created = path is None
         if created:
-            path = _new_active_export_path()
-            _set_active_export_path(conn, path)
+            path = _new_active_export_path(project_type)
+            _set_active_export_path(conn, path, project_type)
 
         type_where, type_params = _project_type_clause(project_type)
         type_sql = f" AND {type_where}" if type_where else ""
 
-        # "New" means never written into ANY rolling sheet -- finalized
-        # ones included, so a closed sheet's rows don't all pour back into
-        # the fresh one right after a Finalize.
+        # "New" = in this division AND never written into ANY rolling sheet.
+        #
+        # The division half is what makes the toggle bite. The "any sheet"
+        # half is deliberately NOT per-division: a row is a piece of work
+        # that gets invoiced once, so once it has gone into a sheet -- the
+        # All sheet, its own division's sheet, finalized or still open --
+        # it must not be picked up again by a different one.
         new_ids = [
             r[0] for r in conn.execute(
                 "SELECT id FROM timecards_approved WHERE id NOT IN "
@@ -2903,10 +2965,15 @@ def rebuild_active_export(project_type=None):
             [(new_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), path) for new_id in new_ids],
         )
 
+        # Scoped to THIS sheet's path, not every unfinalized row: without
+        # that, an F&B rebuild would rewrite its file with the Hospitality
+        # sheet's rows in it too.
         rows = conn.execute(
             f'SELECT {_ACT_ROW_COLUMNS} FROM timecards_approved '
-            'WHERE id IN (SELECT timecard_id FROM active_export_rows WHERE finalized = 0) '
-            'ORDER BY "Date" ASC, subject ASC'
+            'WHERE id IN (SELECT timecard_id FROM active_export_rows '
+            '             WHERE finalized = 0 AND export_path = ?) '
+            'ORDER BY "Date" ASC, subject ASC',
+            (path,),
         ).fetchall()
 
         # Written before the commit on purpose: if the sheet can't be
@@ -2923,11 +2990,14 @@ def rebuild_active_export(project_type=None):
 
 def finalize_active_export(end_date, project_type=None):
     """
-    Closes out the active export: one last top-up (so anything that
-    arrived since the previous Update is in the file), then the file is
-    logged in export_history, its rows are flagged is_exported, and the
-    pointer is cleared so the NEXT Update opens a brand new file and
-    starts filling that one instead.
+    Closes out the active export FOR ONE DIVISION: one last top-up (so
+    anything that arrived since the previous Update is in the file), then
+    the file is logged in export_history, its rows are flagged
+    is_exported, and that division's pointer is cleared so the NEXT Update
+    on it opens a brand new file and starts filling that one instead.
+
+    Everything here is scoped to the sheet being closed -- finalizing Food
+    & Beverage must leave the Hospitality sheet open and untouched.
 
     Returns {"path", "row_count"} -- path being the file just closed,
     which is what gets mailed to the other user.
@@ -2938,8 +3008,11 @@ def finalize_active_export(end_date, project_type=None):
     conn = sqlite3.connect(DB_PATH)
     try:
         ids = [
-            r[0] for r in
-            conn.execute("SELECT timecard_id FROM active_export_rows WHERE finalized = 0").fetchall()
+            r[0] for r in conn.execute(
+                "SELECT timecard_id FROM active_export_rows "
+                "WHERE finalized = 0 AND export_path = ?",
+                (path,),
+            ).fetchall()
         ]
         conn.executemany(
             "UPDATE timecards_approved SET is_exported = 1 WHERE id = ? AND is_exported != 1",
@@ -2949,8 +3022,15 @@ def finalize_active_export(end_date, project_type=None):
         _set_last_export_date(conn, end_date)
         # Rows marked done (not deleted -- see init_db) + no pointer =
         # the next Update opens a new file and fills it with new rows only.
-        conn.execute("UPDATE active_export_rows SET finalized = 1 WHERE finalized = 0")
-        conn.execute("DELETE FROM app_state WHERE key = 'active_export_path'")
+        conn.execute(
+            "UPDATE active_export_rows SET finalized = 1 "
+            "WHERE finalized = 0 AND export_path = ?",
+            (path,),
+        )
+        conn.execute(
+            "DELETE FROM app_state WHERE key = ?",
+            (_active_export_path_key(project_type),),
+        )
         conn.commit()
     finally:
         conn.close()

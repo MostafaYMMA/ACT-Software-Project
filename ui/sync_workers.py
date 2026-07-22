@@ -45,14 +45,28 @@ class UpdateWorker(QObject):
 
 class LocalUpdateWorker(QObject):
     """Sync-off equivalent of UpdateWorker: no recipient email, no
-    pull/push, just a local inbox scan (sync_service.local_update)."""
+    pull/push, just a local inbox scan (sync_service.local_update) plus a
+    top-up of the active export sheet.
+
+    project_type is threaded through deliberately. Without it
+    rebuild_active_export runs unfiltered, so with the Sync switch OFF the
+    Food & Beverage / Hospitality toggle silently does nothing -- the
+    division is chosen on screen and then ignored. This is the one
+    behavioural change main made to its copy of this class, carried over
+    here when the two were merged into this single shared definition."""
     progress = Signal(str)
     finished = Signal(dict)
     failed = Signal(str)
 
+    def __init__(self, project_type=None):
+        super().__init__()
+        self.project_type = project_type
+
     def run(self):
         try:
-            result = local_update(progress_callback=self.progress.emit)
+            result = local_update(
+                project_type=self.project_type, progress_callback=self.progress.emit,
+            )
         except Exception as exc:
             self.failed.emit(str(exc))
             return
