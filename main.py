@@ -61,7 +61,7 @@ class RootWindow(QMainWindow):
         # launch the moment a page queried a table that didn't exist yet.
         init_db()
 
-        self.setWindowTitle("Timecard app")
+        self.setWindowTitle("OSMO App")
         self.resize(1050, 650)
 
         self.stack = FadeStackedWidget()

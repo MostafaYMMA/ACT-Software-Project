@@ -77,6 +77,27 @@ def _ensure_columns(conn, table, column_defs):
             conn.execute(f'ALTER TABLE "{table}" ADD COLUMN {column_def}')
 
 
+# Hard rule: the "name" column must never contain a "Dear ..." salutation,
+# no matter where the value came from -- a fresh Outlook scan (extractor_
+# service.py already cleans this at the source, but a leftover/older build
+# scanning on another synced device won't), an incoming cross-device sync
+# payload (apply_incoming_snapshot -> save_cards -> _to_row, below), or a
+# manual cell edit from the Dashboard grid (update_status_record_field,
+# below). Enforcing it here, at the two actual DB-write choke points,
+# means it's structurally impossible for "Dear Riham," to land in the
+# column again regardless of which upstream path produced it.
+_dear_salutation_pattern = re.compile(
+    r"^\s*Dear\s+(?:Mr\.?|Mrs\.?|Ms\.?|Miss\.?)?\s*", re.IGNORECASE
+)
+
+
+def _sanitize_name(name):
+    if not name:
+        return name
+    name = _dear_salutation_pattern.sub("", name)
+    return name.strip().rstrip(",").strip()
+
+
 STATUS_TABLES = {
     "Approved": "timecards_approved",
     "Pending": "timecards_pending",
@@ -358,6 +379,8 @@ def update_status_record_field(status_key, record_id, column, value):
                     (value, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), get_device_id(), record_id),
                 )
             else:
+                if column == "name":
+                    value = _sanitize_name(value)
                 cursor = conn.execute(
                     f'UPDATE "{table_name}" SET "{column}" = ? WHERE id = ?',
                     (value, record_id),
@@ -1189,7 +1212,7 @@ def _to_row(entry: dict) -> tuple:
         entry.get("project_code"),
         entry.get("project_name"),
         entry.get("task"),
-        entry.get("name"),
+        _sanitize_name(entry.get("name")),
         entry.get("period"),
         # Never NULL: person_number is part of the UNIQUE key, and SQLite
         # counts every NULL as distinct from every other -- one missing

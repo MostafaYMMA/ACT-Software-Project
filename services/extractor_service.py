@@ -72,6 +72,26 @@ _time_type_after_hours_pattern = re.compile(r"Hours\s*[\r\n]+\s*([^\r\n]+)", re.
 # matches either a single space or a run of blank lines, so one pattern
 # covers both.
 _name_pattern = re.compile(r"Time card\s*[\r\n]+\s*([^\r\n]+)", re.IGNORECASE)
+
+# Some emails put a "Dear <name>," salutation on the line right after
+# "Time card" instead of the bare name (e.g. "Time card\nDear Riham,"),
+# so the pattern above ends up capturing "Dear Riham," rather than just
+# "Riham". Strip a leading "Dear [Mr./Mrs./Ms./Miss]" salutation and any
+# trailing comma so only the actual name is kept, regardless of which of
+# the two layouts a given email happens to use.
+_dear_salutation_pattern = re.compile(
+    r"^\s*Dear\s+(?:Mr\.?|Mrs\.?|Ms\.?|Miss\.?)?\s*", re.IGNORECASE
+)
+
+
+def _clean_name(name):
+    """Strip a leading 'Dear ...' salutation and trailing punctuation off
+    an extracted name, so 'Dear Riham,' becomes 'Riham' while a plain
+    'Osama Khodair' line is left untouched."""
+    if not name:
+        return name
+    name = _dear_salutation_pattern.sub("", name)
+    return name.strip().rstrip(",").strip()
 _period_person_pattern = re.compile(
     r"Period\s+Person Number\s+Time Card Status\s+"
     r"(?P<period>\d{1,2}/\d{1,2}/\d{2,4}\s*-\s*\d{1,2}/\d{1,2}/\d{2,4})\s+"
@@ -124,7 +144,7 @@ def _header_fields(text):
     period_person_match = _period_person_pattern.search(text)
 
     return {
-        "name": name_match.group(1).strip() if name_match else None,
+        "name": _clean_name(name_match.group(1).strip()) if name_match else None,
         "period": period_person_match.group("period").strip() if period_person_match else None,
         "person_number": period_person_match.group("person_number").strip() if period_person_match else None,
     }
