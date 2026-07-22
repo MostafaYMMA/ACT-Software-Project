@@ -172,24 +172,35 @@ class RootWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
+    # Fusion draws every widget itself instead of delegating to the native
+    # OS theme (windowsvista/windows11 on Windows), which is what lets our
+    # QSS actually control things like the QSpinBox up/down arrows below --
+    # the native style ignores those subcontrol overrides and always draws
+    # its own default spinner box no matter what the stylesheet says.
+    app.setStyle("Fusion")
+
     # ---------- Load custom font ----------
+    # ui/theme.py registers whatever is in assets/fonts and falls back to a
+    # generic serif if none of it loads (see _ensure_display_font), so a
+    # missing or broken font never stops the app -- it just quietly changes
+    # how everything looks. "Quietly" is the problem: this says so plainly
+    # once, instead of the previous unconditional debug dump that printed
+    # on every single launch whether anything was wrong or not.
     font_path = os.path.join(
-        os.path.dirname(__file__),
-        "assets",
-        "fonts",
-        "GentleHearts-Regular.ttf"
+        os.path.dirname(__file__), "assets", "fonts", "GentleHearts-Regular.ttf"
     )
 
-    font_id = QFontDatabase.addApplicationFont(font_path)
-
-    print("Font path:", font_path)
-    print("Font exists:", os.path.exists(font_path))
-    print("Font ID:", font_id)
-
-    if font_id != -1:
-        print("Loaded families:", QFontDatabase.applicationFontFamilies(font_id))
-    else:
-        print("Failed to load font.")
+    if not os.path.exists(font_path):
+        print(f"WARNING: display font missing at {font_path} - falling back to a system font.")
+    elif QFontDatabase.addApplicationFont(font_path) == -1:
+        # Qt won't say why. In this project's case the file had been
+        # corrupted by a text encode/decode round trip -- see
+        # tests/test_font_assets.py, which checks for exactly that.
+        print(
+            f"WARNING: Qt could not load the display font at {font_path} - it is present "
+            "but not a readable font file. Falling back to a system font. "
+            "Run: python -m unittest tests.test_font_assets"
+        )
     # --------------------------------------
 
     app.setStyleSheet(theme_manager.stylesheet())
