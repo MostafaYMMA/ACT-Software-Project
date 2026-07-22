@@ -490,18 +490,19 @@ def sharepoint_finalize(folder, progress_callback=None, project_type=None, print
 # required at all.
 # ----------------------------------------------------------------------
 
-def local_update(progress_callback=None):
+def local_update(project_type=None, progress_callback=None):
     """Sync-off equivalent of the 'Update' button: scans this device's
     own inbox (same as Scan Inbox), then tops up the active export sheet
     with whatever that scan brought in -- with no pull from or push to
     another device. The export half is the same rolling sheet the sync-on
     Update fills (see update_with_other_user), so turning sync off doesn't
-    put the app on a different export file."""
+    put the app on a different export file -- project_type included, or
+    the History page's division toggle would do nothing with sync off."""
     sync_cards(progress_callback=progress_callback)
 
     if progress_callback:
         progress_callback("Updating the export file...")
-    export_result = rebuild_active_export()
+    export_result = rebuild_active_export(project_type=project_type)
 
     return {"scanned": True, "export": export_result}
 
