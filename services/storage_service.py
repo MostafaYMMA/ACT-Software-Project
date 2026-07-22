@@ -337,10 +337,9 @@ def update_status_record_field(status_key, record_id, column, value):
             elif column == "rate":
                 # rate is the one field either user might edit on ANY
                 # record, including one the other device originally
-                # scanned -- stamping who/when here is what lets a rate
-                # sync (see build_rate_update_payload/apply_rate_update)
-                # decide whose edit is newer instead of just blindly
-                # overwriting whichever one arrives last.
+                # scanned -- stamping who/when here keeps an audit trail
+                # of the last edit, and rides along into the SharePoint
+                # current-sheet xlsx (see SNAPSHOT_COLUMNS below).
                 cursor = conn.execute(
                     f'UPDATE "{table_name}" SET rate = ?, rate_updated_at = ?, rate_updated_by = ? WHERE id = ?',
                     (value, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), get_device_id(), record_id),
@@ -361,6 +360,34 @@ def update_status_record_field(status_key, record_id, column, value):
             _rebuild_project_type_tables(conn)
         conn.commit()
         return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def find_record_id(status_label, day, project_number, task_name, person_number, received_month):
+    """
+    Looks up a status table row's id by its natural key -- (day,
+    "Project Number", "Task Name", person_number, received_month), the
+    same tuple _save_row's UNIQUE constraint uses. For a caller (the
+    SharePoint View Current window, see ui/Pages/History.py) that only
+    has a row from a merged current-sheet xlsx -- which carries no DB id
+    at all -- and needs to resolve it back to the local record it
+    corresponds to before it can call update_status_record_field. Returns
+    None if no such record exists locally (e.g. the row belongs to
+    another device and was never scanned by this one).
+    """
+    table_name = STATUS_TABLES.get(status_label)
+    if table_name is None:
+        return None
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            f'SELECT id FROM "{table_name}" WHERE day = ? AND "Project Number" = ? '
+            f'AND "Task Name" = ? AND person_number = ? AND received_month = ?',
+            (day, project_number, task_name, person_number, received_month),
+        ).fetchone()
+        return row[0] if row else None
     finally:
         conn.close()
 
@@ -778,10 +805,17 @@ def init_db():
             # keep re-mailing each other's data back and forth forever.
             "origin TEXT",
             # rate is hand-typed and never touched by a rescan (see
-            # _upsert_timecard) -- these two exist so a cross-device rate
-            # sync can tell whose edit is newer instead of just blindly
-            # overwriting whatever's here (see _apply_rate_if_newer).
+            # _upsert_timecard) -- these two are an audit trail of the
+            # last edit (who/when), and ride along into the SharePoint
+            # current-sheet xlsx (see SNAPSHOT_COLUMNS below).
             "rate_updated_at TEXT", "rate_updated_by TEXT",
+            # highlight_color: a purely local, per-device visual tag (a
+            # hex color or empty/NULL for none) set from the SharePoint
+            # View Current window -- see ui/Pages/History.py's
+            # _CurrentSheetDialog. Deliberately NOT part of
+            # SNAPSHOT_COLUMNS / the shared current-sheet xlsx -- it's
+            # this device's own view preference, not data to sync.
+            "highlight_color TEXT",
         ])
 
     for table_name in PROJECT_TYPE_TABLES.values():
@@ -940,11 +974,10 @@ def get_device_id():
     """
     A short random id identifying THIS installation, generated once and
     then persisted in app_state forever after. This is what tags a row's
-    "origin" (see init_db's _ensure_columns call) and what a sync payload
-    is tagged with as its "device_id" -- the other side uses that to know
-    whose snapshot it's looking at and to track how far it's caught up
-    with THIS specific device (see get_last_applied_seq), independent of
-    however many other devices might also be syncing with it.
+    "origin" (see init_db's _ensure_columns call) and names this device's
+    current_<device_id>.xlsx in the SharePoint folder (see
+    services/sharepoint_service.py), so each device only ever writes its
+    own file regardless of how many other devices share the folder.
     """
     import uuid
 
@@ -1384,12 +1417,9 @@ def save_card(entry: dict, origin=None):
 def save_cards(entries: list, origin=None):
     """
     origin: which device these entries are attributed to. Defaults to
-    THIS device's own id (a real Outlook scan is always "mine"); a synced
-    import from the other user's device explicitly passes THEIR device
-    id instead (see apply_incoming_snapshot), so build_outgoing_snapshot
-    can later tell "did I scan this myself, or did I just receive it"
-    and never re-broadcast something that isn't actually this device's
-    own contribution.
+    THIS device's own id -- a real Outlook scan is always "mine", which
+    is what lets build_outgoing_snapshot (see services/sharepoint_service.py)
+    only ever publish rows this device actually scanned itself.
     """
     if origin is None:
         origin = get_device_id()
@@ -1807,14 +1837,15 @@ def _row_dict_to_entry(row_dict, status_label):
     """
     Converts one stored row (a dict straight off SELECT *) back into the
     same "entry" shape extract() produces -- the shape _to_row()/
-    save_cards() already know how to consume. This is what lets a synced
-    row round-trip through the EXACT SAME write path a real Outlook scan
-    uses (see apply_incoming_snapshot), instead of a second parallel
-    insert path that could drift out of sync with the real one over time.
+    save_cards() already know how to consume. Used by
+    build_outgoing_snapshot to hand the SharePoint file channel (see
+    services/sharepoint_service.py) rows in the same shape a real Outlook
+    scan produces, instead of a second parallel shape that could drift
+    out of sync with the real one over time.
 
     rate/rate_updated_at/rate_updated_by ride along as extra keys that
-    _to_row() itself ignores -- they're picked back up separately by
-    apply_incoming_snapshot's per-row rate merge.
+    _to_row() itself ignores -- they're just carried through to the
+    rendered current-sheet xlsx for reference.
     """
     return {
         "day": row_dict.get("day"),
@@ -1837,12 +1868,26 @@ def _row_dict_to_entry(row_dict, status_label):
     }
 
 
-def build_outgoing_snapshot(project_type=None):
+_UNSET = object()  # distinguishes "since_date not passed" from "since_date=None" below
+
+
+def build_outgoing_snapshot(project_type=None, since_date=_UNSET):
     """
     Packages everything THIS device has scanned itself (origin = this
-    device's id -- see save_cards) for the current open period (since the
-    last finalize/export -- see get_last_export_date) into a dict ready to
-    be mailed to the other user and handed to their apply_incoming_snapshot().
+    device's id -- see save_cards) for the current open period into a
+    dict ready to be mailed to the other user and handed to their
+    apply_incoming_snapshot() -- or, via the SharePoint file channel (see
+    services/sharepoint_service.py), rendered to this device's own
+    current_<device_id>.xlsx.
+
+    since_date controls where the open period starts:
+      - omitted entirely -> defaults to get_last_export_date() (the email
+        sync channel's boundary), so that flow is unchanged.
+      - explicitly passed (including None, meaning "no lower bound -- the
+        beginning of time") -> used as-is. This is how the SharePoint
+        channel passes its own, independent boundary.json boundary_date
+        instead of the email channel's last_export_date -- the two
+        boundaries must stay separate.
 
     Deliberately excludes any row this device only knows about because it
     was itself synced in from the OTHER device -- each device only ever
@@ -1850,14 +1895,13 @@ def build_outgoing_snapshot(project_type=None):
     anything it sent; re-sending it back would just make every payload
     grow forever and teach the other side nothing new.
 
-    This is a FULL current-period snapshot, not a delta since the last
-    one sent -- that's what makes it safe for the receiving side to
-    simply skip every queued sync mail except the newest one from a given
-    sender (see apply_incoming_snapshot / get_last_applied_seq) without
-    ever losing an entry that only appeared in an older, unprocessed one.
+    "seq" in the returned dict is a monotonically increasing per-device
+    outgoing counter (see _next_outgoing_seq) -- only meaningful to the
+    email channel's apply_incoming_snapshot supersede check; the
+    SharePoint channel ignores it entirely.
     """
     device_id = get_device_id()
-    period_start = get_last_export_date()  # 'YYYY-MM-DD', or None if never exported
+    period_start = get_last_export_date() if since_date is _UNSET else since_date
     type_where, type_params = _project_type_clause(project_type)
 
     conn = sqlite3.connect(DB_PATH)
@@ -1912,7 +1956,7 @@ def apply_incoming_snapshot(payload):
     correct, not lossy.
 
     Returns a dict describing what happened, for the caller (the email
-    import step, in a later phase) to log/surface to the user.
+    import step) to log/surface to the user.
     """
     if not payload:
         return {"applied": False, "reason": "empty payload"}
@@ -2082,6 +2126,8 @@ def record_finalize_from_other_device(name, end_date):
         conn.commit()
     finally:
         conn.close()
+
+
 def export_to_csv(output_path="output.csv"):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.execute('SELECT * FROM timecards_summary ORDER BY "Date" ASC')
@@ -2620,6 +2666,64 @@ def export_invoice_lines_to_excel(output_path=None):
     conn.commit()
     conn.close()
     print(f"Exported to {output_path}")
+
+
+# entry key -> display header, in write order. Read back by
+# services/sharepoint_service.py (_read_device_sheet) to merge multiple
+# devices' current sheets -- keep the two in sync; this is the one place
+# the column layout is defined. rate_updated_at/rate_updated_by are
+# included for reference/audit even though nothing currently merges on
+# them.
+SNAPSHOT_COLUMNS = [
+    ("day", "Day"),
+    ("received", "Received"),
+    ("status", "Status"),
+    ("project_code", "Project Number"),
+    ("project_name", "Project Name"),
+    ("task", "Task Name"),
+    ("period", "Period"),
+    ("person_number", "Person Number"),
+    ("name", "Name"),
+    ("hours", "Qty"),
+    ("labor_type", "Labor Type"),
+    ("time_type", "Time Type"),
+    ("rate", "Rate"),
+    ("subject", "Subject"),
+    ("sender", "Sender"),
+    ("rate_updated_at", "Rate Updated At"),
+    ("rate_updated_by", "Rate Updated By"),
+]
+
+
+def export_snapshot_rows_to_excel(rows, output_path):
+    """
+    Renders build_outgoing_snapshot()-shaped entry rows to a formatted
+    .xlsx -- used by the SharePoint Update/View Current/Finalize channel
+    (services/sharepoint_service.py) both for a device's own
+    current_<device_id>.xlsx and for the transient merged sheet Finalize
+    prints. Not recorded into export_history -- these are working files
+    for that channel, not a real export (see SHAREPOINT_SYNC_SPEC.md).
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Current Sheet"
+
+    ws.append([label for _, label in SNAPSHOT_COLUMNS])
+    for cell in ws[1]:
+        cell.font = _HEADER_FONT
+        cell.fill = _HEADER_FILL
+        cell.border = _THIN_BORDER
+
+    for row in rows:
+        ws.append([row.get(key) for key, _ in SNAPSHOT_COLUMNS])
+        for cell in ws[ws.max_row]:
+            cell.font = _BODY_FONT
+            cell.border = _THIN_BORDER
+
+    for i, (_key, label) in enumerate(SNAPSHOT_COLUMNS, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = max(len(label) + 2, 12)
+
+    wb.save(output_path)
 
 
 if __name__ == "__main__":

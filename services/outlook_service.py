@@ -11,7 +11,6 @@ themselves. Keeping them apart means a change to one's matching logic can
 never accidentally start matching (or ignoring) the other's mail.
 """
 
-import json
 import os
 import re
 import shutil
@@ -19,6 +18,8 @@ import tempfile
 import traceback
 
 import win32com.client
+
+from sync_payload_excel import write_payload_workbook, read_payload_workbook
 
 OL_FOLDER_INBOX = 6
 OL_MAIL_ITEM_CLASS = 43
@@ -37,7 +38,7 @@ _SUBJECT_PATTERN = re.compile(
     r"^ACT-SYNC v1 \| (snapshot|rate|finalize) \| ([a-f0-9]+) \| seq=(\d+)",
     re.IGNORECASE,
 )
-_PAYLOAD_ATTACHMENT_NAME = "act_sync_payload.json"
+_PAYLOAD_ATTACHMENT_NAME = "act_sync_payload.xlsx"
 
 
 def _build_subject(kind, device_id, seq):
@@ -46,12 +47,13 @@ def _build_subject(kind, device_id, seq):
 
 def send_sync_mail(recipient_email, kind, payload, seq, extra_attachments=None, note=""):
     """
-    Sends one sync message via Outlook. `payload` is JSON-serialized and
-    attached as a file (not put in the mail body) so it round-trips
-    byte-for-byte regardless of anything Outlook does to plain-text
-    formatting. extra_attachments (a list of real file paths) rides
-    along for a "finalize" message, which also attaches the actual
-    exported .xlsx so the other user's app can save/register it.
+    Sends one sync message via Outlook. `payload` is rendered to a real
+    .xlsx (see sync_payload_excel.write_payload_workbook) and attached as
+    a file (not put in the mail body), so it round-trips exactly and
+    opens as readable timecard rows if anyone looks at it directly.
+    extra_attachments (a list of real file paths) rides along for a
+    "finalize" message, which also attaches the actual exported .xlsx so
+    the other user's app can save/register it.
 
     Returns True if the mail was handed to Outlook to send, False on any
     failure (Outlook not running, no default profile, etc) -- the caller
@@ -64,8 +66,7 @@ def send_sync_mail(recipient_email, kind, payload, seq, extra_attachments=None, 
     temp_dir = tempfile.mkdtemp(prefix="act_sync_send_")
     try:
         payload_path = os.path.join(temp_dir, _PAYLOAD_ATTACHMENT_NAME)
-        with open(payload_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
+        write_payload_workbook(payload, kind, payload_path)
 
         outlook = win32com.client.Dispatch("Outlook.Application")
         mail = outlook.CreateItem(0)  # olMailItem
@@ -89,10 +90,13 @@ def send_sync_mail(recipient_email, kind, payload, seq, extra_attachments=None, 
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def _extract_attachments(item, temp_dir):
-    """Saves every attachment on `item` to temp_dir and reads the JSON
-    payload one out of them. Returns (payload_dict_or_None, [other saved
-    file paths])."""
+def _extract_attachments(item, temp_dir, kind):
+    """Saves every attachment on `item` to temp_dir and reads the payload
+    .xlsx out of them (see sync_payload_excel.read_payload_workbook).
+    `kind` is the one already parsed off the subject (see
+    _SUBJECT_PATTERN) -- needed to know which payload shape to
+    reconstruct. Returns (payload_dict_or_None, [other saved file
+    paths])."""
     payload = None
     other_paths = []
     try:
@@ -103,8 +107,7 @@ def _extract_attachments(item, temp_dir):
             saved_path = os.path.join(temp_dir, f"{i}_{filename}")
             attachment.SaveAsFile(saved_path)
             if filename == _PAYLOAD_ATTACHMENT_NAME:
-                with open(saved_path, "r", encoding="utf-8") as f:
-                    payload = json.load(f)
+                payload = read_payload_workbook(saved_path, kind)
             else:
                 other_paths.append(saved_path)
     except Exception:
@@ -114,7 +117,7 @@ def _extract_attachments(item, temp_dir):
 
 def scan_sync_mails(folder_name="Inbox", limit=200):
     """
-    Finds every UNREAD sync mail (see _SUBJECT_PATTERN), reads its JSON
+    Finds every UNREAD sync mail (see _SUBJECT_PATTERN), reads its .xlsx
     payload and any extra attachments, and marks it read once handled.
 
     Only UNREAD mail is scanned. Correctness doesn't depend on this --
@@ -170,7 +173,7 @@ def scan_sync_mails(folder_name="Inbox", limit=200):
 
                 scanned += 1
                 kind, device_id, seq = match.group(1), match.group(2), int(match.group(3))
-                payload, extra_paths = _extract_attachments(item, temp_dir)
+                payload, extra_paths = _extract_attachments(item, temp_dir, kind)
                 if payload is None:
                     continue
 
