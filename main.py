@@ -172,6 +172,13 @@ class RootWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
+    # Fusion draws every widget itself instead of delegating to the native
+    # OS theme (windowsvista/windows11 on Windows), which is what lets our
+    # QSS actually control things like the QSpinBox up/down arrows below --
+    # the native style ignores those subcontrol overrides and always draws
+    # its own default spinner box no matter what the stylesheet says.
+    app.setStyle("Fusion")
+
     # ---------- Load custom font ----------
     # ui/theme.py registers whatever is in assets/fonts and falls back to a
     # generic serif if none of it loads (see _ensure_display_font), so a

@@ -110,12 +110,69 @@ class SettingsPage(QWidget):
 
         self._threshold_spin = QSpinBox()
         self._threshold_spin.setRange(1, 999)
+        self._threshold_spin.setFixedHeight(30)
         self._threshold_spin.valueChanged.connect(self._on_threshold_changed)
+        apply_live_style(self._threshold_spin, lambda c: f"""
+            QSpinBox {{
+                border: 1px solid {c['BORDER']};
+                border-radius: 6px;
+                padding: 4px 6px;
+                font-size: 13px;
+                background: {c['SURFACE']};
+                color: {c['TEXT_PRIMARY']};
+            }}
+            QSpinBox:focus {{ border: 1px solid {c['ACCENT']}; }}
+            QSpinBox::up-button, QSpinBox::down-button {{
+                subcontrol-origin: border;
+                width: 18px;
+                border: none;
+                background: transparent;
+            }}
+            QSpinBox::up-button {{
+                subcontrol-position: top right;
+                border-top-right-radius: 6px;
+                margin: 1px 1px 0 0;
+            }}
+            QSpinBox::down-button {{
+                subcontrol-position: bottom right;
+                border-bottom-right-radius: 6px;
+                margin: 0 1px 1px 0;
+            }}
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
+                background: {c['BORDER']};
+            }}
+            QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {{
+                background: {c['ACCENT']};
+            }}
+        """)
         threshold_row.addWidget(self._threshold_spin)
 
         self._threshold_unit = QComboBox()
         self._threshold_unit.addItems(["Hours", "Days"])
+        self._threshold_unit.setFixedHeight(30)
         self._threshold_unit.currentIndexChanged.connect(self._on_unit_changed)
+        apply_live_style(self._threshold_unit, lambda c: f"""
+            QComboBox {{
+                border: 1px solid {c['BORDER']};
+                border-radius: 6px;
+                padding: 4px 8px;
+                font-size: 13px;
+                background: {c['SURFACE']};
+                color: {c['TEXT_PRIMARY']};
+            }}
+            QComboBox:focus {{ border: 1px solid {c['ACCENT']}; }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 20px;
+            }}
+            QComboBox QAbstractItemView {{
+                border: 1px solid {c['BORDER']};
+                background: {c['SURFACE']};
+                color: {c['TEXT_PRIMARY']};
+                selection-background-color: {c['ACCENT']};
+                outline: none;
+            }}
+        """)
         threshold_row.addWidget(self._threshold_unit)
 
         threshold_row.addStretch()

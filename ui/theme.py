@@ -241,6 +241,126 @@ QLineEdit:disabled {{
     border: 1px solid {colors['BORDER']};
 }}
 
+QSpinBox {{
+    border: 1px solid {colors['BORDER']};
+    border-radius: {RADIUS_MD}px;
+    padding: 6px 4px 6px 10px;
+    font-size: 13px;
+    background: {colors['SURFACE']};
+    color: {colors['TEXT_PRIMARY']};
+    selection-background-color: {colors['ACCENT_LIGHT']};
+    selection-color: {colors['TEXT_PRIMARY']};
+}}
+QSpinBox:hover {{
+    border: 1px solid {colors['BORDER_STRONG']};
+}}
+QSpinBox:focus {{
+    border: 1.5px solid {colors['ACCENT']};
+}}
+QSpinBox:disabled {{
+    background: {colors['DISABLED_BG']};
+    color: {colors['DISABLED_TEXT']};
+    border: 1px solid {colors['BORDER']};
+}}
+
+/* Up/down buttons as clearly-visible little arrow buttons -- always-on
+   background (not just on hover) so they read as buttons at a glance,
+   with a bold accent-colored triangle glyph (border trick, no image
+   asset needed). Requires Fusion style (set in main.py) -- the native
+   Windows style ignores QSS on these subcontrols and draws its own
+   default spinner instead. */
+QSpinBox::up-button, QSpinBox::down-button {{
+    width: 20px;
+    border: none;
+    border-left: 1px solid {colors['BORDER']};
+    background: {colors['SURFACE_ALT']};
+    subcontrol-origin: border;
+}}
+QSpinBox::up-button {{
+    subcontrol-position: top right;
+    border-top-right-radius: {RADIUS_MD}px;
+}}
+QSpinBox::down-button {{
+    subcontrol-position: bottom right;
+    border-bottom-right-radius: {RADIUS_MD}px;
+}}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
+    background: {colors['ACCENT_SOFT']};
+}}
+QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {{
+    background: {colors['ACCENT_LIGHT']};
+}}
+QSpinBox::up-arrow {{
+    width: 0px;
+    height: 0px;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-bottom: 7px solid {colors['ACCENT']};
+}}
+QSpinBox::down-arrow {{
+    width: 0px;
+    height: 0px;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 7px solid {colors['ACCENT']};
+}}
+QSpinBox::up-button:disabled, QSpinBox::down-button:disabled {{
+    background: {colors['DISABLED_BG']};
+}}
+QSpinBox::up-arrow:disabled, QSpinBox::down-arrow:disabled {{
+    border-bottom-color: {colors['DISABLED_TEXT']};
+    border-top-color: {colors['DISABLED_TEXT']};
+}}
+
+QComboBox {{
+    border: 1px solid {colors['BORDER']};
+    border-radius: {RADIUS_MD}px;
+    padding: 6px 10px;
+    font-size: 13px;
+    background: {colors['SURFACE']};
+    color: {colors['TEXT_PRIMARY']};
+}}
+QComboBox:hover {{
+    border: 1px solid {colors['BORDER_STRONG']};
+}}
+QComboBox:focus {{
+    border: 1.5px solid {colors['ACCENT']};
+}}
+QComboBox:disabled {{
+    background: {colors['DISABLED_BG']};
+    color: {colors['DISABLED_TEXT']};
+    border: 1px solid {colors['BORDER']};
+}}
+QComboBox::drop-down {{
+    width: 22px;
+    border: none;
+    border-left: 1px solid {colors['BORDER']};
+    background: {colors['SURFACE_ALT']};
+    border-top-right-radius: {RADIUS_MD}px;
+    border-bottom-right-radius: {RADIUS_MD}px;
+}}
+QComboBox::drop-down:hover {{
+    background: {colors['ACCENT_SOFT']};
+}}
+QComboBox::down-arrow {{
+    width: 0px;
+    height: 0px;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 7px solid {colors['ACCENT']};
+}}
+QComboBox::down-arrow:disabled {{
+    border-top-color: {colors['DISABLED_TEXT']};
+}}
+QComboBox QAbstractItemView {{
+    border: 1px solid {colors['BORDER']};
+    background: {colors['SURFACE']};
+    color: {colors['TEXT_PRIMARY']};
+    selection-background-color: {colors['ACCENT_SOFT']};
+    selection-color: {colors['TEXT_PRIMARY']};
+    outline: none;
+}}
+
 /* ---------------------------------------------------------------- */
 /* Buttons                                                           */
 /* ---------------------------------------------------------------- */
