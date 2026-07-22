@@ -1,9 +1,9 @@
 import os
 import shutil
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from filter_service import get_approved_cards, get_expense_reports
+from filter_service import get_approved_cards, get_expense_reports, get_newest_received
 from extractor_service import extract, extract_expense
 from storage_service import (
     init_db, save_cards, save_expenses,
@@ -12,6 +12,7 @@ from storage_service import (
     build_rate_update_payload, get_device_id,
     record_finalize_from_other_device, export_snapshot_rows_to_excel,
     rebuild_active_export, finalize_active_export,
+    get_last_scan_time, set_last_scan_time,
 )
 from outlook_service import send_sync_mail, scan_sync_mails
 from sharepoint_service import (
@@ -20,15 +21,40 @@ from sharepoint_service import (
 )
 
 
-def sync_cards(progress_callback=None, start_date=None, end_date=None):
+# How far BEHIND the stored high-water mark each scan actually starts.
+#
+# Outlook can put an email in the folder after a scan has already passed
+# that point in time: a mailbox that was offline syncing down a backlog, a
+# slow IMAP/POP account, or mail dragged in from another folder all arrive
+# late carrying their ORIGINAL, older ReceivedTime. A scan starting exactly
+# at the mark would step over those forever. Re-walking a few minutes of
+# already-seen mail costs a little time and nothing else -- storage_service
+# upserts on (day, project, task, person, month), so a re-scanned email
+# lands on the row it already wrote rather than duplicating it.
+SCAN_OVERLAP = timedelta(minutes=10)
+
+# What the very first scan on a device covers, before there's any mark to
+# work from. Unchanged from the old no-range default.
+FIRST_SCAN_LIMIT = 500
+
+
+def sync_cards(progress_callback=None):
     """
     Pull approved timecard emails, extract entries, and persist them.
 
-    start_date/end_date (optional): restrict the scan to emails whose
-    Outlook "received on" time falls within [start_date, end_date]
-    (see date_utils for building these from a UI period choice). When
-    both are omitted, the 500 most recently received emails are scanned,
-    with no date restriction.
+    Incremental: the scan starts from where the previous one finished
+    (storage_service.get_last_scan_time, minus SCAN_OVERLAP) rather than
+    re-reading the whole inbox, so a second Scan Inbox straight after the
+    first has almost nothing to walk. The mark is only moved once the scan
+    below completes -- a scan that dies partway through leaves it where it
+    was, and the next one re-covers the same ground.
+
+    On a device that has never scanned, there is no mark yet and the
+    FIRST_SCAN_LIMIT most recently received emails are scanned instead.
+
+    There is no date-range argument: the range is always "since last time".
+    The Dashboard's period picker filters what's DISPLAYED, not what's
+    scanned (see ui/Pages/Dashboard.py).
     """
 
     def report(msg):
@@ -38,13 +64,21 @@ def sync_cards(progress_callback=None, start_date=None, end_date=None):
 
     init_db()
 
-    has_range = start_date is not None or end_date is not None
+    # Read up front, applied at the end -- see filter_service.get_newest_received
+    # for why the order matters.
+    newest_in_folder = get_newest_received()
+
+    last_scan = get_last_scan_time()
+    start_date = last_scan - SCAN_OVERLAP if last_scan else None
+    if start_date:
+        report(f"Scanning inbox for mail received since {start_date:%Y-%m-%d %H:%M:%S}...")
+    else:
+        report(f"First scan - checking the {FIRST_SCAN_LIMIT} most recent emails...")
 
     report("Checking inbox for approved timecards...")
     emails = get_approved_cards(
-        limit=None if has_range else 500,
+        limit=None if start_date else FIRST_SCAN_LIMIT,
         start_date=start_date,
-        end_date=end_date,
     )
     report(f"Approved emails found: {len(emails)}")
 
@@ -69,9 +103,8 @@ def sync_cards(progress_callback=None, start_date=None, end_date=None):
     # (approved expense-report emails, filtered separately from timecards).
     report("Checking inbox for approved expense reports...")
     expense_emails = get_expense_reports(
-        limit=None if has_range else 500,
+        limit=None if start_date else FIRST_SCAN_LIMIT,
         start_date=start_date,
-        end_date=end_date,
         print_report=False,
     )
     report(f"Approved expense reports found: {len(expense_emails)}")
@@ -91,6 +124,12 @@ def sync_cards(progress_callback=None, start_date=None, end_date=None):
         export_expenses_to_csv()
     else:
         print("No expenses to save.")
+
+    # Both halves got through -- everything up to newest_in_folder has now
+    # been looked at, so the next scan can start there. Last thing in the
+    # function on purpose: an exception anywhere above skips this and the
+    # next scan re-covers the same window rather than losing it.
+    set_last_scan_time(newest_in_folder)
 
 
 # ----------------------------------------------------------------------
