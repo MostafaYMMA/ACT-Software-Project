@@ -890,6 +890,27 @@ def init_db():
         )
     """)
 
+    # Which approved timecard rows have been written into a rolling export
+    # sheet, and which sheet (see rebuild_active_export). finalized = 0 is
+    # the file being filled right now; Finalize flips its rows to 1 rather
+    # than deleting them, because a row must never come back as "new" for
+    # the NEXT sheet just because the sheet it went into got closed.
+    #
+    # Deliberately not reusing is_exported for that: is_exported is also
+    # set by the ad-hoc "Export Last Month"/"Export Range" buttons, so
+    # keying off it would let a one-off export silently withhold rows from
+    # the rolling sheet.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS active_export_rows (
+            timecard_id INTEGER PRIMARY KEY,
+            added_at TEXT
+        )
+    """)
+    _ensure_columns(conn, "active_export_rows", [
+        "export_path TEXT",
+        "finalized INTEGER DEFAULT 0",
+    ])
+
     # A single-row-per-key store for small pieces of app state that must
     # survive between runs. Currently holds one key, 'last_export_date':
     # the received-"to" date of the most recent range export, overwritten on
@@ -2288,12 +2309,49 @@ def export_act_invoice_overview_range(start_date: str, end_date: str, output_pat
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.execute(
-        'SELECT id, "Project Number", "Project Name", "Task Name", "Qty", rate, day, period '
+        f'SELECT {_ACT_ROW_COLUMNS} '
         f'FROM timecards_approved WHERE "Date" >= ? AND "Date" <= ?{type_sql} '
         'ORDER BY "Date" ASC, subject ASC',
         [start_date, end_date, *type_params],
     )
     rows = cursor.fetchall()
+
+    try:
+        _write_act_invoice_workbook(conn, rows, output_path)
+    except Exception:
+        conn.close()
+        raise
+
+    conn.executemany(
+        "UPDATE timecards_approved SET is_exported = 1 WHERE id = ? AND is_exported != 1",
+        [(row[0],) for row in rows],
+    )
+    _record_export(conn, os.path.basename(output_path))
+    _set_last_export_date(conn, end_date)
+    conn.commit()
+    conn.close()
+    print(f"Exported {len(rows)} row(s) ({start_date} to {end_date}) to {output_path}")
+    return len(rows)
+
+
+# The exact column list _write_act_invoice_workbook expects a row tuple to
+# be, in order -- kept in one place so the range export and the rolling
+# active export below can't drift apart on it.
+_ACT_ROW_COLUMNS = 'id, "Project Number", "Project Name", "Task Name", "Qty", rate, day, period'
+
+
+def _write_act_invoice_workbook(conn, rows, output_path):
+    """
+    Writes `rows` (tuples in _ACT_ROW_COLUMNS order) out as the ACT
+    "Invoice Overview per Period" sheet at output_path, overwriting
+    whatever is there. Pure file-writing: no is_exported flagging, no
+    export_history entry, no commit -- the caller owns all of that, which
+    is what lets the rolling active export (see rebuild_active_export)
+    rewrite its file over and over without each rewrite counting as a
+    separate export in the log.
+
+    Takes an open conn only to read from it (linked expenses, cached FX).
+    """
     linked_expenses = _linked_expenses_by_timecard(conn, [row[0] for row in rows])
 
     aed_per_usd = None
@@ -2301,7 +2359,6 @@ def export_act_invoice_overview_range(start_date: str, end_date: str, output_pat
         fx_rates = _cached_usd_rates(conn)
         aed_per_usd = fx_rates.get("AED") if fx_rates else None
         if not aed_per_usd:
-            conn.close()
             raise RuntimeError(
                 "Could not get a live AED -> USD exchange rate (no internet right "
                 "now, and none cached from an earlier run) -- refusing to export an "
@@ -2388,27 +2445,190 @@ def export_act_invoice_overview_range(start_date: str, end_date: str, output_pat
     for col_letter, width in zip("BCDEFGHIJKLMNOP", [12, 11, 30, 16, 30, 13, 14, 8, 6, 8, 14, 14, 7, 13, 15]):
         ws.column_dimensions[col_letter].width = width
 
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     wb.save(output_path)
 
-    conn.executemany(
-        "UPDATE timecards_approved SET is_exported = 1 WHERE id = ? AND is_exported != 1",
-        [(row[0],) for row in rows],
+
+# ----------------------------------------------------------------------
+# The rolling "active" export -- the file the Update button keeps topping
+# up, until Finalize closes it and points the app at a fresh one.
+#
+# Two pieces of state back this:
+#   app_state['active_export_path']   -- the file currently being filled
+#   active_export_rows                -- which timecards_approved ids are
+#                                        already in that file
+# Update adds only rows NOT in active_export_rows, then rewrites the whole
+# file from the accumulated set (rewriting rather than appending in place:
+# the sheet carries a Table ref and a totals block underneath the data, so
+# every added row would have to shift and re-anchor those anyway -- a
+# rewrite from the id set is the same result with nothing to keep in sync).
+# Finalize leaves that file alone as the finished article, empties
+# active_export_rows, and writes a new active_export_path -- so the next
+# Update starts a fresh file instead of re-topping-up a closed one.
+# ----------------------------------------------------------------------
+
+# The one folder every .xlsx this app produces lands in, so the sheets
+# aren't scattered next to output.csv and the source tree.
+EXPORTS_DIR = os.path.join(BASE_DIR, "exports")
+
+
+def _new_active_export_path():
+    """
+    Path for a newly opened active export: the current month, then a
+    counter. 2026-07.xlsx is July's first sheet, 2026-07_2.xlsx the one
+    opened after that was finalized, and so on -- so the name says which
+    month's work it holds, and finalizing twice in a month can't land the
+    new sheet on top of the one just closed.
+    """
+    os.makedirs(EXPORTS_DIR, exist_ok=True)
+    base = os.path.join(EXPORTS_DIR, date.today().strftime("%Y-%m"))
+    path = f"{base}.xlsx"
+    attempt = 2
+    while os.path.exists(path):
+        path = f"{base}_{attempt}.xlsx"
+        attempt += 1
+    return path
+
+
+def get_active_export_path():
+    """The file Update is currently filling, or None if no active export
+    has been opened yet (fresh install, or straight after a finalize)."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT value FROM app_state WHERE key = 'active_export_path'"
+        ).fetchone()
+        return row[0] if row and row[0] else None
+    finally:
+        conn.close()
+
+
+def _set_active_export_path(conn, path):
+    conn.execute(
+        "INSERT INTO app_state (key, value) VALUES ('active_export_path', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (path,),
     )
-    _record_export(conn, os.path.basename(output_path))
-    _set_last_export_date(conn, end_date)
-    conn.commit()
-    conn.close()
-    print(f"Exported {len(rows)} row(s) ({start_date} to {end_date}) to {output_path}")
-    return len(rows)
 
 
-def export_invoice_lines_to_excel(output_path="invoice_lines.xlsx"):
+def rebuild_active_export(project_type=None):
+    """
+    Behind the History page's Update button, and the export half of
+    Finalize. Adds every approved timecard row that isn't in the active
+    export yet, then rewrites the active file from the full accumulated
+    set. Reads only the database -- scanning the inbox is Scan Inbox's
+    job, and whatever it found is already stored by the time this runs.
+
+    Opens a new active file if there isn't one (first ever Update, or the
+    first Update after a Finalize) -- that's the "creates the excel the
+    first time" case; every later call tops the same file up.
+
+    Nothing here touches export_history or last_export_date: an in-progress
+    file isn't an export yet. Finalize is what logs it (see
+    finalize_active_export).
+
+    Returns {"path", "new_rows", "total_rows", "created"}.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT value FROM app_state WHERE key = 'active_export_path'"
+        ).fetchone()
+        path = row[0] if row and row[0] else None
+        created = path is None
+        if created:
+            path = _new_active_export_path()
+            _set_active_export_path(conn, path)
+
+        type_where, type_params = _project_type_clause(project_type)
+        type_sql = f" AND {type_where}" if type_where else ""
+
+        # "New" means never written into ANY rolling sheet -- finalized
+        # ones included, so a closed sheet's rows don't all pour back into
+        # the fresh one right after a Finalize.
+        new_ids = [
+            r[0] for r in conn.execute(
+                "SELECT id FROM timecards_approved WHERE id NOT IN "
+                f"(SELECT timecard_id FROM active_export_rows){type_sql}",
+                type_params,
+            ).fetchall()
+        ]
+        conn.executemany(
+            "INSERT OR IGNORE INTO active_export_rows "
+            "(timecard_id, added_at, export_path, finalized) VALUES (?, ?, ?, 0)",
+            [(new_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), path) for new_id in new_ids],
+        )
+
+        rows = conn.execute(
+            f'SELECT {_ACT_ROW_COLUMNS} FROM timecards_approved '
+            'WHERE id IN (SELECT timecard_id FROM active_export_rows WHERE finalized = 0) '
+            'ORDER BY "Date" ASC, subject ASC'
+        ).fetchall()
+
+        # Written before the commit on purpose: if the sheet can't be
+        # written (no FX rate, file open in Excel), the rows must NOT stay
+        # marked as already-in-the-file, or the next Update would skip them.
+        _write_act_invoice_workbook(conn, rows, path)
+        conn.commit()
+    finally:
+        conn.close()
+
+    print(f"Active export {path}: +{len(new_ids)} new row(s), {len(rows)} total")
+    return {"path": path, "new_rows": len(new_ids), "total_rows": len(rows), "created": created}
+
+
+def finalize_active_export(end_date, project_type=None):
+    """
+    Closes out the active export: one last top-up (so anything that
+    arrived since the previous Update is in the file), then the file is
+    logged in export_history, its rows are flagged is_exported, and the
+    pointer is cleared so the NEXT Update opens a brand new file and
+    starts filling that one instead.
+
+    Returns {"path", "row_count"} -- path being the file just closed,
+    which is what gets mailed to the other user.
+    """
+    result = rebuild_active_export(project_type=project_type)
+    path = result["path"]
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        ids = [
+            r[0] for r in
+            conn.execute("SELECT timecard_id FROM active_export_rows WHERE finalized = 0").fetchall()
+        ]
+        conn.executemany(
+            "UPDATE timecards_approved SET is_exported = 1 WHERE id = ? AND is_exported != 1",
+            [(row_id,) for row_id in ids],
+        )
+        _record_export(conn, os.path.basename(path))
+        _set_last_export_date(conn, end_date)
+        # Rows marked done (not deleted -- see init_db) + no pointer =
+        # the next Update opens a new file and fills it with new rows only.
+        conn.execute("UPDATE active_export_rows SET finalized = 1 WHERE finalized = 0")
+        conn.execute("DELETE FROM app_state WHERE key = 'active_export_path'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    print(f"Finalized {path} with {result['total_rows']} row(s)")
+    return {"path": path, "row_count": result["total_rows"]}
+
+
+def export_invoice_lines_to_excel(output_path=None):
     """
     Exports invoice_lines to a real formatted .xlsx (not .csv - a CSV is
     plain text and can't hold fonts/colors/borders at all). Header row is
     bold, larger, light-blue-filled; every cell in the table gets a thin
     border and black text.
+
+    Defaults into EXPORTS_DIR rather than the working directory, so every
+    .xlsx this app writes ends up in the same folder.
     """
+    if output_path is None:
+        os.makedirs(EXPORTS_DIR, exist_ok=True)
+        output_path = os.path.join(EXPORTS_DIR, "invoice_lines.xlsx")
+
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.execute("""
         SELECT "Date", "Invoice Number", "Project Name", "Period", "Task Name", "Project Mgr",

@@ -9,8 +9,9 @@ from storage_service import (
     init_db, save_cards, save_expenses,
     export_to_csv, export_invoice_lines_to_excel, export_expenses_to_csv,
     build_outgoing_snapshot, apply_incoming_snapshot, apply_rate_update,
-    build_rate_update_payload, get_device_id, export_act_invoice_overview_range,
+    build_rate_update_payload, get_device_id,
     record_finalize_from_other_device, export_snapshot_rows_to_excel,
+    rebuild_active_export, finalize_active_export,
 )
 from outlook_service import send_sync_mail, scan_sync_mails
 from sharepoint_service import (
@@ -184,17 +185,19 @@ def _save_incoming_export_copy(source_path, export_name):
 
 def push_updates(recipient_email, project_type=None, progress_callback=None):
     """
-    Scans this device's own inbox for new approved/pending/rejected
-    timecards (same as a normal Scan Inbox), then mails the other user a
-    full current-period snapshot of what THIS device has scanned.
+    Mails the other user a full current-period snapshot of what THIS
+    device has stored.
+
+    Reads the database only -- it does NOT scan the inbox. Getting mail
+    out of Outlook and into the database is Scan Inbox's job (sync_cards);
+    doing it again here would just re-do that work on every Update, and
+    slowly, for no new data.
     """
 
     def report(msg):
         print(msg)
         if progress_callback:
             progress_callback(msg)
-
-    sync_cards(progress_callback=progress_callback)
 
     report("Preparing update for the other user...")
     snapshot = build_outgoing_snapshot(project_type=project_type)
@@ -208,14 +211,46 @@ def push_updates(recipient_email, project_type=None, progress_callback=None):
 
 
 def update_with_other_user(recipient_email, project_type=None, progress_callback=None):
-    """The 'Update' button on the Export History page (sync on): pulls in
-    anything waiting from the other user, then pushes this device's own
-    new data out to them. Pull-before-push so this device's own snapshot
-    (built during push) reflects anything just received, not a picture
-    that's already one step behind."""
-    pull_result = pull_updates(progress_callback=progress_callback)
-    push_result = push_updates(recipient_email, project_type=project_type, progress_callback=progress_callback)
-    return {"pull": pull_result, "push": push_result}
+    """
+    The 'Update' button on the Export History page (sync on). Three steps,
+    in order:
+
+      1. Pull anything waiting from the other user.
+      2. Push this device's own data out to them. Pull-before-push so the
+         snapshot built during push reflects what was just received,
+         rather than a picture that's already one step behind.
+      3. Top up the active export file with every approved row that isn't
+         in it yet -- including whatever step 1 just brought in. Creates
+         that file on the first ever Update (and on the first Update after
+         a Finalize); tops the same file up on every Update after that.
+
+    Nothing here reads Outlook for timecards -- see push_updates.
+
+    Steps 1 and 2 are SKIPPED when recipient_email is empty (no sync
+    partner configured), and a failure in either is caught rather than
+    raised. Step 3 is local work on local data -- it must not be blocked
+    by there being no one to sync with, or by Outlook being shut, offline,
+    or slow. The two halves of the result say which parts actually ran.
+    """
+    pull_result = {"skipped": True}
+    push_result = {"sent": False, "reason": "no sync partner"}
+
+    if recipient_email:
+        try:
+            pull_result = pull_updates(progress_callback=progress_callback)
+            push_result = push_updates(
+                recipient_email, project_type=project_type, progress_callback=progress_callback
+            )
+        except Exception as exc:  # Outlook not running, COM error, mailbox refused...
+            print(f"Sync with {recipient_email} failed: {exc}")
+            pull_result = {"error": str(exc)}
+            push_result = {"sent": False, "reason": "sync failed", "error": str(exc)}
+
+    if progress_callback:
+        progress_callback("Updating the export file...")
+    export_result = rebuild_active_export(project_type=project_type)
+
+    return {"pull": pull_result, "push": push_result, "export": export_result}
 
 
 def push_rate_update(status_key, record_id, recipient_email):
@@ -238,21 +273,28 @@ def push_rate_update(status_key, record_id, recipient_email):
     return send_sync_mail(recipient_email, "rate", payload, seq=0)
 
 
-def finalize_month(recipient_email, start_date, end_date, output_path, project_type=None, progress_callback=None):
+def finalize_month(recipient_email, start_date, end_date, project_type=None, progress_callback=None):
     """
     The 'Finalize' button (sync on), called AFTER the user has confirmed
     in the UI. Order matters here:
-      1. One last pull+push pass, so nothing sent moments ago on either
-         side is missed right before the boundary moves.
-      2. Export the real file. This also advances get_last_export_date
-         and logs export_history LOCALLY (see export_act_invoice_overview_range) --
-         that part already existed before this feature.
-      3. Mail the other user a "finalize" notice: the exported file
-         itself, plus a closing snapshot so their data is fully caught
-         up too. Their app applies this specially (see pull_updates
-         above) -- logged into THEIR export_history and THEIR
-         last_export_date is advanced too, so the boundary is shared
-         rather than tracked per-machine.
+      1. A full Update pass -- pull, push, and one last top-up of the
+         active export file -- so nothing sent moments ago on either side
+         is missed right before the boundary moves.
+      2. Close that file out: log it in export_history, advance
+         get_last_export_date, and clear the active-export pointer so the
+         next Update opens a NEW file and starts filling that one. The
+         file itself is left exactly as it is -- it is the final export;
+         nothing is re-exported into a separate one.
+      3. Mail the other user a "finalize" notice: the closed file itself,
+         plus a closing snapshot so their data is fully caught up too.
+         Their app applies this specially (see pull_updates above) --
+         logged into THEIR export_history and THEIR last_export_date is
+         advanced too, so the boundary is shared rather than tracked
+         per-machine.
+
+    Note there is no output_path argument: the file being finalized is
+    whichever one Update has been filling, not one chosen at save time.
+    Its path comes back in the return value.
     """
 
     def report(msg):
@@ -262,26 +304,39 @@ def finalize_month(recipient_email, start_date, end_date, output_path, project_t
 
     update_with_other_user(recipient_email, project_type=project_type, progress_callback=progress_callback)
 
-    report("Exporting final sheet...")
-    row_count = export_act_invoice_overview_range(start_date, end_date, output_path, project_type=project_type)
+    report("Closing out the current export sheet...")
+    finalized = finalize_active_export(end_date, project_type=project_type)
+    output_path = finalized["path"]
+    row_count = finalized["row_count"]
 
-    report("Notifying the other user...")
-    closing_snapshot = build_outgoing_snapshot(project_type=project_type)
-    finalize_payload = {
-        "device_id": get_device_id(),
-        "export_filename": os.path.basename(output_path),
-        "period_start": start_date,
-        "period_end": end_date,
-        "snapshot": closing_snapshot,
-    }
-    sent = send_sync_mail(
-        recipient_email, "finalize", finalize_payload, closing_snapshot["seq"],
-        extra_attachments=[output_path],
-        note=f"Month finalized: {start_date} to {end_date}. The final export is attached.",
-    )
-    report("Finalize notice sent." if sent else "Failed to notify the other user - the export still completed locally.")
+    # The sheet is already closed by this point, so a failure here (or no
+    # partner to notify at all) must not raise -- it would leave the
+    # period closed locally while the caller was told the whole thing
+    # failed. It's reported back as notified=False instead.
+    sent = False
+    if recipient_email:
+        report("Notifying the other user...")
+        try:
+            closing_snapshot = build_outgoing_snapshot(project_type=project_type)
+            finalize_payload = {
+                "device_id": get_device_id(),
+                "export_filename": os.path.basename(output_path),
+                "period_start": start_date,
+                "period_end": end_date,
+                "snapshot": closing_snapshot,
+            }
+            sent = send_sync_mail(
+                recipient_email, "finalize", finalize_payload, closing_snapshot["seq"],
+                extra_attachments=[output_path],
+                note=f"Month finalized: {start_date} to {end_date}. The final export is attached.",
+            )
+        except Exception as exc:
+            print(f"Finalize notice to {recipient_email} failed: {exc}")
+        report("Finalize notice sent." if sent else "Failed to notify the other user - the export still completed locally.")
+    else:
+        report("No sync partner set - finalized locally only.")
 
-    return {"row_count": row_count, "notified": sent}
+    return {"row_count": row_count, "notified": sent, "path": output_path}
 
 
 # ----------------------------------------------------------------------
@@ -398,18 +453,28 @@ def sharepoint_finalize(folder, progress_callback=None, project_type=None, print
 
 def local_update(progress_callback=None):
     """Sync-off equivalent of the 'Update' button: scans this device's
-    own inbox (same as Scan Inbox), with no pull from or push to another
-    device."""
+    own inbox (same as Scan Inbox), then tops up the active export sheet
+    with whatever that scan brought in -- with no pull from or push to
+    another device. The export half is the same rolling sheet the sync-on
+    Update fills (see update_with_other_user), so turning sync off doesn't
+    put the app on a different export file."""
     sync_cards(progress_callback=progress_callback)
-    return {"scanned": True}
+
+    if progress_callback:
+        progress_callback("Updating the export file...")
+    export_result = rebuild_active_export()
+
+    return {"scanned": True, "export": export_result}
 
 
-def local_finalize(start_date, end_date, output_path, project_type=None, progress_callback=None):
+def local_finalize(start_date, end_date, project_type=None, progress_callback=None):
     """Sync-off equivalent of 'Finalize': scans this device's own inbox,
-    then exports and closes out the period locally -- no pull, no
-    notification. notified is deliberately None (not False) so the UI
-    can tell "sync is off, nothing was attempted" apart from "sync is on
-    and the notification failed to send"."""
+    then closes out the active export sheet locally -- no pull, no
+    notification. As with finalize_month there is no output_path: the
+    file closed is whichever one Update has been filling. notified is
+    deliberately None (not False) so the UI can tell "sync is off,
+    nothing was attempted" apart from "sync is on and the notification
+    failed to send"."""
 
     def report(msg):
         print(msg)
@@ -418,7 +483,7 @@ def local_finalize(start_date, end_date, output_path, project_type=None, progres
 
     sync_cards(progress_callback=progress_callback)
 
-    report("Exporting final sheet...")
-    row_count = export_act_invoice_overview_range(start_date, end_date, output_path, project_type=project_type)
+    report("Closing out the current export sheet...")
+    finalized = finalize_active_export(end_date, project_type=project_type)
 
-    return {"row_count": row_count, "notified": None}
+    return {"row_count": finalized["row_count"], "notified": None, "path": finalized["path"]}
