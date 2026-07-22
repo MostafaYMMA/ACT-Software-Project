@@ -22,6 +22,19 @@ _THIN_BORDER = Border(
     top=Side(style="thin"), bottom=Side(style="thin"),
 )
 
+class ExportFileInUseError(RuntimeError):
+    """An export .xlsx couldn't be written because something else has it
+    open (Excel holds an exclusive lock on an open workbook).
+
+    Its own type, not a bare PermissionError, so the UI can tell "close
+    the file and click again" apart from a real failure and say so in a
+    message box instead of dying with a traceback. Nothing is half-written
+    when this is raised -- see rebuild_active_export, which writes the
+    sheet before committing precisely so a failed write leaves the rows
+    still flagged as not-yet-exported.
+    """
+
+
 _DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 _PERIOD_PATTERN = re.compile(
@@ -2504,7 +2517,19 @@ def _write_act_invoice_workbook(conn, rows, output_path):
         ws.column_dimensions[col_letter].width = width
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    wb.save(output_path)
+    try:
+        wb.save(output_path)
+    except PermissionError as exc:
+        # Almost always the sheet being open in Excel: Excel takes an
+        # exclusive lock for as long as the workbook is open, and the
+        # rolling active export is a file the user is MEANT to open and
+        # look at, so this is a normal thing to hit, not a broken install.
+        # Re-raised as something the UI can put in front of the user --
+        # a bare PermissionError reads as a crash (see ui/Pages/History.py).
+        raise ExportFileInUseError(
+            f"Could not write {output_path} - the file is open in another program "
+            "(usually Excel). Close it and try again; nothing has been lost."
+        ) from exc
 
 
 # ----------------------------------------------------------------------

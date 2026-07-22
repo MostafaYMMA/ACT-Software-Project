@@ -120,9 +120,17 @@ def _apply_orange_calendar_style(date_edit):
 # for the sync-off, local-scan-only path).
 # ----------------------------------------------------------------------
 
+# Every worker below emits EITHER finished or failed, never neither: the
+# page disables its buttons when one starts and only re-enables them in
+# those two handlers, so an exception escaping run() would leave Update and
+# Finalize greyed out for the rest of the session (and the QThread never
+# quit, since quit is wired to those same signals). Same shape as the
+# SharePoint workers further down.
+
 class _UpdateWorker(QObject):
     progress = Signal(str)
     finished = Signal(dict)
+    failed = Signal(str)
 
     def __init__(self, recipient_email, project_type):
         super().__init__()
@@ -130,10 +138,14 @@ class _UpdateWorker(QObject):
         self.project_type = project_type
 
     def run(self):
-        result = update_with_other_user(
-            self.recipient_email, project_type=self.project_type,
-            progress_callback=self.progress.emit,
-        )
+        try:
+            result = update_with_other_user(
+                self.recipient_email, project_type=self.project_type,
+                progress_callback=self.progress.emit,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
         self.finished.emit(result)
 
 
@@ -142,15 +154,21 @@ class _LocalUpdateWorker(QObject):
     pull/push, just a local inbox scan (sync_service.local_update)."""
     progress = Signal(str)
     finished = Signal(dict)
+    failed = Signal(str)
 
     def run(self):
-        result = local_update(progress_callback=self.progress.emit)
+        try:
+            result = local_update(progress_callback=self.progress.emit)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
         self.finished.emit(result)
 
 
 class _FinalizeWorker(QObject):
     progress = Signal(str)
     finished = Signal(dict)
+    failed = Signal(str)
 
     def __init__(self, recipient_email, start_date, end_date, project_type):
         super().__init__()
@@ -160,10 +178,14 @@ class _FinalizeWorker(QObject):
         self.project_type = project_type
 
     def run(self):
-        result = finalize_month(
-            self.recipient_email, self.start_date, self.end_date,
-            project_type=self.project_type, progress_callback=self.progress.emit,
-        )
+        try:
+            result = finalize_month(
+                self.recipient_email, self.start_date, self.end_date,
+                project_type=self.project_type, progress_callback=self.progress.emit,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
         self.finished.emit(result)
 
 
@@ -175,6 +197,7 @@ class _LocalFinalizeWorker(QObject):
     filling."""
     progress = Signal(str)
     finished = Signal(dict)
+    failed = Signal(str)
 
     def __init__(self, start_date, end_date, project_type):
         super().__init__()
@@ -183,10 +206,14 @@ class _LocalFinalizeWorker(QObject):
         self.project_type = project_type
 
     def run(self):
-        result = local_finalize(
-            self.start_date, self.end_date,
-            project_type=self.project_type, progress_callback=self.progress.emit,
-        )
+        try:
+            result = local_finalize(
+                self.start_date, self.end_date,
+                project_type=self.project_type, progress_callback=self.progress.emit,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
         self.finished.emit(result)
 
 
@@ -887,6 +914,20 @@ class HistoryPage(QWidget):
         self.update_btn.setEnabled(enabled)
         self.finalize_btn.setEnabled(enabled)
 
+    def _on_sync_action_failed(self, message):
+        """Shared failure handler for Update and Finalize, sync on or off.
+        Re-enabling the buttons is the important part -- they're disabled
+        for the duration of the run, so without this a single failure would
+        lock the page until the app is restarted.
+
+        Nothing is half-done when this fires: rebuild_active_export writes
+        the sheet before committing, so a failed write leaves the rows
+        still counted as new and the next Update picks them up again."""
+        self._set_sync_controls_enabled(True)
+        self.status_label.setText("Update failed - nothing was changed.")
+        QMessageBox.warning(self, "Couldn't finish", message)
+        self.refresh()
+
     def _on_update_clicked(self):
         if self._sync_enabled():
             # No partner email is not an error: the export half of Update
@@ -905,7 +946,9 @@ class HistoryPage(QWidget):
             self._update_thread.started.connect(self._update_worker.run)
             self._update_worker.progress.connect(self.status_label.setText)
             self._update_worker.finished.connect(self._on_update_finished)
+            self._update_worker.failed.connect(self._on_sync_action_failed)
             self._update_worker.finished.connect(self._update_thread.quit)
+            self._update_worker.failed.connect(self._update_thread.quit)
             self._update_thread.finished.connect(self._update_thread.deleteLater)
 
             self._update_thread.start()
@@ -922,7 +965,9 @@ class HistoryPage(QWidget):
             self._update_thread.started.connect(self._update_worker.run)
             self._update_worker.progress.connect(self.status_label.setText)
             self._update_worker.finished.connect(self._on_local_update_finished)
+            self._update_worker.failed.connect(self._on_sync_action_failed)
             self._update_worker.finished.connect(self._update_thread.quit)
+            self._update_worker.failed.connect(self._update_thread.quit)
             self._update_thread.finished.connect(self._update_thread.deleteLater)
 
             self._update_thread.start()
@@ -1037,7 +1082,9 @@ class HistoryPage(QWidget):
         self._finalize_thread.started.connect(self._finalize_worker.run)
         self._finalize_worker.progress.connect(self.status_label.setText)
         self._finalize_worker.finished.connect(self._on_finalize_finished)
+        self._finalize_worker.failed.connect(self._on_sync_action_failed)
         self._finalize_worker.finished.connect(self._finalize_thread.quit)
+        self._finalize_worker.failed.connect(self._finalize_thread.quit)
         self._finalize_thread.finished.connect(self._finalize_thread.deleteLater)
 
         self._finalize_thread.start()

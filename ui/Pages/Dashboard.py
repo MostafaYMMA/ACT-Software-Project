@@ -3,7 +3,7 @@ from datetime import datetime
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy,
-    QDateEdit, QButtonGroup,
+    QDateEdit, QButtonGroup, QMessageBox,
 )
 from PySide6.QtCore import Qt, Signal, QThread, QObject, QPropertyAnimation, QEasingCurve, Property, QDate
 
@@ -223,9 +223,18 @@ class SyncWorker(QObject):
     picker only filters what's displayed afterwards."""
     progress = Signal(str)
     finished = Signal()
+    failed = Signal(str)
 
     def run(self):
-        sync_cards(progress_callback=self.progress.emit)
+        # Emits exactly one of finished/failed: scan_inbox disables the
+        # button and only those two handlers turn it back on, so an escaping
+        # exception would leave "Scanning..." stuck forever. A locked
+        # exports/*.xlsx (open in Excel) is the everyday way to hit this.
+        try:
+            sync_cards(progress_callback=self.progress.emit)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
         self.finished.emit()
 
 
@@ -739,13 +748,25 @@ class DashboardPage(QWidget):
         self._sync_thread.started.connect(self._sync_worker.run)
         self._sync_worker.progress.connect(self._on_sync_progress)
         self._sync_worker.finished.connect(self._on_sync_finished)
+        self._sync_worker.failed.connect(self._on_sync_failed)
         self._sync_worker.finished.connect(self._sync_thread.quit)
+        self._sync_worker.failed.connect(self._sync_thread.quit)
         self._sync_thread.finished.connect(self._sync_thread.deleteLater)
 
         self._sync_thread.start()
 
     def _on_sync_progress(self, message):
         print(message)
+
+    def _on_sync_failed(self, message):
+        """The scan couldn't finish. The high-water mark isn't moved on a
+        failed scan (see sync_service.sync_cards), so simply clicking Scan
+        Inbox again after fixing the cause re-covers the same window."""
+        self.scan_btn.setEnabled(True)
+        self.scan_btn.setText("Scan Inbox")
+        for card in self.stat_cards.values():
+            card.set_value("—")
+        QMessageBox.warning(self, "Scan failed", message)
 
     def _on_sync_finished(self):
         self._has_scanned = True
