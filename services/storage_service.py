@@ -1063,6 +1063,64 @@ def get_last_export_date():
         conn.close()
 
 
+def get_last_scan_time():
+    """
+    The high-water mark for inbox scanning: the ReceivedTime of the newest
+    email that was in the folder the last time a scan completed, as a naive
+    datetime (second precision), or None if this device has never completed
+    a scan.
+
+    sync_service.sync_cards starts each scan from this instead of walking
+    the whole inbox -- see set_last_scan_time for why it's stored at all
+    rather than derived from the saved records' "received" column.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT value FROM app_state WHERE key = 'last_scan_received'"
+        ).fetchone()
+        return _parse_received(row[0]) if row and row[0] else None
+    finally:
+        conn.close()
+
+
+def set_last_scan_time(received_at):
+    """
+    Moves the scan high-water mark to `received_at` (a datetime).
+
+    Deliberately the newest email IN THE FOLDER, not the newest one that
+    matched the timecard filter: a week of unrelated mail after the last
+    real timecard would otherwise be re-walked on every single scan. The
+    cost is that this can only ever be trusted as "everything up to here
+    has been looked at", which is why sync_cards re-scans a small overlap
+    behind it rather than starting exactly here.
+
+    Only ever moves FORWARD -- a caller handing over an older timestamp
+    (an empty folder, a failed read) leaves the stored mark alone, so a
+    bad read can't quietly force a full re-scan or, worse, be combined
+    with the overlap into a window that skips mail.
+    """
+    if received_at is None:
+        return
+    if received_at.tzinfo is not None:
+        received_at = received_at.replace(tzinfo=None)
+
+    current = get_last_scan_time()
+    if current is not None and received_at <= current:
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            "INSERT INTO app_state (key, value) VALUES ('last_scan_received', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (received_at.strftime("%Y-%m-%d %H:%M:%S"),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _received_date_only(received: str) -> str:
     """
     Truncates the raw "received" timestamp (item.ReceivedTime, e.g.

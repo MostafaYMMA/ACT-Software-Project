@@ -218,16 +218,14 @@ class StatCard(QFrame):
 
 
 class SyncWorker(QObject):
+    """Runs Scan Inbox off the GUI thread. Takes no date range -- sync_cards
+    scans from where the previous scan finished, and the page's period
+    picker only filters what's displayed afterwards."""
     progress = Signal(str)
     finished = Signal()
 
-    def __init__(self, start_date=None, end_date=None):
-        super().__init__()
-        self.start_date = start_date
-        self.end_date = end_date
-
     def run(self):
-        sync_cards(progress_callback=self.progress.emit, start_date=self.start_date, end_date=self.end_date)
+        sync_cards(progress_callback=self.progress.emit)
         self.finished.emit()
 
 
@@ -284,13 +282,18 @@ class DashboardPage(QWidget):
         header_row.addWidget(self.scan_btn)
         layout.addLayout(header_row)
 
-        # Period row: choose which "received on" window the next scan
-        # covers, before it runs. Two mutually exclusive modes -- This
-        # Month (one click) or a custom From/To range.
+        # Period row: which "received on" window the cards and table below
+        # SHOW. Two mutually exclusive modes -- This Month (one click) or a
+        # custom From/To range.
+        #
+        # It does not affect Scan Inbox: scanning always picks up from where
+        # the last scan finished (see sync_service.sync_cards), so this is
+        # purely a view filter over what's already stored -- including rows
+        # scanned long before the window it's set to.
         period_row = QHBoxLayout()
         period_row.setSpacing(8)
 
-        period_label = QLabel("Scan period:")
+        period_label = QLabel("Show period:")
         apply_live_style(period_label, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 12px;")
         period_row.addWidget(period_label)
 
@@ -485,7 +488,8 @@ class DashboardPage(QWidget):
 
     def _get_selected_period(self):
         """Returns (start_date, end_date) datetimes for the currently
-        chosen scan period, per date_utils' rules."""
+        chosen display period, per date_utils' rules. Filters the cards and
+        table only -- Scan Inbox doesn't take a range (see SyncWorker)."""
         if self.custom_range_btn.isChecked():
             from_qdate = self.from_date_edit.date()
             to_qdate = self.to_date_edit.date()
@@ -728,10 +732,8 @@ class DashboardPage(QWidget):
         for card in self.stat_cards.values():
             card.start_loading()
 
-        start_date, end_date = self._get_selected_period()
-
         self._sync_thread = QThread(self)
-        self._sync_worker = SyncWorker(start_date, end_date)
+        self._sync_worker = SyncWorker()
         self._sync_worker.moveToThread(self._sync_thread)
 
         self._sync_thread.started.connect(self._sync_worker.run)

@@ -951,6 +951,39 @@ def _received_time_naive(item):
     return received.replace(tzinfo=None) if getattr(received, "tzinfo", None) is not None else received
 
 
+def get_newest_received(folder_name="Inbox"):
+    """
+    ReceivedTime of the newest item currently in the folder, as a naive
+    datetime, or None if the folder is empty / Outlook can't be reached.
+
+    Read BEFORE a scan starts, not after, and stored as the new high-water
+    mark once that scan finishes (see storage_service.set_last_scan_time
+    and sync_service.sync_cards). Taking it up front is what makes mail
+    that lands DURING a long scan get picked up by the next one instead of
+    being stepped over: the mark never claims to cover anything the scan
+    couldn't have seen.
+
+    Only the first few items are inspected -- the collection is sorted
+    newest-first, so the loop is really just skipping the odd item that has
+    no ReceivedTime at all (some non-mail items), not searching.
+    """
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        namespace = outlook.GetNamespace("MAPI")
+        folder = get_outlook_folder(namespace, folder_name)
+    except Exception as exc:
+        print(f"Could not read the newest received time: {exc}")
+        return None
+
+    items = folder.Items
+    items.Sort("[ReceivedTime]", True)  # newest first
+    for item in itertools.islice(items, 10):
+        received_at = _received_time_naive(item)
+        if received_at is not None:
+            return received_at
+    return None
+
+
 def get_approved_cards(folder_name="Inbox", print_report=True, limit=None,
                         start_date=None, end_date=None):
     """
