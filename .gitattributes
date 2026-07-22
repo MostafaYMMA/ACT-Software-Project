@@ -1,0 +1,28 @@
+# Binary assets must never be treated as text.
+#
+# Git's text handling (and some editors/terminals/copy-paste paths) will
+# "helpfully" normalise line endings or re-encode a file it believes is
+# text. On a binary file that is destructive and silent: every byte that
+# isn't valid UTF-8 becomes U+FFFD (ef bf bd), the file still looks about
+# the right size, and nothing complains until whatever reads it fails.
+#
+# That is exactly what happened to assets/fonts/GentleHearts-Regular.ttf --
+# ~10,000 bytes destroyed, so Qt refused to load it and the whole app
+# silently fell back to a generic serif. See tests/test_font_assets.py,
+# which now checks these files are still structurally intact.
+*.ttf  binary
+*.otf  binary
+*.woff binary
+*.woff2 binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.ico  binary
+*.gif  binary
+*.svg  text
+*.db   binary
+*.xlsx binary
+*.xls  binary
+*.docx binary
+*.pdf  binary
+*.msg  binary
