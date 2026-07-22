@@ -954,9 +954,61 @@ def init_db():
     # last-write-wins stamps the rate edits already use (see
     # _apply_rate_if_newer) -- who set it and when, so an old payload
     # replayed later can't undo a newer local choice.
+    # updated_at is the change marker the outgoing current-sheet sync reads:
+    # every successful edit (a cell via update_current_sheet_field, a colour
+    # via set_current_sheet_row_color) stamps it, and
+    # get_current_sheet_changes_since() sends every row stamped later than
+    # the last send. NULL means "never edited on this device since the
+    # column was added" -- such a row has nothing local to push.
+    # updated_by records WHICH device made that edit, and is what stops an
+    # echo loop: a row applied from an incoming payload keeps the sender's
+    # id, so this device's own change feed skips it instead of mailing the
+    # row straight back to the person it came from. Without it, every
+    # received row looks like a local change and the two installs bounce
+    # the same rows at each other on every Update.
     _ensure_columns(conn, "current_sheet", [
         "color_updated_at TEXT", "color_updated_by TEXT",
+        "updated_at TEXT", "updated_by TEXT",
     ])
+
+    # One row per sync direction (currently just 'current_sheet_out'),
+    # holding how far this device has already pushed and which sequence
+    # number the next push should carry.
+    #
+    # last_synced_at is the high-water mark over current_sheet.updated_at,
+    # NOT "when we last synced": it is only advanced after a send actually
+    # succeeds (see advance_sync_state), so a failed send leaves those
+    # changes queued for the next attempt rather than dropping them.
+    #
+    # next_seq extends the same per-device counter scheme the snapshot
+    # channel uses (see _next_outgoing_seq / the ACT-SYNC subject line) --
+    # kept in its own row rather than sharing app_state's
+    # 'sync_outgoing_seq' so a burned snapshot seq can't create gaps the
+    # receiver's sync_log dedupe would have to reason about.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sync_state (
+            direction TEXT PRIMARY KEY,
+            last_synced_at TEXT,
+            next_seq INTEGER DEFAULT 1
+        )
+    """)
+
+    # Which incoming sync payloads have already been applied here. This is
+    # the ONLY thing stopping a re-scanned email from being applied twice
+    # (scan_sync_mails only reads UNREAD mail, but that's an optimisation,
+    # not a guarantee). device_id is part of the key because seq counts up
+    # per SENDING device -- two partners both sending their seq=3 are
+    # different payloads, and keying on seq alone would silently drop the
+    # second one.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sync_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT,
+            seq INTEGER,
+            applied_at TEXT,
+            UNIQUE(device_id, seq)
+        )
+    """)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS export_history (
@@ -1464,9 +1516,13 @@ def update_current_sheet_field(row_id, column, value):
         if column not in valid_columns:
             return False
         try:
+            # updated_at is stamped in the same statement as the edit, so a
+            # row can never be changed without being marked as changed --
+            # an unstamped edit would simply never reach the other user.
             cursor = conn.execute(
-                f'UPDATE current_sheet SET "{column}" = ? WHERE id = ?',
-                (value, row_id),
+                f'UPDATE current_sheet SET "{column}" = ?, updated_at = ?, updated_by = ? '
+                'WHERE id = ?',
+                (value, _now_stamp(), get_device_id(), row_id),
             )
         except sqlite3.IntegrityError:
             return False
@@ -1494,15 +1550,292 @@ def set_current_sheet_row_color(row_id, hex_color):
     """
     conn = sqlite3.connect(DB_PATH)
     try:
+        stamp = _now_stamp()
+        device_id = get_device_id()
         cursor = conn.execute(
-            "UPDATE current_sheet SET row_color = ?, color_updated_at = ?, color_updated_by = ? "
-            "WHERE id = ?",
-            (hex_color, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), get_device_id(), row_id),
+            "UPDATE current_sheet SET row_color = ?, color_updated_at = ?, color_updated_by = ?, "
+            "updated_at = ?, updated_by = ? WHERE id = ?",
+            (hex_color, stamp, device_id, stamp, device_id, row_id),
         )
         conn.commit()
         return cursor.rowcount > 0
     finally:
         conn.close()
+
+
+# ----------------------------------------------------------------------
+# Current Sheet change tracking + the current-sheet sync payload.
+#
+# A row-level (not field-level) change feed: get_current_sheet_changes_since
+# returns WHOLE rows. That is deliberate and not just simpler -- a row can
+# be new to the receiving device entirely (the timecard email was only ever
+# sent to one of the two users), and "what changed" is meaningless for a row
+# the other side has never seen. A whole row is always enough; a diff isn't.
+# ----------------------------------------------------------------------
+
+CURRENT_SHEET_SYNC_DIRECTION = "current_sheet_out"
+
+
+def _now_stamp():
+    """The one timestamp format every current_sheet marker uses. Sortable
+    as a plain string, which is what lets the changes-since query be a
+    simple `updated_at > ?` comparison in SQL."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_current_sheet_changes_since(last_synced_at):
+    """
+    Every current_sheet row edited since last_synced_at, as full row dicts
+    (every column, including id/timecard_id -- timecard_id is what the
+    receiving side matches on, see apply_sync_payload).
+
+    last_synced_at of None means "never synced from here": everything ever
+    edited HERE goes out. Two rows are excluded:
+      - NULL updated_at: never touched since the column existed, so there
+        is nothing local about them worth sending.
+      - updated_by != this device: applied from the other user's payload
+        rather than edited here. Sending those back would bounce every
+        received row straight to the person who just sent it, on every
+        Update, forever.
+    """
+    device_id = get_device_id()
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        if last_synced_at:
+            cursor = conn.execute(
+                "SELECT * FROM current_sheet WHERE updated_at IS NOT NULL "
+                "AND updated_by = ? AND updated_at > ? ORDER BY updated_at ASC",
+                (device_id, last_synced_at),
+            )
+        else:
+            cursor = conn.execute(
+                "SELECT * FROM current_sheet WHERE updated_at IS NOT NULL "
+                "AND updated_by = ? ORDER BY updated_at ASC",
+                (device_id,),
+            )
+        columns = [desc[0] for desc in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_sync_state(direction=CURRENT_SHEET_SYNC_DIRECTION):
+    """This direction's (last_synced_at, next_seq), creating the row on
+    first use. A device that has never pushed starts at last_synced_at
+    None and seq 1."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT last_synced_at, next_seq FROM sync_state WHERE direction = ?",
+            (direction,),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO sync_state (direction, last_synced_at, next_seq) VALUES (?, NULL, 1)",
+                (direction,),
+            )
+            conn.commit()
+            return {"last_synced_at": None, "next_seq": 1}
+        return {"last_synced_at": row[0], "next_seq": int(row[1] or 1)}
+    finally:
+        conn.close()
+
+
+def advance_sync_state(synced_at, direction=CURRENT_SHEET_SYNC_DIRECTION):
+    """
+    Records that everything edited up to synced_at has been sent, and burns
+    this direction's sequence number.
+
+    Call this ONLY after a send has actually succeeded. Everything about
+    the change feed depends on that ordering: the marker is what decides
+    which rows are considered already-delivered, so advancing it for a send
+    that then failed would drop those edits from every future payload and
+    they would never reach the other user.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            "INSERT INTO sync_state (direction, last_synced_at, next_seq) VALUES (?, ?, 2) "
+            "ON CONFLICT(direction) DO UPDATE SET "
+            "last_synced_at = excluded.last_synced_at, next_seq = sync_state.next_seq + 1",
+            (direction, synced_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def build_current_sheet_sync_payload(direction=CURRENT_SHEET_SYNC_DIRECTION):
+    """
+    The outgoing current-sheet payload: the changed rows themselves plus
+    the small metadata block the receiver needs (who sent it, which
+    sequence number, when it was built).
+
+    `cutoff` rides along so the caller can hand the exact same value back
+    to advance_sync_state after a successful send. Using "now" at send time
+    instead would swallow any edit made in the seconds between building the
+    payload and the mail going out.
+
+    Returns None when there is nothing to send.
+    """
+    state = get_sync_state(direction)
+    rows = get_current_sheet_changes_since(state["last_synced_at"])
+    if not rows:
+        return None
+
+    cutoff = max(row.get("updated_at") or "" for row in rows)
+    return {
+        "kind": "sheet",
+        "device_id": get_device_id(),
+        "seq": state["next_seq"],
+        "generated_at": _now_stamp(),
+        "cutoff": cutoff,
+        "rows": rows,
+    }
+
+
+def _sync_payload_already_applied(conn, device_id, seq):
+    return conn.execute(
+        "SELECT 1 FROM sync_log WHERE device_id = ? AND seq = ?",
+        (device_id, seq),
+    ).fetchone() is not None
+
+
+def apply_sync_payload(payload):
+    """
+    Applies one incoming current-sheet payload (the JSON attachment parsed
+    by outlook_service -- never the .xlsx, which is for human eyes only).
+
+    Duplicate-safe by sequence number: if this sender's seq is already in
+    sync_log the whole payload is skipped, which is what makes re-scanning
+    the same email harmless.
+
+    Each row is matched on timecard_id and either INSERTed (a row this
+    device has never seen -- the common case, since a timecard email often
+    reaches only one of the two users) or UPDATEd in place. A plain
+    overwrite, on purpose: only one user ever edits a given row, so there
+    is no conflict to resolve and no merge rule to get wrong.
+
+    The sender's updated_at is written through as-is rather than restamped
+    with local time. Restamping would make every received row look locally
+    edited and it would bounce straight back to the sender on the next
+    push, forever.
+
+    Returns {"applied": bool, "inserted": n, "updated": n, "skipped_duplicate": bool}.
+    """
+    result = {"applied": False, "inserted": 0, "updated": 0, "skipped_duplicate": False}
+    if not payload:
+        return result
+
+    device_id = payload.get("device_id")
+    seq = payload.get("seq")
+    rows = payload.get("rows") or []
+    try:
+        seq = int(seq)
+    except (TypeError, ValueError):
+        print(f"Ignoring sync payload with unusable seq {seq!r} from {device_id!r}")
+        return result
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        if _sync_payload_already_applied(conn, device_id, seq):
+            result["skipped_duplicate"] = True
+            return result
+
+        valid_columns = {row[1] for row in conn.execute('PRAGMA table_info("current_sheet")')}
+        # id is this device's own autoincrement key and means nothing on
+        # the sender's machine -- matching is on timecard_id.
+        valid_columns.discard("id")
+
+        for row in rows:
+            timecard_id = row.get("timecard_id")
+            if timecard_id is None:
+                continue
+            # Unknown keys (a newer build's extra column) are dropped rather
+            # than raising, so an older receiver still applies the rest.
+            values = {k: v for k, v in row.items() if k in valid_columns}
+            if not values:
+                continue
+            values["timecard_id"] = timecard_id
+            # Stamped as the SENDER's, never this device's: that's what
+            # keeps the row out of our own outgoing change feed (see
+            # get_current_sheet_changes_since) so it isn't mailed back.
+            values["updated_by"] = device_id
+
+            exists = conn.execute(
+                "SELECT id FROM current_sheet WHERE timecard_id = ?", (timecard_id,)
+            ).fetchone()
+
+            if exists:
+                assignments = [k for k in values if k != "timecard_id"]
+                if not assignments:
+                    continue
+                conn.execute(
+                    "UPDATE current_sheet SET "
+                    + ", ".join(f'"{k}" = ?' for k in assignments)
+                    + " WHERE timecard_id = ?",
+                    [values[k] for k in assignments] + [timecard_id],
+                )
+                result["updated"] += 1
+            else:
+                keys = list(values)
+                conn.execute(
+                    "INSERT INTO current_sheet (" + ", ".join(f'"{k}"' for k in keys) + ") "
+                    "VALUES (" + ", ".join("?" for _ in keys) + ")",
+                    [values[k] for k in keys],
+                )
+                result["inserted"] += 1
+
+        conn.execute(
+            "INSERT OR IGNORE INTO sync_log (device_id, seq, applied_at) VALUES (?, ?, ?)",
+            (device_id, seq, _now_stamp()),
+        )
+        conn.commit()
+        result["applied"] = True
+        return result
+    finally:
+        conn.close()
+
+
+def export_current_sheet_changes_to_excel(rows, output_path):
+    """
+    The human-readable half of a current-sheet sync mail: the SAME changed
+    rows the JSON payload carries, rendered with the header/border styling
+    export_invoice_lines_to_excel uses.
+
+    Display only. Nothing ever reads this file back -- apply_sync_payload
+    works purely from the JSON attachment -- so its layout can change
+    freely without breaking either side of the sync.
+    """
+    columns = [
+        ("Date", "Date"), ("day", "Day"), ("Project Number", "Project Number"),
+        ("Project Name", "Project Name"), ("Task Name", "Task Name"),
+        ("Qty", "Qty"), ("rate", "Rate"), ("name", "Name"),
+        ("person_number", "Person Number"), ("period", "Period"),
+        ("sender", "Sender"), ("received", "Received"),
+        ("row_color", "Row Colour"), ("updated_at", "Updated At"),
+    ]
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Changes"
+
+    ws.append([label for _key, label in columns])
+    for cell in ws[1]:
+        cell.font = _HEADER_FONT
+        cell.fill = _HEADER_FILL
+        cell.border = _THIN_BORDER
+
+    for row in rows:
+        ws.append([row.get(key) for key, _label in columns])
+        for cell in ws[ws.max_row]:
+            cell.font = _BODY_FONT
+            cell.border = _THIN_BORDER
+
+    for i, (_key, label) in enumerate(columns, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = max(len(label) + 2, 12)
+
+    wb.save(output_path)
 
 
 def _dedupe_latest_across_statuses(grouped):

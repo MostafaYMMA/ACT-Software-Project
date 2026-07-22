@@ -21,11 +21,47 @@ Layout -- two sheets, present as the payload kind needs them:
             attachments read the same way.
 """
 
+import json
+
 from openpyxl import Workbook, load_workbook
 
-from storage_service import SNAPSHOT_COLUMNS
+from storage_service import SNAPSHOT_COLUMNS, export_current_sheet_changes_to_excel
 
 _ROW_KEYS = [key for key, _label in SNAPSHOT_COLUMNS]
+
+# --- The "sheet" kind: current_sheet changes ---------------------------
+#
+# Unlike the three kinds below, this one does NOT round-trip through the
+# .xlsx. It ships two attachments with different audiences:
+#   act_sync_payload.json    -- the real data, the only thing ever parsed.
+#   act_sync_changes.xlsx    -- the same rows, formatted, for a human who
+#                               opens the email. Never read back.
+# Splitting them means the human-readable file's layout can be changed
+# freely without any risk to what the receiving app actually applies.
+SHEET_JSON_ATTACHMENT_NAME = "act_sync_payload.json"
+SHEET_XLSX_ATTACHMENT_NAME = "act_sync_changes.xlsx"
+
+
+def write_sheet_payload_files(payload, json_path, xlsx_path):
+    """Writes both halves of a "sheet" sync mail's attachments from one
+    payload (see storage_service.build_current_sheet_sync_payload)."""
+    with open(json_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+    export_current_sheet_changes_to_excel(payload.get("rows") or [], xlsx_path)
+
+
+def read_sheet_payload_json(path):
+    """Reads a "sheet" payload back off its JSON attachment. Returns None
+    if the file isn't valid JSON carrying a row list -- a malformed
+    payload is skipped rather than half-applied."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("rows"), list):
+        return None
+    return payload
 
 
 def _write_meta_sheet(ws, meta_items):

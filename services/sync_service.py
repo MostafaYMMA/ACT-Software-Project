@@ -10,6 +10,7 @@ from storage_service import (
     export_to_csv, export_invoice_lines_to_excel, export_expenses_to_csv,
     build_outgoing_snapshot, apply_incoming_snapshot, apply_rate_update,
     build_rate_update_payload, get_device_id,
+    build_current_sheet_sync_payload, apply_sync_payload, advance_sync_state,
     record_finalize_from_other_device, export_snapshot_rows_to_excel,
     rebuild_active_export, finalize_active_export,
     get_last_scan_time, set_last_scan_time,
@@ -161,6 +162,8 @@ def pull_updates(progress_callback=None):
         applied_snapshots = 0
         applied_rates = 0
         applied_finalizes = 0
+        applied_sheets = 0
+        sheet_rows = 0
 
         for message in messages:
             kind = message["kind"]
@@ -170,6 +173,15 @@ def pull_updates(progress_callback=None):
                 result = apply_incoming_snapshot(payload)
                 if result.get("applied"):
                     applied_snapshots += 1
+
+            elif kind == "sheet":
+                # Current Sheet changes -- applied from the JSON payload
+                # only, and skipped outright if this sender's seq is
+                # already in sync_log (see apply_sync_payload).
+                result = apply_sync_payload(payload)
+                if result.get("applied"):
+                    applied_sheets += 1
+                    sheet_rows += result["inserted"] + result["updated"]
 
             elif kind == "rate":
                 if apply_rate_update(payload):
@@ -199,7 +211,8 @@ def pull_updates(progress_callback=None):
 
         report(
             f"Updates received: {applied_snapshots} snapshot(s), "
-            f"{applied_rates} rate edit(s), {applied_finalizes} finalize notice(s)."
+            f"{applied_rates} rate edit(s), {applied_finalizes} finalize notice(s), "
+            f"{applied_sheets} Current Sheet update(s) ({sheet_rows} row(s))."
         )
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -249,6 +262,40 @@ def push_updates(recipient_email, project_type=None, progress_callback=None):
     return {"sent": sent, "rows_sent": len(snapshot["rows"])}
 
 
+def push_current_sheet_changes(recipient_email, progress_callback=None):
+    """
+    Mails the other user every Current Sheet row edited here since the last
+    successful push (see storage_service.build_current_sheet_sync_payload).
+
+    The marker is advanced ONLY after send_sync_mail reports success, and
+    it's advanced to the payload's own cutoff rather than "now" -- so a
+    failed send leaves those rows queued for the next Update, and an edit
+    made while the mail was going out isn't skipped over.
+    """
+
+    def report(msg):
+        print(msg)
+        if progress_callback:
+            progress_callback(msg)
+
+    payload = build_current_sheet_sync_payload()
+    if payload is None:
+        report("No Current Sheet changes to send.")
+        return {"sent": False, "reason": "no changes", "rows_sent": 0}
+
+    report(f"Sending {len(payload['rows'])} Current Sheet change(s)...")
+    sent = send_sync_mail(recipient_email, "sheet", payload, payload["seq"])
+    if sent:
+        # Only now is it safe to say these rows have gone out.
+        advance_sync_state(payload["cutoff"])
+        report("Current Sheet changes sent.")
+    else:
+        report("Failed to send Current Sheet changes - they'll be included in the next Update.")
+
+    return {"sent": sent, "rows_sent": len(payload["rows"]) if sent else 0,
+            "seq": payload["seq"]}
+
+
 def update_with_other_user(recipient_email, project_type=None, progress_callback=None):
     """
     The 'Update' button on the Export History page (sync on). Three steps,
@@ -273,6 +320,7 @@ def update_with_other_user(recipient_email, project_type=None, progress_callback
     """
     pull_result = {"skipped": True}
     push_result = {"sent": False, "reason": "no sync partner"}
+    sheet_result = {"sent": False, "reason": "no sync partner", "rows_sent": 0}
 
     if recipient_email:
         try:
@@ -280,16 +328,25 @@ def update_with_other_user(recipient_email, project_type=None, progress_callback
             push_result = push_updates(
                 recipient_email, project_type=project_type, progress_callback=progress_callback
             )
+            # The Current Sheet change feed: the hand-edited working copy,
+            # which the snapshot above does not carry (a snapshot is built
+            # from the scanned status tables). Sent as its own message so a
+            # failure in one half can't silently swallow the other's marker.
+            sheet_result = push_current_sheet_changes(
+                recipient_email, progress_callback=progress_callback
+            )
         except Exception as exc:  # Outlook not running, COM error, mailbox refused...
             print(f"Sync with {recipient_email} failed: {exc}")
             pull_result = {"error": str(exc)}
             push_result = {"sent": False, "reason": "sync failed", "error": str(exc)}
+            sheet_result = {"sent": False, "reason": "sync failed", "rows_sent": 0}
 
     if progress_callback:
         progress_callback("Updating the export file...")
     export_result = rebuild_active_export(project_type=project_type)
 
-    return {"pull": pull_result, "push": push_result, "export": export_result}
+    return {"pull": pull_result, "push": push_result, "sheet": sheet_result,
+            "export": export_result}
 
 
 def push_rate_update(status_key, record_id, recipient_email):

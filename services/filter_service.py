@@ -89,6 +89,29 @@ subject_pattern = re.compile(
     re.IGNORECASE
 )
 
+# --- App-to-app sync mail -- NEVER a real timecard/expense email. ---
+#
+# Mail the other install's app sent to this one (see
+# services/outlook_service.py, which owns the full subject grammar and is
+# what actually reads these). Matched here only to REJECT: an attachment
+# on one of these is a sync payload, and the loose attachment-keyword rule
+# in process_email would happily match a current-sheet .xlsx full of
+# project/task/hours words and feed the app's own data back through the
+# extraction pipeline as if a client had emailed it.
+#
+# This is a deliberately broad prefix check rather than a copy of
+# outlook_service._SUBJECT_PATTERN: anything announcing itself as ACT-SYNC
+# should be kept out of here even if it's a version or kind this build
+# doesn't recognise.
+sync_mail_subject_pattern = re.compile(r"^\s*ACT-SYNC\b", re.IGNORECASE)
+
+
+def is_sync_mail(item):
+    """True if this MailItem is one of the app's own sync messages. Both
+    scanners check this first and skip the item entirely."""
+    subject = getattr(item, "Subject", "") or ""
+    return bool(sync_mail_subject_pattern.match(subject))
+
 # --- Keyword list -- used for ATTACHMENT matching (any ONE keyword
 #     is enough) AND for informational reporting in body/subject. ---
 KEYWORDS = [
@@ -627,6 +650,10 @@ def process_email_expense(item, temp_dir):
     received, where each required term was found) if all three terms
     are present somewhere in the email, or None if not matched.
     """
+    # Same early rejection as process_email -- see is_sync_mail.
+    if is_sync_mail(item):
+        return None
+
     subject = getattr(item, "Subject", "") or ""
 
     try:
@@ -719,6 +746,15 @@ def process_email(item, temp_dir, counters):
         did not match. This return value is what get_approved_cards()
         collects into its matching_emails list.
     """
+    # Before anything else, and before a single attachment is opened: the
+    # app's own sync mail is handled by outlook_service.scan_sync_mails /
+    # sync_service.pull_updates, and must never be run through approval
+    # detection or extraction here.
+    if is_sync_mail(item):
+        if DEBUG:
+            print(f"[DEBUG] Skipping app sync mail: '{getattr(item, 'Subject', '')}'")
+        return None
+
     counters.total_emails += 1
 
     try:

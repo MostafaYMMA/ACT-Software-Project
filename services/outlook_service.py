@@ -19,7 +19,11 @@ import traceback
 
 import win32com.client
 
-from sync_payload_excel import write_payload_workbook, read_payload_workbook
+from sync_payload_excel import (
+    write_payload_workbook, read_payload_workbook,
+    write_sheet_payload_files, read_sheet_payload_json,
+    SHEET_JSON_ATTACHMENT_NAME, SHEET_XLSX_ATTACHMENT_NAME,
+)
 
 OL_FOLDER_INBOX = 6
 OL_MAIL_ITEM_CLASS = 43
@@ -27,7 +31,10 @@ OL_MAIL_ITEM_CLASS = 43
 # Every sync mail's subject looks like:
 #   ACT-SYNC v1 | snapshot | a1b2c3d4e5f6 | seq=7
 # - kind: "snapshot" (a device's current-period timecard data),
-#   "rate" (one standalone rate edit), or "finalize" (month-close notice).
+#   "rate" (one standalone rate edit), "finalize" (month-close notice), or
+#   "sheet" (the current_sheet rows edited since this device's last push --
+#   see storage_service.build_current_sheet_sync_payload; the only kind
+#   whose real data is a JSON attachment rather than the .xlsx).
 # - device_id / seq: see storage_service.get_device_id / _next_outgoing_seq.
 # This exact, distinctive shape is what keeps filter_service's approval
 # regex from ever mistaking one of these for a real timecard email (it
@@ -35,7 +42,7 @@ OL_MAIL_ITEM_CLASS = 43
 # contains) and what lets scan_sync_mails() below find them again.
 _SUBJECT_PREFIX = "ACT-SYNC"
 _SUBJECT_PATTERN = re.compile(
-    r"^ACT-SYNC v1 \| (snapshot|rate|finalize) \| ([a-f0-9]+) \| seq=(\d+)",
+    r"^ACT-SYNC v1 \| (snapshot|rate|finalize|sheet) \| ([a-f0-9]+) \| seq=(\d+)",
     re.IGNORECASE,
 )
 _PAYLOAD_ATTACHMENT_NAME = "act_sync_payload.xlsx"
@@ -65,8 +72,18 @@ def send_sync_mail(recipient_email, kind, payload, seq, extra_attachments=None, 
 
     temp_dir = tempfile.mkdtemp(prefix="act_sync_send_")
     try:
-        payload_path = os.path.join(temp_dir, _PAYLOAD_ATTACHMENT_NAME)
-        write_payload_workbook(payload, kind, payload_path)
+        if kind == "sheet":
+            # Two attachments: the JSON the other app actually reads, and a
+            # formatted .xlsx of the same rows purely so a human opening
+            # the mail sees the changes instead of raw JSON.
+            attachment_paths = [
+                os.path.join(temp_dir, SHEET_JSON_ATTACHMENT_NAME),
+                os.path.join(temp_dir, SHEET_XLSX_ATTACHMENT_NAME),
+            ]
+            write_sheet_payload_files(payload, attachment_paths[0], attachment_paths[1])
+        else:
+            attachment_paths = [os.path.join(temp_dir, _PAYLOAD_ATTACHMENT_NAME)]
+            write_payload_workbook(payload, kind, attachment_paths[0])
 
         outlook = win32com.client.Dispatch("Outlook.Application")
         mail = outlook.CreateItem(0)  # olMailItem
@@ -77,7 +94,8 @@ def send_sync_mail(recipient_email, kind, payload, seq, extra_attachments=None, 
             "Please do not reply to or delete it manually -- it's handled by the app.\n\n"
             + (note or "")
         )
-        mail.Attachments.Add(payload_path)
+        for attachment_path in attachment_paths:
+            mail.Attachments.Add(attachment_path)
         for extra_path in (extra_attachments or []):
             if extra_path and os.path.exists(extra_path):
                 mail.Attachments.Add(extra_path)
@@ -106,7 +124,14 @@ def _extract_attachments(item, temp_dir, kind):
             filename = attachment.FileName
             saved_path = os.path.join(temp_dir, f"{i}_{filename}")
             attachment.SaveAsFile(saved_path)
-            if filename == _PAYLOAD_ATTACHMENT_NAME:
+            if kind == "sheet":
+                # ONLY the JSON is ever parsed. The .xlsx riding alongside
+                # it is a human-readable copy and is deliberately left
+                # alone -- treating it as data would mean two sources of
+                # truth for the same rows.
+                if filename == SHEET_JSON_ATTACHMENT_NAME:
+                    payload = read_sheet_payload_json(saved_path)
+            elif filename == _PAYLOAD_ATTACHMENT_NAME:
                 payload = read_payload_workbook(saved_path, kind)
             else:
                 other_paths.append(saved_path)
