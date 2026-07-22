@@ -39,6 +39,28 @@ class _DbTestCase(unittest.TestCase):
         return storage_service.get_current_sheet_rows()[0]["id"]
 
 
+class _ReceiverHarness:
+    """A second, separate database standing in for the other user's
+    machine, so a payload built by the sender can be applied somewhere it
+    genuinely hasn't been seen before."""
+
+    def __init__(self, test_case):
+        self.db_path = os.path.join(test_case.temp_dir.name, "receiver.db")
+        with patch.object(storage_service, "DB_PATH", self.db_path):
+            storage_service.init_db()
+
+    def apply(self, payload):
+        with patch.object(storage_service, "DB_PATH", self.db_path):
+            return storage_service.apply_sync_payload(payload)
+
+    def qty(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return conn.execute('SELECT "Qty" FROM current_sheet').fetchone()[0]
+        finally:
+            conn.close()
+
+
 class ChangeTrackingTests(_DbTestCase):
     """updated_at is the whole basis of the change feed -- if an edit
     doesn't stamp it, that edit silently never reaches the other user."""
@@ -90,14 +112,17 @@ class SyncStateTests(_DbTestCase):
         self.assertIsNone(state["last_synced_at"])
         self.assertEqual(state["next_seq"], 1)
 
-    def test_advance_moves_marker_and_burns_a_seq(self):
+    def test_advance_moves_the_marker_only(self):
         storage_service.advance_sync_state("2026-07-20 10:00:00")
         state = storage_service.get_sync_state()
         self.assertEqual(state["last_synced_at"], "2026-07-20 10:00:00")
-        self.assertEqual(state["next_seq"], 2)
+        # The seq is burned at build time, not here.
+        self.assertEqual(state["next_seq"], 1)
 
-        storage_service.advance_sync_state("2026-07-21 10:00:00")
-        self.assertEqual(storage_service.get_sync_state()["next_seq"], 3)
+    def test_reserving_a_seq_burns_it_immediately(self):
+        self.assertEqual(storage_service.reserve_sync_seq(), 1)
+        self.assertEqual(storage_service.get_sync_state()["next_seq"], 2)
+        self.assertEqual(storage_service.reserve_sync_seq(), 2)
 
     def test_payload_is_none_when_nothing_changed(self):
         self._seed()
@@ -124,7 +149,28 @@ class SyncStateTests(_DbTestCase):
         second = storage_service.build_current_sheet_sync_payload()
 
         self.assertEqual(len(second["rows"]), 1)
-        self.assertEqual(second["seq"], first["seq"])
+        self.assertEqual(second["rows"][0]["Qty"], "9")
+        # A retry must NOT reuse the seq: if the previous mail did in fact
+        # go out, the receiver would skip this one as an already-applied
+        # duplicate and lose anything newly added to it.
+        self.assertNotEqual(second["seq"], first["seq"])
+
+    def test_a_retry_after_an_uncertain_send_is_still_applied(self):
+        """The crash window: mail went out, the app died before the marker
+        advanced. The retry has to land, not be swallowed as a duplicate."""
+        row_id = self._seed()
+        storage_service.update_current_sheet_field(row_id, "Qty", "9")
+
+        sent = storage_service.build_current_sheet_sync_payload()
+        # ...crash here: the mail was delivered, advance_sync_state never ran...
+        storage_service.update_current_sheet_field(row_id, "Qty", "11")
+        retry = storage_service.build_current_sheet_sync_payload()
+
+        receiver = _ReceiverHarness(self)
+        self.assertTrue(receiver.apply(sent)["applied"])
+        result = receiver.apply(retry)
+        self.assertTrue(result["applied"], "retry was wrongly skipped as a duplicate")
+        self.assertEqual(receiver.qty(), "11")
 
     def test_advancing_after_a_successful_send_clears_the_queue(self):
         row_id = self._seed()

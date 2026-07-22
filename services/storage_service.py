@@ -1641,23 +1641,60 @@ def get_sync_state(direction=CURRENT_SHEET_SYNC_DIRECTION):
         conn.close()
 
 
+def reserve_sync_seq(direction=CURRENT_SHEET_SYNC_DIRECTION):
+    """
+    Burns and returns the next sequence number, BEFORE the send is
+    attempted.
+
+    Deliberately separate from advance_sync_state, and deliberately not
+    conditional on the send working. A seq is only a duplicate-detection
+    token on the receiving end, and gaps in it mean nothing (unlike the
+    snapshot channel's counter, apply_sync_payload does no ordering or
+    supersede check -- it only asks "have I applied this exact one").
+
+    Reusing a seq after an uncertain send is the dangerous option: if the
+    mail did go out, the retry would carry the SAME seq plus any rows
+    edited in the meantime, and the receiver would skip the whole payload
+    as an already-applied duplicate -- silently dropping those newer rows.
+    Burning it up front means a retry always looks like a new payload and
+    gets applied; re-applying rows that did arrive is a harmless identical
+    overwrite.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT next_seq FROM sync_state WHERE direction = ?", (direction,)
+        ).fetchone()
+        seq = int(row[0] or 1) if row else 1
+        conn.execute(
+            "INSERT INTO sync_state (direction, last_synced_at, next_seq) VALUES (?, NULL, ?) "
+            "ON CONFLICT(direction) DO UPDATE SET next_seq = ?",
+            (direction, seq + 1, seq + 1),
+        )
+        conn.commit()
+        return seq
+    finally:
+        conn.close()
+
+
 def advance_sync_state(synced_at, direction=CURRENT_SHEET_SYNC_DIRECTION):
     """
-    Records that everything edited up to synced_at has been sent, and burns
-    this direction's sequence number.
+    Records that everything edited up to synced_at has been sent.
 
     Call this ONLY after a send has actually succeeded. Everything about
     the change feed depends on that ordering: the marker is what decides
     which rows are considered already-delivered, so advancing it for a send
     that then failed would drop those edits from every future payload and
     they would never reach the other user.
+
+    The sequence number is NOT touched here -- it's burned up front by
+    reserve_sync_seq, for the reason given there.
     """
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.execute(
-            "INSERT INTO sync_state (direction, last_synced_at, next_seq) VALUES (?, ?, 2) "
-            "ON CONFLICT(direction) DO UPDATE SET "
-            "last_synced_at = excluded.last_synced_at, next_seq = sync_state.next_seq + 1",
+            "INSERT INTO sync_state (direction, last_synced_at, next_seq) VALUES (?, ?, 1) "
+            "ON CONFLICT(direction) DO UPDATE SET last_synced_at = excluded.last_synced_at",
             (direction, synced_at),
         )
         conn.commit()
@@ -1687,7 +1724,8 @@ def build_current_sheet_sync_payload(direction=CURRENT_SHEET_SYNC_DIRECTION):
     return {
         "kind": "sheet",
         "device_id": get_device_id(),
-        "seq": state["next_seq"],
+        # Burned now, not after the send -- see reserve_sync_seq.
+        "seq": reserve_sync_seq(direction),
         "generated_at": _now_stamp(),
         "cutoff": cutoff,
         "rows": rows,
