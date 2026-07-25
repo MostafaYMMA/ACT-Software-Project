@@ -107,6 +107,25 @@ KEYWORD_PATTERNS = [
     (kw, re.compile(re.escape(kw), re.IGNORECASE)) for kw in KEYWORDS
 ]
 
+# services/outlook_service.py's private cross-device sync mail (see that
+# module's _SUBJECT_PREFIX/_SUBJECT_PATTERN) is never a real client email --
+# but its own payload attachment is a real .xlsx whose "Status" column
+# literally contains the words "Approved"/"Pending"/"Rejected", and whose
+# "Project Number"/"Project Name" headers contain "Project". Scanned like
+# any other attachment, that would trip BOTH the loose timecard
+# attachment-keyword match below AND the expense filter's three-term match,
+# so a sync mail must be recognized and skipped before either ever opens
+# its attachments. Duplicated here (rather than imported from
+# outlook_service) to keep the two modules' matching logic independent, per
+# outlook_service.py's own module docstring -- this is just the one string
+# both sides need to agree on to avoid ever mismatching the other's mail.
+_SYNC_MAIL_SUBJECT_PREFIX = "ACT-SYNC"
+
+
+def is_sync_mail_subject(subject):
+    return bool(subject) and subject.strip().upper().startswith(_SYNC_MAIL_SUBJECT_PREFIX)
+
+
 # --- Expense Report logic -- a SEPARATE filter from the timecard logic
 #     above. A match requires ALL THREE terms below to be present
 #     (checked across subject + body + attachment text combined), not
@@ -628,6 +647,8 @@ def process_email_expense(item, temp_dir):
     are present somewhere in the email, or None if not matched.
     """
     subject = getattr(item, "Subject", "") or ""
+    if is_sync_mail_subject(subject):
+        return None
 
     try:
         sender = item.SenderName
@@ -704,7 +725,10 @@ def process_email_expense(item, temp_dir):
 def process_email(item, temp_dir, counters):
     """
     Process a single MailItem. Every attachment is opened and scanned
-    regardless of subject content.
+    regardless of subject content -- EXCEPT this app's own private
+    cross-device sync mail (see is_sync_mail_subject), which is skipped
+    outright before anything is counted or opened, never a candidate for
+    the timecard match at all.
 
     MATCH RULE:
       - Subject alone NEVER triggers a match (informational only).
@@ -719,6 +743,9 @@ def process_email(item, temp_dir, counters):
         did not match. This return value is what get_approved_cards()
         collects into its matching_emails list.
     """
+    if is_sync_mail_subject(getattr(item, "Subject", "") or ""):
+        return None
+
     counters.total_emails += 1
 
     try:

@@ -51,10 +51,32 @@ class LocalUpdateWorkerProjectTypeTests(unittest.TestCase):
 
         self.assertEqual(mocked.call_args.kwargs["project_type"], "hospitality")
 
-    def test_history_and_current_sheet_construct_it_the_same_way(self):
-        """Both pages own an Update button backed by this one class; a call
-        site passing the wrong number of arguments raises the moment the
-        button is clicked, which no import-time check would catch."""
+    def test_refresh_worker_accepts_a_project_type(self):
+        from ui.sync_workers import RefreshWorker
+
+        worker = RefreshWorker("beverage")
+        self.assertEqual(worker.project_type, "beverage")
+
+    def test_refresh_worker_still_works_with_no_project_type(self):
+        from ui.sync_workers import RefreshWorker
+
+        self.assertIsNone(RefreshWorker().project_type)
+
+    def test_the_division_reaches_rebuild_active_export(self):
+        import ui.sync_workers as sync_workers
+
+        worker = sync_workers.RefreshWorker("hospitality")
+        with patch.object(sync_workers, "rebuild_active_export", return_value={}) as mocked:
+            worker.run()
+
+        self.assertEqual(mocked.call_args.kwargs["project_type"], "hospitality")
+
+    def test_history_and_current_sheet_construct_update_the_same_way(self):
+        """Both pages' Update button is local-only and unconditional now
+        (RefreshWorker, not the old toggle-dependent LocalUpdateWorker/
+        UpdateWorker split) -- a call site passing the wrong number of
+        arguments raises the moment the button is clicked, which no
+        import-time check would catch."""
         import inspect
 
         from ui.Pages import CurrentSheet, History
@@ -62,8 +84,12 @@ class LocalUpdateWorkerProjectTypeTests(unittest.TestCase):
         for module in (History, CurrentSheet):
             source = inspect.getsource(module)
             self.assertIn(
-                "LocalUpdateWorker(project_type_settings.project_type)", source,
-                msg=f"{module.__name__} does not pass a project type to LocalUpdateWorker",
+                "RefreshWorker(project_type_settings.project_type)", source,
+                msg=f"{module.__name__} does not pass a project type to RefreshWorker",
+            )
+            self.assertNotIn(
+                "LocalUpdateWorker", source,
+                msg=f"{module.__name__} still references the removed toggle-dependent LocalUpdateWorker",
             )
 
 

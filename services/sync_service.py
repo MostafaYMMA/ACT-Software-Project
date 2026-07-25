@@ -136,10 +136,10 @@ def sync_cards(progress_callback=None):
 # Email/partner sync: pulling in what the other user sent, and pushing
 # out what this device has scanned. See storage_service.py for why each
 # of these is safe to call repeatedly / out of order / with stale mail
-# still sitting in the inbox. Only used when the Settings page's Sync
-# switch is on (see ui/Pages/History.py's _sync_enabled()) -- when it's
-# off, local_update/local_finalize below run instead, with no mail
-# involved at all.
+# still sitting in the inbox. Driven by the Current Sheet page's Sync
+# button (UpdateWorker, ui/sync_workers.py) and by Finalize when a sync
+# partner is configured -- local_finalize below runs instead when there
+# is no partner, with no mail involved at all.
 # ----------------------------------------------------------------------
 
 def pull_updates(progress_callback=None):
@@ -481,13 +481,12 @@ def sharepoint_finalize(folder, progress_callback=None, project_type=None, print
 
 
 # ----------------------------------------------------------------------
-# Local-only equivalents, used when the "Sync" switch on the Settings
-# page is turned off (see ui/Pages/Settings.py's SYNC_ENABLED_KEY and
-# ui/Pages/History.py's _sync_enabled()). Same end results as the
-# functions above -- new mail gets scanned in, a Finalize still exports
-# and closes out the period locally -- just with no pull from, push to,
-# or notification of another device, and therefore no partner email
-# required at all.
+# Local-only equivalents -- used by LocalFinalizeWorker (ui/sync_workers.py)
+# when Finalize runs with no sync partner configured. Same end results as
+# the functions above -- new mail gets scanned in, a Finalize still exports
+# and closes out the period locally -- just with no pull from, push to, or
+# notification of another device, and therefore no partner email required
+# at all.
 # ----------------------------------------------------------------------
 
 def local_update(project_type=None, progress_callback=None):

@@ -1426,13 +1426,21 @@ def sync_current_sheet(conn):
     """, rows)
 
 
-def get_current_sheet_rows():
+def get_current_sheet_rows(project_type=None):
     """Every current_sheet row as a dict, newest work-date first. Includes
     the internal id and timecard_id -- the UI needs the id to save an edit,
-    and table_utils.HIDDEN_COLUMNS already keeps both off screen."""
+    and table_utils.HIDDEN_COLUMNS already keeps both off screen.
+
+    project_type ("beverage"/"hospitality", or None for every project)
+    narrows to one division, by the same "Project Name" prefix rule as
+    everywhere else (_project_type_clause) -- same convention the
+    Dashboard/Export History toggle already uses."""
+    where, params = _project_type_clause(project_type)
+    where_sql = f" WHERE {where}" if where else ""
+
     conn = sqlite3.connect(DB_PATH)
     try:
-        cursor = conn.execute('SELECT * FROM current_sheet')
+        cursor = conn.execute(f'SELECT * FROM current_sheet{where_sql}', params)
         columns = [desc[0] for desc in cursor.description]
         rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
     finally:
@@ -1440,6 +1448,42 @@ def get_current_sheet_rows():
 
     rows.sort(key=lambda r: r.get("Date") or "", reverse=True)
     return rows
+
+
+def prune_old_month_current_sheet_rows(reference_date=None):
+    """
+    Deletes current_sheet rows whose "Date" isn't in the current calendar
+    month -- a one-time/on-demand cleanup, NOT something sync_current_sheet
+    calls automatically on every scan. Doing it on every scan would fight
+    Finalize: current_sheet only ever grows on its own (see
+    sync_current_sheet's own docstring, "a re-scan can only ever ADD rows
+    here") specifically so nothing but a deliberate Finalize ever discards
+    unfinished work. This function is that deliberate action, invoked
+    explicitly (e.g. from a maintenance script or an explicit "clean up
+    old records" UI action), not wired into any automatic path.
+
+    reference_date: a 'YYYY-MM-DD' string or date to treat as "today" --
+    defaults to the real today. Only the year/month are used.
+
+    Returns the number of rows deleted.
+    """
+    if reference_date is None:
+        current_month = date.today().strftime("%Y-%m")
+    elif isinstance(reference_date, str):
+        current_month = reference_date[:7]
+    else:
+        current_month = reference_date.strftime("%Y-%m")
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cursor = conn.execute(
+            'DELETE FROM current_sheet WHERE "Date" IS NOT NULL AND SUBSTR("Date", 1, 7) != ?',
+            (current_month,),
+        )
+        conn.commit()
+        return cursor.rowcount
+    finally:
+        conn.close()
 
 
 def update_current_sheet_field(row_id, column, value):
@@ -1451,9 +1495,17 @@ def update_current_sheet_field(row_id, column, value):
     safe -- and the internal columns are refused. Returns True when a row
     was updated; False for an unknown/refused column or a missing id.
 
-    Edits stay in current_sheet. They are deliberately NOT written back to
-    timecards_approved: this table is a working copy, and the scanned
-    record is the record of what actually arrived.
+    Edits stay in current_sheet -- deliberately NOT written back to
+    timecards_approved, since this table is a working copy and the
+    scanned record is the record of what actually arrived -- EXCEPT
+    "rate", which also gets pushed into timecards_approved via
+    update_status_record_field (see below). rate is the one field the
+    cross-device sync payload actually carries (SNAPSHOT_COLUMNS,
+    build_outgoing_snapshot, _apply_rate_if_newer all already read/merge
+    it against timecards_approved.rate) -- current_sheet.rate itself
+    isn't read by the snapshot and has no rate_updated_at/rate_updated_by
+    to merge with, so without this a rate typed into Current Sheet would
+    stay on this device forever, never reaching the other user.
     """
     if column in ("id", "timecard_id", "row_color"):
         return False
@@ -1470,10 +1522,21 @@ def update_current_sheet_field(row_id, column, value):
             )
         except sqlite3.IntegrityError:
             return False
+        updated = cursor.rowcount > 0
+        timecard_id = None
+        if updated and column == "rate":
+            row = conn.execute(
+                "SELECT timecard_id FROM current_sheet WHERE id = ?", (row_id,)
+            ).fetchone()
+            timecard_id = row[0] if row else None
         conn.commit()
-        return cursor.rowcount > 0
     finally:
         conn.close()
+
+    if updated and column == "rate" and timecard_id is not None:
+        update_status_record_field("approve", timecard_id, "rate", value)
+
+    return updated
 
 
 def set_current_sheet_row_color(row_id, hex_color):
@@ -2392,6 +2455,17 @@ def _apply_rate_if_newer(conn, status_label, natural_key, rate, updated_at, upda
         f'UPDATE "{table_name}" SET rate = ?, rate_updated_at = ?, rate_updated_by = ? WHERE id = ?',
         (rate, updated_at, updated_by, record_id),
     )
+    if status_label == "Approved":
+        # current_sheet.rate is a separate column from timecards_approved.rate
+        # (see update_current_sheet_field) -- without this, the merge above
+        # would land correctly in timecards_approved but Current Sheet itself
+        # (which reads current_sheet, not timecards_approved) would keep
+        # showing whatever rate that row had when sync_current_sheet first
+        # linked it, silently going stale on the receiving device.
+        conn.execute(
+            "UPDATE current_sheet SET rate = ? WHERE timecard_id = ?",
+            (rate, record_id),
+        )
     return True
 
 
