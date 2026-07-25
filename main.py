@@ -27,7 +27,7 @@ or signals are changed.
 """
 import sys
 import os
-
+from startup import enable_startup, startup_enabled
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -170,6 +170,10 @@ class RootWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    # Register OSMO to start with Windows (only once)
+    if not startup_enabled():
+        enable_startup()
+
     app = QApplication(sys.argv)
 
     # Fusion draws every widget itself instead of delegating to the native
