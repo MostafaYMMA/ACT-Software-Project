@@ -19,6 +19,35 @@ from PySide6.QtCore import QObject, Signal
 from sync_service import (
     update_with_other_user, finalize_month, local_update, local_finalize,
 )
+from storage_service import rebuild_active_export
+
+
+class RefreshWorker(QObject):
+    """The 'Update' button's ONE behavior, unconditionally: reread what's
+    already in the local database (put there by a prior Scan Inbox) and
+    top up the active export file from it. Never touches Outlook, never
+    contacts the other device, never depends on any setting -- unlike
+    local_update() (used by "Sync" instead of this), which also runs a
+    fresh inbox scan. rebuild_active_export itself only reads the
+    database (see its own docstring: "scanning the inbox is Scan Inbox's
+    job")."""
+    progress = Signal(str)
+    finished = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, project_type=None):
+        super().__init__()
+        self.project_type = project_type
+
+    def run(self):
+        try:
+            if self.progress:
+                self.progress.emit("Updating the export file...")
+            result = rebuild_active_export(project_type=self.project_type)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.finished.emit({"export": result})
 
 
 class UpdateWorker(QObject):

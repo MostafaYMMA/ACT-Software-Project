@@ -17,8 +17,9 @@ scan untouched.
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget,
     QTableWidgetItem, QMenu, QToolButton, QMessageBox, QStyle, QStyledItemDelegate,
+    QButtonGroup,
 )
-from PySide6.QtCore import Qt, QThread, QSettings, QTimer, QDate, QEvent
+from PySide6.QtCore import Qt, QThread, QTimer, QDate, QEvent
 from PySide6.QtGui import QColor, QIcon, QPixmap, QFontMetrics
 
 from ui.theme_manager import theme_manager
@@ -26,20 +27,14 @@ from ui.theme_utils import apply_live_style
 from ui.project_type_settings import project_type_settings
 from ui.sync_partner_settings import sync_partner_settings
 from ui.sync_workers import (
-    UpdateWorker, LocalUpdateWorker, FinalizeWorker, LocalFinalizeWorker,
+    RefreshWorker, UpdateWorker, FinalizeWorker, LocalFinalizeWorker,
 )
-from ui.profile_circle import SETTINGS_ORG, SETTINGS_APP
 from ui.table_utils import order_columns, configure_grid, fit_columns, HEADER_LABELS
 from ui.transition import reveal_rows
 from storage_service import (
     get_current_sheet_rows, update_current_sheet_field, set_current_sheet_row_color,
-    get_active_export_path, get_last_export_date,
+    get_active_export_path, get_last_export_date, PROJECT_TYPE_LABELS,
 )
-
-# Same key ui/Pages/Settings.py's Sync switch writes to, read the same way
-# ui/Pages/History.py reads it -- the Update button below is the same
-# button, so it has to make the same sync-on/sync-off choice.
-SYNC_ENABLED_KEY = "sync_enabled"
 
 # Columns the user shouldn't retype: "Date" and "received" are what the
 # scan actually saw, and rewriting them here would put the row out of step
@@ -191,7 +186,6 @@ class RowTintDelegate(QStyledItemDelegate):
 class CurrentSheetPage(QWidget):
     def __init__(self):
         super().__init__()
-        self._settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
         self._displayed_columns = []
         self._displayed_rows = []
         self._populating_table = False
@@ -219,10 +213,52 @@ class CurrentSheetPage(QWidget):
         apply_live_style(subtitle, lambda c: f"font-size: 12px; color: {c['TEXT_SECONDARY']};")
         layout.addWidget(subtitle)
 
-        # The same Update button as the Export History page -- literally the
-        # same workers behind it (ui/sync_workers.py), making the same
-        # sync-on/off choice, so clicking it here does exactly what clicking
-        # it there does.
+        # Project type: same "All / Food & Beverage / Hospitality" toggle
+        # as Dashboard and Export History, reusing the same shared
+        # singleton -- picking a division here keeps those two pages in
+        # sync and vice versa. Filters which rows the table below shows.
+        type_row = QHBoxLayout()
+        type_row.setSpacing(8)
+
+        type_label = QLabel("Project type:")
+        apply_live_style(type_label, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 12px;")
+        type_row.addWidget(type_label)
+
+        self._project_type_group = QButtonGroup(self)
+        self._project_type_group.setExclusive(True)
+        self._project_type_buttons = {}
+
+        type_defs = [(None, "All")] + list(PROJECT_TYPE_LABELS.items())
+        for project_type, label in type_defs:
+            button = QPushButton(label)
+            button.setObjectName("periodToggle")
+            button.setCheckable(True)
+            button.setChecked(project_type == project_type_settings.project_type)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.toggled.connect(
+                lambda checked, value=project_type: self._on_project_type_toggled(value) if checked else None
+            )
+            self._project_type_group.addButton(button)
+            self._project_type_buttons[project_type] = button
+            type_row.addWidget(button)
+
+        # Keeps this page's buttons in lockstep with Dashboard's/Export
+        # History's (and vice versa) - toggling one is what fires this,
+        # on every page.
+        project_type_settings.project_type_changed.connect(self._sync_project_type_selection)
+
+        type_row.addStretch()
+        layout.addLayout(type_row)
+
+        # Update and Sync are two distinct things, not one button whose
+        # behavior used to change based on a settings toggle:
+        #   Update -- local only. Rereads what Scan Inbox already put in
+        #             the database and tops up the export file. Never
+        #             touches Outlook, never contacts the other device,
+        #             identical every time it's clicked.
+        #   Sync   -- cross-device, email-based. Pushes this device's
+        #             changes to the other user and pulls/applies theirs.
+        #             Lives ONLY here, not on Export History.
         controls_row = QHBoxLayout()
         controls_row.setSpacing(10)
 
@@ -230,11 +266,22 @@ class CurrentSheetPage(QWidget):
         self.update_btn.setObjectName("secondaryButton")
         self.update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.update_btn.setToolTip(
-            "Same Update as on the Export History page: pulls in anything the other "
-            "user has sent, pushes this device's data out, and tops up the export sheet."
+            "Refreshes this page and the export sheet from what's already in the "
+            "database (from a prior Scan Inbox). Local only -- never contacts the "
+            "other user's device or touches email."
         )
         self.update_btn.clicked.connect(self._on_update_clicked)
         controls_row.addWidget(self.update_btn)
+
+        self.sync_btn = QPushButton("Sync")
+        self.sync_btn.setObjectName("secondaryButton")
+        self.sync_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sync_btn.setToolTip(
+            "Sends this device's changes (new rows, rate edits, row colours) to the "
+            "other user by email, and pulls in whatever they've sent."
+        )
+        self.sync_btn.clicked.connect(self._on_sync_clicked)
+        controls_row.addWidget(self.sync_btn)
 
         self.finalize_btn = QPushButton("Finalize")
         self.finalize_btn.setObjectName("primaryButton")
@@ -285,6 +332,21 @@ class CurrentSheetPage(QWidget):
         self.refresh()
 
     # -----------------------------------------------------------------
+    # Project type filter
+    # -----------------------------------------------------------------
+    def _on_project_type_toggled(self, project_type):
+        project_type_settings.set_project_type(project_type)
+
+    def _sync_project_type_selection(self, project_type):
+        """Fires whenever EITHER page's project-type filter changes -
+        including from this page's own toggle above, in which case the
+        matching button is already checked and this is a no-op."""
+        button = self._project_type_buttons.get(project_type)
+        if button is not None:
+            button.setChecked(True)
+        self.refresh()
+
+    # -----------------------------------------------------------------
     # Loading / rendering
     # -----------------------------------------------------------------
     def refresh(self):
@@ -292,7 +354,7 @@ class CurrentSheetPage(QWidget):
         # one would tint whatever row happens to land there.
         self._cancel_ripple()
 
-        rows = get_current_sheet_rows()
+        rows = get_current_sheet_rows(project_type=project_type_settings.project_type)
         columns = order_columns(rows[0].keys()) if rows else []
         # row_color and its stamps are state, not data -- the colour shows
         # as the row's background and in the picker button, so columns of
@@ -588,32 +650,21 @@ class CurrentSheetPage(QWidget):
             self.table.viewport().update()
 
     # -----------------------------------------------------------------
-    # Update (the Export History page's button, same workers)
+    # Update -- local only, identical every click, no setting involved.
     # -----------------------------------------------------------------
-    def _sync_enabled(self):
-        return self._settings.value(SYNC_ENABLED_KEY, True, type=bool)
-
     def _set_controls_enabled(self, enabled):
-        """Both buttons move together: Finalize runs an Update first, so
-        letting one start while the other is mid-flight would have two
-        scans writing at once."""
+        """All three buttons move together: Finalize runs an Update and a
+        Sync first, so letting one start while another is mid-flight would
+        have two things writing to the database at once."""
         self.update_btn.setEnabled(enabled)
+        self.sync_btn.setEnabled(enabled)
         self.finalize_btn.setEnabled(enabled)
 
     def _on_update_clicked(self):
         self._set_controls_enabled(False)
+        self.status_label.setText("Updating...")
 
-        if self._sync_enabled():
-            self.status_label.setText("Updating...")
-            self._update_worker = UpdateWorker(
-                sync_partner_settings.partner_email, project_type_settings.project_type,
-            )
-        else:
-            self.status_label.setText("Updating (sync is off - local scan only)...")
-            # Same division the sync-on branch above passes -- the toggle
-            # has to mean the same thing whichever way the Sync switch is set.
-            self._update_worker = LocalUpdateWorker(project_type_settings.project_type)
-
+        self._update_worker = RefreshWorker(project_type_settings.project_type)
         self._update_thread = QThread(self)
         self._update_worker.moveToThread(self._update_thread)
 
@@ -630,8 +681,6 @@ class CurrentSheetPage(QWidget):
     def _on_update_finished(self, _result):
         self._set_controls_enabled(True)
         self.status_label.setText("Update finished.")
-        # A scan can only ever ADD rows here, so this brings in whatever is
-        # new without disturbing anything already on screen.
         self.refresh()
 
     def _on_update_failed(self, message):
@@ -640,7 +689,55 @@ class CurrentSheetPage(QWidget):
         QMessageBox.warning(self, "Couldn't finish", message)
 
     # -----------------------------------------------------------------
-    # Finalize (the Export History page's button, same workers)
+    # Sync -- cross-device, email-based. Only check here is whether a
+    # partner email is configured; it never depends on any setting.
+    # -----------------------------------------------------------------
+    def _on_sync_clicked(self):
+        email = sync_partner_settings.partner_email
+        if not email:
+            QMessageBox.information(
+                self, "No sync partner set",
+                "Set the other user's email address in Settings first "
+                "(Settings -> Sync) before using Sync.",
+            )
+            return
+
+        self._set_controls_enabled(False)
+        self.status_label.setText("Syncing...")
+
+        self._sync_worker = UpdateWorker(email, project_type_settings.project_type)
+        self._sync_thread = QThread(self)
+        self._sync_worker.moveToThread(self._sync_thread)
+
+        self._sync_thread.started.connect(self._sync_worker.run)
+        self._sync_worker.progress.connect(self.status_label.setText)
+        self._sync_worker.finished.connect(self._on_sync_finished)
+        self._sync_worker.failed.connect(self._on_sync_failed)
+        self._sync_worker.finished.connect(self._sync_thread.quit)
+        self._sync_worker.failed.connect(self._sync_thread.quit)
+        self._sync_thread.finished.connect(self._sync_thread.deleteLater)
+
+        self._sync_thread.start()
+
+    def _on_sync_finished(self, _result):
+        self._set_controls_enabled(True)
+        self.status_label.setText("Sync finished.")
+        # A sync can only ever ADD/merge rows here, so this brings in
+        # whatever is new without disturbing anything already on screen.
+        self.refresh()
+
+    def _on_sync_failed(self, message):
+        self._set_controls_enabled(True)
+        self.status_label.setText("Sync failed - nothing was changed.")
+        QMessageBox.warning(self, "Couldn't finish", message)
+
+    # -----------------------------------------------------------------
+    # Finalize (the Export History page's button, same workers) -- keeps
+    # doing a full Update AND a full cross-device Sync before producing
+    # the final export: finalizing needs the most complete picture from
+    # both users. Whether the cross-device half runs depends only on
+    # whether a partner email is configured (same check Sync itself
+    # uses) -- there is no separate on/off setting anymore.
     # -----------------------------------------------------------------
     def _finalize_period(self):
         """The range Finalize closes out.
@@ -660,8 +757,8 @@ class CurrentSheetPage(QWidget):
         return end.addDays(-(end.day() - 1)).toString("yyyy-MM-dd"), end.toString("yyyy-MM-dd")
 
     def _on_finalize_clicked(self):
-        sync_on = self._sync_enabled()
-        email = sync_partner_settings.partner_email if sync_on else None
+        email = sync_partner_settings.partner_email
+        sync_on = bool(email)
         start_str, end_str = self._finalize_period()
 
         active_path = get_active_export_path()
@@ -670,20 +767,14 @@ class CurrentSheetPage(QWidget):
             if active_path else "the export sheet is created and closed"
         )
         message = f"This closes out {start_str} to {end_str}.\n\n"
-        if not sync_on:
+        if sync_on:
             message += (
-                f"One last local scan runs first, then {sheet_text}.\n\n"
-                "Sync is currently off, so this closes out the period locally only - "
-                "no other user will be notified.\n\n"
-            )
-        elif email:
-            message += (
-                f"One last Update runs first, then {sheet_text} and {email} is "
+                f"One last Update and Sync run first, then {sheet_text} and {email} is "
                 "notified so both apps agree the period is closed.\n\n"
             )
         else:
             message += (
-                f"One last Update runs first, then {sheet_text}.\n\n"
+                f"One last local Update runs first, then {sheet_text}.\n\n"
                 "No sync partner is set, so nobody will be notified - the period "
                 "closes on this machine only.\n\n"
             )
