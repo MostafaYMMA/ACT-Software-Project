@@ -151,17 +151,19 @@ def _header_fields(text):
 
 
 def _merge_header_fields(texts):
-    """Document-level name/period/person_number for one EMAIL, resolved once
-    across ALL of its text sources (body + matching attachments) rather than
-    separately per source -- so a day-entry's identity doesn't depend on
-    which particular text blob happened to contain the labelled header line.
-    PDFs squeeze "Period Person Number Time Card Status" onto one line that
-    a plain-text email body covering the same timecard often doesn't
-    reproduce; resolving per-source used to give the body's day-entries a
-    different (blank) person_number than the attachment's day-entries for
-    the same real day, so both got inserted as separate, permanently
-    duplicated rows instead of one being recognized as the other's update.
-    First non-empty value found wins, in text order (body first)."""
+    """Email-level FALLBACK name/period/person_number, resolved once across ALL
+    of one email's text sources (body + matching attachments). First non-empty
+    value found wins, in text order (body first).
+
+    This exists because a PDF squeezes "Period Person Number Time Card Status"
+    onto one line that a plain-text email body covering the same timecard often
+    doesn't reproduce -- so the body's day-entries, taken alone, would get a
+    blank person_number and be inserted as separate, permanently duplicated
+    rows instead of being recognized as the attachment day-entry's update.
+    A source that lacks its own header line borrows these merged values (see
+    extract()); a source that HAS its own uses its own, so two attachments
+    covering two different periods are each tagged with their own period
+    rather than both inheriting the first one's."""
     merged = {"name": None, "period": None, "person_number": None}
     for text in texts:
         fields = _header_fields(text)
@@ -243,17 +245,28 @@ def extract(email):
         if att.get("matches_keyword"):
             texts.append(att.get("text") or "")
 
-    header_fields = _merge_header_fields(texts)
+    # Email-level values are only a fallback: a text source that carries its
+    # own "Period Person Number" header line (each timecard PDF does) uses its
+    # own, so one email bundling two PDFs for two different periods tags each
+    # PDF's day-entries with that PDF's real period instead of both inheriting
+    # the first one's. A source without its own header line (typically the
+    # plain-text body) borrows the merged value so its day-entries still line
+    # up with the attachment's -- see _merge_header_fields.
+    email_fields = _merge_header_fields(texts)
 
     entries = []
     for text in texts:
+        source_fields = _header_fields(text)
+        name = source_fields["name"] or email_fields["name"]
+        period = source_fields["period"] or email_fields["period"]
+        person_number = source_fields["person_number"] or email_fields["person_number"]
         for day, block in _day_blocks(text):
             entry = _parse_block(day, block)
             if entry is None:
                 continue
-            entry["name"] = header_fields["name"]
-            entry["period"] = header_fields["period"]
-            entry["person_number"] = header_fields["person_number"]
+            entry["name"] = name
+            entry["period"] = period
+            entry["person_number"] = person_number
             entry["subject"] = subject
             entry["sender"] = sender
             entry["received"] = received

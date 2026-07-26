@@ -216,10 +216,11 @@ def pull_updates(progress_callback=None):
     any time, any number of times -- every kind of incoming message is
     idempotent on the receiving end.
 
-    Still used by the Update/Sync button flow (update_with_other_user).
-    Scan Inbox uses pull_collected_updates instead, which reuses mail
-    items the regular scan already walked past rather than doing a
-    second, redundant walk just for this.
+    Fallback / manual-trigger path only -- it has no live callers. The
+    Update/Sync button (update_with_other_user) is push-only and does NOT
+    pull; Scan Inbox pulls via pull_collected_updates, which reuses mail
+    items the regular scan already walked past rather than doing a second,
+    redundant walk just for this. Both paths share _apply_sync_messages.
     """
 
     def report(msg):
@@ -384,9 +385,9 @@ def finalize_month(recipient_email, start_date, end_date, project_type=None, pro
     """
     The 'Finalize' button (sync on), called AFTER the user has confirmed
     in the UI. Order matters here:
-      1. A full Update pass -- pull, push, and one last top-up of the
-         active export file -- so nothing sent moments ago on either side
-         is missed right before the boundary moves.
+      1. A full Update pass -- push and one last top-up of the active
+         export file (update_with_other_user is push-only; it does not
+         pull the partner's last-minute edits before the boundary moves).
       2. Close that file out: log it in export_history, advance
          get_last_export_date, and clear the active-export pointer so the
          next Update opens a NEW file and starts filling that one. The
@@ -394,10 +395,10 @@ def finalize_month(recipient_email, start_date, end_date, project_type=None, pro
          nothing is re-exported into a separate one.
       3. Mail the other user a "finalize" notice: the closed file itself,
          plus a closing snapshot so their data is fully caught up too.
-         Their app applies this specially (see pull_updates above) --
-         logged into THEIR export_history and THEIR last_export_date is
-         advanced too, so the boundary is shared rather than tracked
-         per-machine.
+         Their app applies this specially (via pull_collected_updates ->
+         _apply_sync_messages, on their next Scan Inbox) -- logged into
+         THEIR export_history and THEIR last_export_date is advanced too,
+         so the boundary is shared rather than tracked per-machine.
 
     Note there is no output_path argument: the file being finalized is
     whichever one Update has been filling, not one chosen at save time.

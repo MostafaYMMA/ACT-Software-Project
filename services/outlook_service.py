@@ -205,10 +205,13 @@ def scan_sync_mails(folder_name="Inbox", limit=200):
     """
     Finds every UNREAD sync mail (see _SUBJECT_PATTERN) with its OWN
     dedicated Outlook folder walk, reads its .xlsx payload and any extra
-    attachments, and marks it read once handled. Still used by the
-    Update/Sync button flow (sync_service.pull_updates); Scan Inbox no
-    longer calls this -- see read_collected_sync_mails, which reuses mail
-    items the regular scan already walked past instead of a second walk.
+    attachments, and marks it read once handled. This dedicated-walk path
+    is now a fallback/manual trigger only: NEITHER the Update/Sync button
+    (which is push-only -- see sync_service.update_with_other_user) NOR
+    Scan Inbox call it. Scan Inbox instead uses read_collected_sync_mails,
+    which reuses mail items the regular scan already walked past instead of
+    doing a second walk. sync_service.pull_updates still backs onto this
+    function but has no live callers of its own.
 
     Returns (messages, temp_dir):
       messages: list of {kind, device_id, seq, payload, extra_paths,
