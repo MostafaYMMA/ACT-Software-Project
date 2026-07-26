@@ -1012,7 +1012,7 @@ def get_newest_received(folder_name="Inbox"):
 
 
 def get_approved_cards(folder_name="Inbox", print_report=True, limit=None,
-                        start_date=None, end_date=None):
+                        start_date=None, end_date=None, sync_mail_items=None):
     """
     Connect to Outlook, scan the given folder (Inbox by default) using
     the same single-pass logic as main(), and return the list of
@@ -1038,6 +1038,18 @@ def get_approved_cards(folder_name="Inbox", print_report=True, limit=None,
                      newest-first, an email older than start_date ends
                      the scan immediately rather than counting against
                      `limit`.
+        sync_mail_items: optional list this function appends raw
+                     cross-device sync-mail items to (see
+                     outlook_service._SUBJECT_PREFIX/is_sync_mail_subject)
+                     as it walks past them, instead of just skipping them.
+                     Lets sync_service.sync_cards pick up sync mail from
+                     THIS SAME Outlook walk rather than a second, separate
+                     one (see outlook_service.read_collected_sync_mails) --
+                     purely additive, default None preserves the old
+                     behavior exactly (sync mail silently skipped here,
+                     same as always). A sync-mail item appended here is
+                     never handed to process_email -- no attachment on it
+                     is opened during this walk either way.
 
     Returns:
         matching_emails: list of dicts, one per matched email, in the
@@ -1075,6 +1087,10 @@ def get_approved_cards(folder_name="Inbox", print_report=True, limit=None,
                         continue  # newer than the window -- keep scanning
                     if start_date is not None and received_at < start_date:
                         break  # newest-first order: nothing after this is in range
+
+                if sync_mail_items is not None and is_sync_mail_subject(getattr(item, "Subject", "") or ""):
+                    sync_mail_items.append(item)
+                    continue  # never handed to process_email -- no attachment opened here
 
                 matched_email = process_email(item, temp_dir, counters)
                 if matched_email is not None:

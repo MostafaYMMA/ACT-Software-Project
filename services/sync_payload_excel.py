@@ -22,18 +22,50 @@ Layout -- two sheets, present as the payload kind needs them:
 """
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill
 
 from storage_service import SNAPSHOT_COLUMNS
 
 _ROW_KEYS = [key for key, _label in SNAPSHOT_COLUMNS]
+
+# Shared look for both sheets' header row -- without this every column was
+# sized off the HEADER LABEL's length only, never the data actually written
+# into it, so a long "Project Name"/"Subject"/etc value just overflowed or
+# got visually truncated next to another filled cell: this is what a user
+# reported as the attachment looking like "garbage" when opened in Excel.
+_HEADER_FONT = Font(bold=True, color="FFFFFF")
+_HEADER_FILL = PatternFill("solid", fgColor="4A4A4A")
+_MAX_COLUMN_WIDTH = 60
+
+
+def _style_header_row(ws, last_column):
+    for col in range(1, last_column + 1):
+        cell = ws.cell(row=1, column=col)
+        cell.font = _HEADER_FONT
+        cell.fill = _HEADER_FILL
+    ws.freeze_panes = "A2"
+
+
+def _autosize_columns(ws, header_labels):
+    """Widens each column to fit the longest value actually written into
+    it (header included), not just the header label -- capped so one huge
+    outlier (a long Subject line) can't blow the sheet out sideways."""
+    widths = [len(label) for label in header_labels]
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        for i, value in enumerate(row):
+            if value is None:
+                continue
+            widths[i] = max(widths[i], min(len(str(value)), _MAX_COLUMN_WIDTH))
+    for i, width in enumerate(widths, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = min(width + 2, _MAX_COLUMN_WIDTH)
 
 
 def _write_meta_sheet(ws, meta_items):
     ws.append(["Key", "Value"])
     for key, value in meta_items:
         ws.append([key, value])
-    ws.column_dimensions["A"].width = 20
-    ws.column_dimensions["B"].width = 40
+    _style_header_row(ws, last_column=2)
+    _autosize_columns(ws, ["Key", "Value"])
 
 
 def _read_meta_sheet(ws):
@@ -48,11 +80,12 @@ def _read_meta_sheet(ws):
 
 
 def _write_rows_sheet(ws, rows):
-    ws.append([label for _key, label in SNAPSHOT_COLUMNS])
+    labels = [label for _key, label in SNAPSHOT_COLUMNS]
+    ws.append(labels)
     for row in rows:
         ws.append([row.get(key) for key in _ROW_KEYS])
-    for i, (_key, label) in enumerate(SNAPSHOT_COLUMNS, start=1):
-        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = max(len(label) + 2, 12)
+    _style_header_row(ws, last_column=len(labels))
+    _autosize_columns(ws, labels)
 
 
 def _read_rows_sheet(ws):
@@ -122,8 +155,14 @@ def write_payload_workbook(payload, kind, output_path):
     _write_meta_sheet(meta_ws, meta_items)
 
     if rows is not None:
-        rows_ws = wb.create_sheet("Rows")
+        # Inserted BEFORE Meta and made the active sheet -- otherwise
+        # opening the attachment lands on the small kind/device_id/seq
+        # summary and the actual timecard rows sit unnoticed on a second
+        # tab nobody clicks (this is exactly what looked like "no records
+        # were sent" -- they were there, just not what greeted the eye).
+        rows_ws = wb.create_sheet("Rows", 0)
         _write_rows_sheet(rows_ws, rows)
+        wb.active = wb.sheetnames.index("Rows")
 
     wb.save(output_path)
 
