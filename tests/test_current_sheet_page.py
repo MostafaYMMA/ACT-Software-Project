@@ -45,6 +45,13 @@ class CurrentSheetPageTests(unittest.TestCase):
             'VALUES (1, ?, ?, ?, ?, ?)',
             ("Monday", "2026-07-06", "FB Kitchen", "T1", "8"),
         )
+        # The page only shows rows already written into an open active export
+        # (what Update/Finalize does); register the seeded row so it renders.
+        conn.execute(
+            "INSERT OR IGNORE INTO active_export_rows (timecard_id, added_at, export_path, finalized) "
+            "SELECT timecard_id, '2026-07-06 00:00:00', 'test.xlsx', 0 FROM current_sheet "
+            "WHERE timecard_id IS NOT NULL"
+        )
         conn.commit()
         conn.close()
 

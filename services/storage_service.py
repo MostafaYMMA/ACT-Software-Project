@@ -1452,7 +1452,7 @@ def sync_current_sheet(conn):
     """, rows)
 
 
-def get_current_sheet_rows(project_type=None):
+def get_current_sheet_rows(project_type=None, only_in_active_export=False):
     """Every current_sheet row as a dict, newest work-date first. Includes
     the internal id and timecard_id -- the UI needs the id to save an edit,
     and table_utils.HIDDEN_COLUMNS already keeps both off screen.
@@ -1460,9 +1460,25 @@ def get_current_sheet_rows(project_type=None):
     project_type ("beverage"/"hospitality", or None for every project)
     narrows to one division, by the same "Project Name" prefix rule as
     everywhere else (_project_type_clause) -- same convention the
-    Dashboard/Export History toggle already uses."""
+    Dashboard/Export History toggle already uses.
+
+    only_in_active_export (the Current Sheet page's mode): return ONLY rows
+    whose timecard has already been written into an open active export file
+    (a row in active_export_rows with finalized = 0). current_sheet itself
+    is filled by every Scan Inbox (sync_current_sheet, INSERT-only), but the
+    active export file is only topped up by Update/Finalize -- so gating on
+    it makes the page mirror the .xlsx: nothing before the first Update,
+    and a freshly scanned row stays hidden until the next Update pushes it
+    into the file. Editing/colour still work because these are the same
+    current_sheet rows (keyed by id), just filtered."""
     where, params = _project_type_clause(project_type)
-    where_sql = f" WHERE {where}" if where else ""
+    clauses = [where] if where else []
+    if only_in_active_export:
+        clauses.append(
+            "timecard_id IN (SELECT timecard_id FROM active_export_rows "
+            "WHERE finalized = 0)"
+        )
+    where_sql = (" WHERE " + " AND ".join(clauses)) if clauses else ""
 
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -2754,9 +2770,15 @@ def export_act_invoice_overview_range(start_date: str, end_date: str, output_pat
     """
     Exports approved timecard rows whose "Date" falls within
     [start_date, end_date] straight into the ACT "Invoice Overview per
-    Period" template layout (.xlsx) -- same query/filters/bookkeeping as
+    Period" template layout (.xlsx) -- same query/filters as
     export_summary_csv_range, but the file this produces opens as the
     proper template instead of a flat CSV.
+
+    Unlike the CSV export, this does NO export-state bookkeeping (no
+    is_exported flag, no last_export_date) -- see the end of the function.
+    It backs the Export History page's two standalone buttons, which are
+    intentionally independent of the Update/Sync/Finalize / current-sheet
+    accounting.
 
     Each timecard entry becomes a LABOR row immediately followed by an
     Expense row, mirroring the template's existing pattern:
@@ -2803,12 +2825,16 @@ def export_act_invoice_overview_range(start_date: str, end_date: str, output_pat
         conn.close()
         raise
 
-    conn.executemany(
-        "UPDATE timecards_approved SET is_exported = 1 WHERE id = ? AND is_exported != 1",
-        [(row[0],) for row in rows],
-    )
+    # Deliberately does NOT flag is_exported or move last_export_date: the
+    # two Export-History buttons (Export Last Month / Export Range) are
+    # standalone snapshots, fully decoupled from the Update/Sync/Finalize
+    # accounting. So exporting here never marks a record "already gone out"
+    # (which would otherwise change what the current-sheet/finalize flow
+    # considers new), and it never checks that flag either -- the query
+    # above filters on the date range alone, so a record already finalized
+    # through the Current Sheet is still included here. Only the export is
+    # logged, so the produced file still lists in the Export History table.
     _record_export(conn, os.path.basename(output_path), os.path.abspath(output_path))
-    _set_last_export_date(conn, end_date)
     conn.commit()
     conn.close()
     print(f"Exported {len(rows)} row(s) ({start_date} to {end_date}) to {output_path}")

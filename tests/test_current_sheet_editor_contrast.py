@@ -80,6 +80,9 @@ class CurrentSheetEditorContrastTests(unittest.TestCase):
         self.storage_service.save_cards([
             _entry("2026-07-01", "FB-100", "FB Kitchen", "T1", "P1", "2026-07-01 09:00:00"),
         ])
+        # The page now only shows rows already written into an active export
+        # (Update/Finalize), so mirror an Update here before building it.
+        self.storage_service.rebuild_active_export()
         row_id = self.storage_service.get_current_sheet_rows()[0]["id"]
         tint = "#9B59B6"
         self.storage_service.set_current_sheet_row_color(row_id, tint)
@@ -110,6 +113,9 @@ class CurrentSheetEditorContrastTests(unittest.TestCase):
         self.storage_service.save_cards([
             _entry("2026-07-01", "FB-100", "FB Kitchen", "T1", "P1", "2026-07-01 09:00:00"),
         ])
+        # The page now only shows rows already written into an active export
+        # (Update/Finalize), so mirror an Update here before building it.
+        self.storage_service.rebuild_active_export()
 
         page = CurrentSheetPage()
         page.show()
@@ -135,6 +141,9 @@ class CurrentSheetEditorContrastTests(unittest.TestCase):
         self.storage_service.save_cards([
             _entry("2026-07-01", "FB-100", "FB Kitchen", "T1", "P1", "2026-07-01 09:00:00"),
         ])
+        # The page now only shows rows already written into an active export
+        # (Update/Finalize), so mirror an Update here before building it.
+        self.storage_service.rebuild_active_export()
 
         page = CurrentSheetPage()
         page.show()
