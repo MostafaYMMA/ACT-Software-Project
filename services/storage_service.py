@@ -1574,14 +1574,19 @@ def _dedupe_latest_across_statuses(grouped):
     latest-received one, ACROSS the status tables they'd otherwise be
     routed to. Takes and returns a {table_name: [row, ...]} mapping.
 
-    Within one table, a batch can contain the same logical entry twice (a
-    resend alongside the real one) and the last one written would win --
-    but emails are scanned newest-received-first (see filter_service), so
-    an OLDER duplicate lands later in the batch and would overwrite the
-    newer one, exactly backwards. Across tables, one scan can pick up both
-    a Pending email and the Approval that superseded it; only the later of
-    the two is the entry's current state, and letting both through would
-    leave a stale row in the other table.
+    Two rules, depending on whether the collision is within one status or
+    across two:
+      - SAME status (same target table): the two rows are the same entry
+        with everything identical except the received timestamp -- a resend
+        or re-forward of one unchanged timecard. The EARLIEST received wins,
+        so re-forwarding a card never drags its recorded arrival forward
+        (an "Approved this week" row must not silently move because someone
+        forwarded the same mail again later). This mirrors the persistent
+        path in _save_row/_upsert_timecard.
+      - DIFFERENT status (different tables): one scan can pick up both a
+        Pending email and the Approval that superseded it; only the LATER
+        of the two is the entry's current state, and letting both through
+        would leave a stale row in the other table.
     """
     best = {}
     for table_name, rows in grouped.items():
@@ -1593,8 +1598,16 @@ def _dedupe_latest_across_statuses(grouped):
                 continue
             new_parsed = _parse_received(row[13])
             existing_parsed = _parse_received(existing[1][13])
-            if new_parsed and (existing_parsed is None or new_parsed > existing_parsed):
-                best[key] = (table_name, row)
+            if new_parsed is None:
+                continue
+            if table_name == existing[0]:
+                # same status -> earliest received wins
+                if existing_parsed is None or new_parsed < existing_parsed:
+                    best[key] = (table_name, row)
+            else:
+                # status change within the batch -> latest received wins
+                if existing_parsed is None or new_parsed > existing_parsed:
+                    best[key] = (table_name, row)
 
     resolved = {}
     for table_name, row in best.values():
@@ -1644,7 +1657,12 @@ def _upsert_timecard(conn, table_name, row, origin=None):
             period = excluded.period,
             subject = excluded.subject,
             sender = excluded.sender,
-            received = excluded.received
+            received = CASE
+                WHEN excluded.received IS NULL OR excluded.received = '' THEN received
+                WHEN received IS NULL OR received = '' THEN excluded.received
+                WHEN excluded.received < received THEN excluded.received
+                ELSE received
+            END
     """, (*row, origin))
 
 
@@ -1674,7 +1692,15 @@ def _save_row(conn, table_name, row, origin=None):
     incoming = _parse_received(row[13])
     existing = _find_existing(conn, key)
 
+    # Drop the incoming row only when a newer copy already sits under a
+    # DIFFERENT status: re-reading an old Pending email must not undo the
+    # Approval that came after it. When the existing row is under the SAME
+    # status (everything matches except the received timestamp), we do NOT
+    # drop -- the upsert below keeps the EARLIEST received, so a later
+    # re-forward of the same card can't push its recorded arrival forward.
     for _table, _id, stored_received, _rate, _is_exported, _origin in existing:
+        if _table == table_name:
+            continue
         stored = _parse_received(stored_received)
         if stored is not None and (incoming is None or stored > incoming):
             return
