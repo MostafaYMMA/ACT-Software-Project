@@ -97,7 +97,7 @@ def sync_cards(progress_callback=None):
         save_cards(all_entries)  # origin defaults to THIS device -- see storage_service.save_cards
         print("Saved entries to database.")
         export_to_csv()
-        export_invoice_lines_to_excel()
+        #export_invoice_lines_to_excel() Hashed to not create the invoice lines file on every scan, only when the user clicks the Export button.
     else:
         print("Nothing to save.")
 

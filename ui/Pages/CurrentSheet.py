@@ -12,6 +12,12 @@ Rows appear here by being scanned and approved -- there is no way to add a
 row that didn't come from a real approved timecard email (see
 storage_service.sync_current_sheet). Edits and colours survive every later
 scan untouched.
+
+The page mirrors the active export .xlsx rather than the live scan: a row
+is shown only once Update (or Finalize) has written it into the export file
+(get_current_sheet_rows(only_in_active_export=True)). So before the first
+Update nothing shows, and a row picked up by a later Scan Inbox stays hidden
+until the next Update pushes it into the file.
 """
 
 from PySide6.QtWidgets import (
@@ -271,12 +277,17 @@ class CurrentSheetPage(QWidget):
         self._project_type_group.setExclusive(True)
         self._project_type_buttons = {}
 
-        type_defs = [(None, "All")] + list(PROJECT_TYPE_LABELS.items())
+        # "All" is not offered on this page -- a division is always shown.
+        # When the shared filter is None ("All", which can still be chosen
+        # on the Dashboard) this page falls back to the first division for
+        # both its buttons and every read, WITHOUT writing it back, so the
+        # Dashboard keeps showing "All". See _effective_project_type.
+        type_defs = list(PROJECT_TYPE_LABELS.items())
         for project_type, label in type_defs:
             button = QPushButton(label)
             button.setObjectName("periodToggle")
             button.setCheckable(True)
-            button.setChecked(project_type == project_type_settings.project_type)
+            button.setChecked(project_type == self._effective_project_type())
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.toggled.connect(
                 lambda checked, value=project_type: self._on_project_type_toggled(value) if checked else None
@@ -377,14 +388,25 @@ class CurrentSheetPage(QWidget):
     # -----------------------------------------------------------------
     # Project type filter
     # -----------------------------------------------------------------
+    def _effective_project_type(self):
+        """The division this page operates on. "All" (None) isn't offered
+        here, so a None shared setting -- which can still be chosen on the
+        Dashboard -- falls back to the first real division. Deliberately
+        does NOT write the fallback back to the shared setting, so the
+        Dashboard's own "All" selection is left intact (the two views are
+        allowed to disagree)."""
+        return project_type_settings.project_type or next(iter(PROJECT_TYPE_LABELS))
+
     def _on_project_type_toggled(self, project_type):
         project_type_settings.set_project_type(project_type)
 
     def _sync_project_type_selection(self, project_type):
-        """Fires whenever EITHER page's project-type filter changes -
-        including from this page's own toggle above, in which case the
-        matching button is already checked and this is a no-op."""
-        button = self._project_type_buttons.get(project_type)
+        """Fires whenever a page's project-type filter changes - including
+        from this page's own toggle above, in which case the matching
+        button is already checked and this is a no-op. A None ("All", from
+        the Dashboard) maps to this page's fallback division so a button is
+        always checked here."""
+        button = self._project_type_buttons.get(self._effective_project_type())
         if button is not None:
             button.setChecked(True)
         self.refresh()
@@ -397,7 +419,15 @@ class CurrentSheetPage(QWidget):
         # one would tint whatever row happens to land there.
         self._cancel_ripple()
 
-        rows = get_current_sheet_rows(project_type=project_type_settings.project_type)
+        # only_in_active_export: the page mirrors the export .xlsx, not the
+        # live scan. A row shows here once Update/Finalize has written it into
+        # the active export file -- before the first Update there is no file
+        # and nothing shows, and a freshly scanned row stays hidden until the
+        # next Update pushes it in. See storage_service.get_current_sheet_rows.
+        rows = get_current_sheet_rows(
+            project_type=self._effective_project_type(),
+            only_in_active_export=True,
+        )
         columns = order_columns(rows[0].keys()) if rows else []
         # row_color and its stamps are state, not data -- the colour shows
         # as the row's background and in the picker button, so columns of
@@ -449,7 +479,9 @@ class CurrentSheetPage(QWidget):
         self.table.setEnabled(True)
         if not rows:
             self.status_label.setText(
-                "Nothing here yet - scan the inbox for approved timecards and they'll appear."
+                "Nothing here yet - press Update to build the sheet from the "
+                "approved timecards scanned so far. New scans appear here only "
+                "after the next Update."
             )
 
     def _install_color_button(self, row_index, record):
@@ -707,7 +739,7 @@ class CurrentSheetPage(QWidget):
         self._set_controls_enabled(False)
         self.status_label.setText("Updating...")
 
-        self._update_worker = RefreshWorker(project_type_settings.project_type)
+        self._update_worker = RefreshWorker(self._effective_project_type())
         self._update_thread = QThread(self)
         self._update_worker.moveToThread(self._update_thread)
 
@@ -748,7 +780,7 @@ class CurrentSheetPage(QWidget):
         self._set_controls_enabled(False)
         self.status_label.setText("Syncing...")
 
-        self._sync_worker = UpdateWorker(email, project_type_settings.project_type)
+        self._sync_worker = UpdateWorker(email, self._effective_project_type())
         self._sync_thread = QThread(self)
         self._sync_worker.moveToThread(self._sync_thread)
 
@@ -838,7 +870,7 @@ class CurrentSheetPage(QWidget):
         self._set_controls_enabled(False)
         self.status_label.setText("Finalizing...")
 
-        project_type = project_type_settings.project_type
+        project_type = self._effective_project_type()
         if sync_on:
             self._finalize_worker = FinalizeWorker(email, start_str, end_str, project_type)
         else:

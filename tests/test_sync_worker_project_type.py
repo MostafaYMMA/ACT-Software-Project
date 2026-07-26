@@ -84,7 +84,7 @@ class LocalUpdateWorkerProjectTypeTests(unittest.TestCase):
         for module in (History, CurrentSheet):
             source = inspect.getsource(module)
             self.assertIn(
-                "RefreshWorker(project_type_settings.project_type)", source,
+                "RefreshWorker(self._effective_project_type())", source,
                 msg=f"{module.__name__} does not pass a project type to RefreshWorker",
             )
             self.assertNotIn(
