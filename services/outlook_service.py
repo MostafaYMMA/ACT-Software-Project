@@ -59,6 +59,14 @@ def send_sync_mail(recipient_email, kind, payload, seq, extra_attachments=None, 
     failure (Outlook not running, no default profile, etc) -- the caller
     is expected to tell the user the update went out locally even if the
     notification failed, rather than silently losing the local export.
+
+    NOTE: mail.Send() succeeding only means Outlook accepted the item into
+    the Outbox -- it does NOT mean the item was actually transmitted. If
+    Outlook is set to "Work Offline", or its Send/Receive isn't configured
+    to fire immediately, the mail can sit in the Outbox indefinitely (and
+    won't show in Sent Items until it actually goes out). Forcing a
+    SendAndReceive right after Send below is what makes "Update sent."
+    actually mean sent, not just queued.
     """
     device_id = payload.get("device_id", "")
     subject = _build_subject(kind, device_id, seq)
@@ -69,6 +77,7 @@ def send_sync_mail(recipient_email, kind, payload, seq, extra_attachments=None, 
         write_payload_workbook(payload, kind, payload_path)
 
         outlook = win32com.client.Dispatch("Outlook.Application")
+        namespace = outlook.GetNamespace("MAPI")
         mail = outlook.CreateItem(0)  # olMailItem
         mail.To = recipient_email
         mail.Subject = subject
@@ -82,6 +91,24 @@ def send_sync_mail(recipient_email, kind, payload, seq, extra_attachments=None, 
             if extra_path and os.path.exists(extra_path):
                 mail.Attachments.Add(extra_path)
         mail.Send()
+
+        # Push the Outbox out now instead of waiting for Outlook's own
+        # scheduled Send/Receive -- see the NOTE above. If Outlook is
+        # Working Offline this still queues in the Outbox (SendAndReceive
+        # can't force a connection that isn't there); flagged loudly here
+        # so it isn't mistaken for a successful send.
+        try:
+            if getattr(namespace, "Offline", False):
+                print(
+                    "WARNING: Outlook is Working Offline -- the sync mail is queued "
+                    "in the Outbox and will NOT reach the recipient until Outlook "
+                    "goes back online and sends/receives."
+                )
+            else:
+                namespace.SendAndReceive(False)
+        except Exception:
+            traceback.print_exc()
+
         return True
     except Exception:
         traceback.print_exc()
@@ -115,10 +142,14 @@ def _extract_attachments(item, temp_dir, kind):
     return payload, other_paths
 
 
-def scan_sync_mails(folder_name="Inbox", limit=200):
+def _process_sync_mail_items(items, limit=200):
     """
-    Finds every UNREAD sync mail (see _SUBJECT_PATTERN), reads its .xlsx
-    payload and any extra attachments, and marks it read once handled.
+    Shared core behind both scan_sync_mails() (its own dedicated Outlook
+    walk) and read_collected_sync_mails() (mail items another scan already
+    walked past -- see filter_service.get_approved_cards' sync_mail_items
+    param and sync_service.sync_cards). Only UNREAD items whose subject
+    fully matches _SUBJECT_PATTERN are read/applied; each is marked read
+    once handled so a repeat call doesn't re-download it.
 
     Only UNREAD mail is scanned. Correctness doesn't depend on this --
     every kind of payload is idempotent on the receiving end (see
@@ -126,34 +157,12 @@ def scan_sync_mails(folder_name="Inbox", limit=200):
     record_finalize_from_other_device) -- it's purely so this doesn't
     re-download months of old sync attachments on every single check.
 
-    Returns (messages, temp_dir):
-      messages: list of {kind, device_id, seq, payload, extra_paths,
-                subject}, oldest first.
-      temp_dir: where extra_paths (e.g. a finalize's exported .xlsx) were
-                saved -- the CALLER is responsible for deleting this once
-                it's done with any extra_paths it needed (see
-                sync_service.pull_updates), since a finalize's attached
-                file needs to still exist after this function returns.
+    Returns (messages, temp_dir) -- see scan_sync_mails' own docstring for
+    the shape of each; temp_dir is always created (even if messages is
+    empty) so the caller can unconditionally clean it up.
     """
     messages = []
     temp_dir = tempfile.mkdtemp(prefix="act_sync_scan_")
-
-    try:
-        outlook = win32com.client.Dispatch("Outlook.Application")
-        namespace = outlook.GetNamespace("MAPI")
-        inbox = namespace.GetDefaultFolder(OL_FOLDER_INBOX)
-        folder = inbox
-        if folder_name.lower() != "inbox":
-            for sub in inbox.Folders:
-                if sub.Name.lower() == folder_name.lower():
-                    folder = sub
-                    break
-    except Exception:
-        traceback.print_exc()
-        return messages, temp_dir
-
-    items = folder.Items
-    items.Sort("[ReceivedTime]", False)  # oldest first, so callers naturally settle on newest per sender
 
     scanned = 0
     try:
@@ -190,3 +199,57 @@ def scan_sync_mails(folder_name="Inbox", limit=200):
         traceback.print_exc()
 
     return messages, temp_dir
+
+
+def scan_sync_mails(folder_name="Inbox", limit=200):
+    """
+    Finds every UNREAD sync mail (see _SUBJECT_PATTERN) with its OWN
+    dedicated Outlook folder walk, reads its .xlsx payload and any extra
+    attachments, and marks it read once handled. Still used by the
+    Update/Sync button flow (sync_service.pull_updates); Scan Inbox no
+    longer calls this -- see read_collected_sync_mails, which reuses mail
+    items the regular scan already walked past instead of a second walk.
+
+    Returns (messages, temp_dir):
+      messages: list of {kind, device_id, seq, payload, extra_paths,
+                subject}, oldest first.
+      temp_dir: where extra_paths (e.g. a finalize's exported .xlsx) were
+                saved -- the CALLER is responsible for deleting this once
+                it's done with any extra_paths it needed (see
+                sync_service.pull_updates), since a finalize's attached
+                file needs to still exist after this function returns.
+    """
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        namespace = outlook.GetNamespace("MAPI")
+        inbox = namespace.GetDefaultFolder(OL_FOLDER_INBOX)
+        folder = inbox
+        if folder_name.lower() != "inbox":
+            for sub in inbox.Folders:
+                if sub.Name.lower() == folder_name.lower():
+                    folder = sub
+                    break
+    except Exception:
+        traceback.print_exc()
+        return [], tempfile.mkdtemp(prefix="act_sync_scan_")
+
+    items = folder.Items
+    items.Sort("[ReceivedTime]", False)  # oldest first, so callers naturally settle on newest per sender
+
+    return _process_sync_mail_items(items, limit=limit)
+
+
+def read_collected_sync_mails(sync_mail_items, limit=200):
+    """
+    Same processing as scan_sync_mails, but over a list of raw MailItem
+    objects a caller already has in hand (see filter_service.get_approved_cards'
+    sync_mail_items param) instead of doing its own Dispatch/folder/Sort --
+    this is what lets Scan Inbox pick up sync mail from the SAME Outlook
+    walk it already does for timecards, rather than a second, redundant
+    full-folder pass just for this.
+
+    sync_mail_items is typically small (a handful of items at most, one
+    per Update/Sync click since the last scan) -- an empty list is the
+    common case and is perfectly fine, it just returns ([], temp_dir).
+    """
+    return _process_sync_mail_items(sync_mail_items, limit=limit)

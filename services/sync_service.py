@@ -14,7 +14,7 @@ from storage_service import (
     rebuild_active_export, finalize_active_export,
     get_last_scan_time, set_last_scan_time,
 )
-from outlook_service import send_sync_mail, scan_sync_mails
+from outlook_service import send_sync_mail, scan_sync_mails, read_collected_sync_mails
 from sharepoint_service import (
     require_sharepoint_folder, read_boundary_date, write_boundary,
     write_device_sheet, merge_device_sheets, print_workbook,
@@ -76,9 +76,11 @@ def sync_cards(progress_callback=None):
         report(f"First scan - checking the {FIRST_SCAN_LIMIT} most recent emails...")
 
     report("Checking inbox for approved timecards...")
+    sync_mail_items = []
     emails = get_approved_cards(
         limit=None if start_date else FIRST_SCAN_LIMIT,
         start_date=start_date,
+        sync_mail_items=sync_mail_items,
     )
     report(f"Approved emails found: {len(emails)}")
 
@@ -125,6 +127,19 @@ def sync_cards(progress_callback=None):
     else:
         print("No expenses to save.")
 
+    # --- Cross-device sync mail, picked up from the SAME Outlook walk as
+    # the timecard scan above (sync_mail_items), not a second one. A
+    # failure here (Outlook hiccup, unreadable attachment, no sync
+    # partner's mail waiting at all) must not undo the timecard/expense
+    # saves that already happened above -- caught and reported, never
+    # raised.
+    try:
+        if sync_mail_items:
+            report("Checking for updates from the other user...")
+        pull_collected_updates(sync_mail_items, progress_callback=progress_callback)
+    except Exception as exc:
+        print(f"Sync-mail check failed: {exc}")
+
     # Both halves got through -- everything up to newest_in_folder has now
     # been looked at, so the next scan can start there. Last thing in the
     # function on purpose: an exception anywhere above skips this and the
@@ -142,12 +157,69 @@ def sync_cards(progress_callback=None):
 # is no partner, with no mail involved at all.
 # ----------------------------------------------------------------------
 
+def _apply_sync_messages(messages):
+    """
+    Shared apply logic behind pull_updates (its own dedicated mail scan)
+    and pull_collected_updates (mail items a regular Scan Inbox pass
+    already walked past) -- one implementation of "what an incoming sync
+    message does to the local DB", reused by both instead of forked.
+
+    Returns (applied_snapshots, applied_rates, applied_finalizes) counts.
+    """
+    applied_snapshots = 0
+    applied_rates = 0
+    applied_finalizes = 0
+
+    for message in messages:
+        kind = message["kind"]
+        payload = message["payload"]
+
+        if kind == "snapshot":
+            result = apply_incoming_snapshot(payload)
+            if result.get("applied"):
+                applied_snapshots += 1
+
+        elif kind == "rate":
+            if apply_rate_update(payload):
+                applied_rates += 1
+
+        elif kind == "finalize":
+            # Catch this device up with the sender's closing snapshot
+            # FIRST, so nothing the sender scanned in their last-minute
+            # check before finalizing is missed here.
+            snapshot = payload.get("snapshot")
+            if snapshot:
+                apply_incoming_snapshot(snapshot)
+
+            export_name = payload.get("export_filename") or "final_export.xlsx"
+            end_date = payload.get("period_end") or (payload.get("generated_at") or "")[:10]
+            record_finalize_from_other_device(export_name, end_date)
+            applied_finalizes += 1
+
+            # The actual exported file the sender attached (see
+            # finalize_month) -- copied next to this device's own
+            # exports so it's not lost when temp_dir is cleaned up by the
+            # caller, and so the user can find it without having to dig
+            # through Outlook attachments.
+            for extra_path in message.get("extra_paths", []):
+                if os.path.basename(extra_path).endswith(".xlsx") or export_name in extra_path:
+                    _save_incoming_export_copy(extra_path, export_name)
+
+    return applied_snapshots, applied_rates, applied_finalizes
+
+
 def pull_updates(progress_callback=None):
     """
     Checks for and applies any sync mail waiting from the other user
-    (a full snapshot, a standalone rate edit, or a finalize notice).
-    Safe to call any time, any number of times -- every kind of incoming
-    message is idempotent on the receiving end.
+    (a full snapshot, a standalone rate edit, or a finalize notice), via
+    its OWN dedicated Outlook folder walk (scan_sync_mails). Safe to call
+    any time, any number of times -- every kind of incoming message is
+    idempotent on the receiving end.
+
+    Still used by the Update/Sync button flow (update_with_other_user).
+    Scan Inbox uses pull_collected_updates instead, which reuses mail
+    items the regular scan already walked past rather than doing a
+    second, redundant walk just for this.
     """
 
     def report(msg):
@@ -158,47 +230,42 @@ def pull_updates(progress_callback=None):
     report("Checking for updates from the other user...")
     messages, temp_dir = scan_sync_mails()
     try:
-        applied_snapshots = 0
-        applied_rates = 0
-        applied_finalizes = 0
-
-        for message in messages:
-            kind = message["kind"]
-            payload = message["payload"]
-
-            if kind == "snapshot":
-                result = apply_incoming_snapshot(payload)
-                if result.get("applied"):
-                    applied_snapshots += 1
-
-            elif kind == "rate":
-                if apply_rate_update(payload):
-                    applied_rates += 1
-
-            elif kind == "finalize":
-                # Catch this device up with the sender's closing snapshot
-                # FIRST, so nothing the sender scanned in their last-minute
-                # check before finalizing is missed here.
-                snapshot = payload.get("snapshot")
-                if snapshot:
-                    apply_incoming_snapshot(snapshot)
-
-                export_name = payload.get("export_filename") or "final_export.xlsx"
-                end_date = payload.get("period_end") or (payload.get("generated_at") or "")[:10]
-                record_finalize_from_other_device(export_name, end_date)
-                applied_finalizes += 1
-
-                # The actual exported file the sender attached (see
-                # finalize_month) -- copied next to this device's own
-                # exports so it's not lost when temp_dir is cleaned up
-                # below, and so the user can find it without having to
-                # dig through Outlook attachments.
-                for extra_path in message.get("extra_paths", []):
-                    if os.path.basename(extra_path).endswith(".xlsx") or export_name in extra_path:
-                        _save_incoming_export_copy(extra_path, export_name)
-
+        applied_snapshots, applied_rates, applied_finalizes = _apply_sync_messages(messages)
         report(
             f"Updates received: {applied_snapshots} snapshot(s), "
+            f"{applied_rates} rate edit(s), {applied_finalizes} finalize notice(s)."
+        )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    return {"messages_seen": len(messages)}
+
+
+def pull_collected_updates(sync_mail_items, progress_callback=None):
+    """
+    Same as pull_updates, but over sync-mail items a regular Scan Inbox
+    pass already collected in the SAME Outlook walk (see
+    filter_service.get_approved_cards' sync_mail_items param) instead of
+    doing a second, dedicated walk. Called from sync_cards.
+
+    sync_mail_items is typically empty or has just a handful of items --
+    that's the normal case, not an error; this returns cleanly either way
+    ({"messages_seen": 0} when nothing was waiting).
+    """
+
+    def report(msg):
+        print(msg)
+        if progress_callback:
+            progress_callback(msg)
+
+    messages, temp_dir = read_collected_sync_mails(sync_mail_items)
+    try:
+        if not messages:
+            return {"messages_seen": 0}
+
+        applied_snapshots, applied_rates, applied_finalizes = _apply_sync_messages(messages)
+        report(
+            f"Updates received from the other user: {applied_snapshots} snapshot(s), "
             f"{applied_rates} rate edit(s), {applied_finalizes} finalize notice(s)."
         )
     finally:
@@ -251,45 +318,46 @@ def push_updates(recipient_email, project_type=None, progress_callback=None):
 
 def update_with_other_user(recipient_email, project_type=None, progress_callback=None):
     """
-    The 'Update' button on the Export History page (sync on). Three steps,
-    in order:
+    The 'Sync' button (Current Sheet / Export History, sync on). Two
+    steps, in order:
 
-      1. Pull anything waiting from the other user.
-      2. Push this device's own data out to them. Pull-before-push so the
-         snapshot built during push reflects what was just received,
-         rather than a picture that's already one step behind.
-      3. Top up the active export file with every approved row that isn't
-         in it yet -- including whatever step 1 just brought in. Creates
-         that file on the first ever Update (and on the first Update after
-         a Finalize); tops the same file up on every Update after that.
+      1. Push this device's own data out to the other user by email.
+      2. Top up the active export file with every approved row that isn't
+         in it yet. Creates that file on the first ever Update (and on
+         the first Update after a Finalize); tops the same file up on
+         every Update after that.
 
-    Nothing here reads Outlook for timecards -- see push_updates.
+    This does NOT pull/check for incoming sync mail -- that is Scan
+    Inbox's job now (see sync_service.sync_cards' call to
+    pull_collected_updates), which picks up any waiting sync mail from
+    the SAME Outlook walk as the regular timecard scan. Sync doing its
+    own separate pull here used to mean every Sync click also silently
+    re-walked the whole inbox looking for updates ("Checking for updates
+    from the other user...") even though the button's only job, from the
+    user's perspective, is to SEND. Keeping Sync as send-only here avoids
+    that redundant walk and matches what Scan Inbox already covers.
 
-    Steps 1 and 2 are SKIPPED when recipient_email is empty (no sync
-    partner configured), and a failure in either is caught rather than
-    raised. Step 3 is local work on local data -- it must not be blocked
-    by there being no one to sync with, or by Outlook being shut, offline,
-    or slow. The two halves of the result say which parts actually ran.
+    Step 1 is SKIPPED when recipient_email is empty (no sync partner
+    configured), and a failure in it is caught rather than raised. Step 2
+    is local work on local data -- it must not be blocked by there being
+    no one to sync with, or by Outlook being shut, offline, or slow.
     """
-    pull_result = {"skipped": True}
     push_result = {"sent": False, "reason": "no sync partner"}
 
     if recipient_email:
         try:
-            pull_result = pull_updates(progress_callback=progress_callback)
             push_result = push_updates(
                 recipient_email, project_type=project_type, progress_callback=progress_callback
             )
         except Exception as exc:  # Outlook not running, COM error, mailbox refused...
             print(f"Sync with {recipient_email} failed: {exc}")
-            pull_result = {"error": str(exc)}
             push_result = {"sent": False, "reason": "sync failed", "error": str(exc)}
 
     if progress_callback:
         progress_callback("Updating the export file...")
     export_result = rebuild_active_export(project_type=project_type)
 
-    return {"pull": pull_result, "push": push_result, "export": export_result}
+    return {"push": push_result, "export": export_result}
 
 
 def push_rate_update(status_key, record_id, recipient_email):
