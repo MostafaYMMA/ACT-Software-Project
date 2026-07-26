@@ -30,6 +30,14 @@ _STATUS_COLORS = {
 
 _COLUMNS = ["Status", "Subject", "Project Number", "Project Name", "Task Name", "Date", "Been like this for"]
 
+# A dedicated trailing column for the Send Mail button, kept narrow and
+# fixed-width (see the Stretch/Fixed split in __init__) so it never
+# overlaps real row data -- it used to be centered across the whole
+# viewport width, which for a 7-column table landed squarely on top of
+# the "Project Name" column, hiding that row's actual value underneath it.
+_ACTIONS_COLUMN_INDEX = len(_COLUMNS)
+_ACTIONS_COLUMN_WIDTH = 130
+
 
 def _format_age(hours):
     if hours < 24:
@@ -72,9 +80,16 @@ class LatePage(QWidget):
         apply_live_style(self.subtitle, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 11px;")
         layout.addWidget(self.subtitle)
 
-        self.table = QTableWidget(0, len(_COLUMNS))
-        self.table.setHorizontalHeaderLabels(_COLUMNS)
+        self.table = QTableWidget(0, len(_COLUMNS) + 1)
+        self.table.setHorizontalHeaderLabels(_COLUMNS + ["Actions"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        # The Actions column holds only the Send Mail button -- fixed and
+        # narrow, not stretched like the data columns, so it stays its own
+        # separate space instead of competing for width with real data.
+        self.table.horizontalHeader().setSectionResizeMode(
+            _ACTIONS_COLUMN_INDEX, QHeaderView.ResizeMode.Fixed
+        )
+        self.table.setColumnWidth(_ACTIONS_COLUMN_INDEX, _ACTIONS_COLUMN_WIDTH)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -149,21 +164,32 @@ class LatePage(QWidget):
                         item.setBackground(QBrush(QColor(color)))
                 self.table.setItem(row_index, col_index, item)
 
+            # An empty, non-editable item under the button so the column
+            # paints with the table's normal item background/selection
+            # styling instead of being left blank, and so hovering into it
+            # still fires cellEntered (see _on_cell_entered).
+            actions_item = QTableWidgetItem("")
+            actions_item.setFlags(actions_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row_index, _ACTIONS_COLUMN_INDEX, actions_item)
+
     def showEvent(self, event):
         self.refresh()
         super().showEvent(event)
 
     def _on_cell_entered(self, row, column):
         """Moves the Send Mail button over `row` and shows it, centered
-        horizontally in the middle of the row."""
+        within the dedicated Actions column -- NOT centered across the
+        whole row, which used to land the button on top of the "Project
+        Name" column and hide that row's actual value underneath it."""
         if row < 0 or row >= len(self.records):
             self.send_button.hide()
             self._hover_row = None
             return
 
         self._hover_row = row
-        viewport_width = self.table.viewport().width()
-        x = max(0, (viewport_width - _SEND_BUTTON_WIDTH) // 2)
+        column_x = self.table.columnViewportPosition(_ACTIONS_COLUMN_INDEX)
+        column_width = self.table.columnWidth(_ACTIONS_COLUMN_INDEX)
+        x = column_x + max(0, (column_width - _SEND_BUTTON_WIDTH) // 2)
         y = self.table.rowViewportPosition(row) + (self.table.rowHeight(row) - _SEND_BUTTON_HEIGHT) // 2
         self.send_button.move(x, y)
         self.send_button.show()

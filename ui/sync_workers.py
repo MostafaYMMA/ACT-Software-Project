@@ -20,6 +20,7 @@ from sync_service import (
     update_with_other_user, finalize_month, local_update, local_finalize,
 )
 from storage_service import rebuild_active_export
+from outlook_service import com_thread
 
 
 class RefreshWorker(QObject):
@@ -62,10 +63,11 @@ class UpdateWorker(QObject):
 
     def run(self):
         try:
-            result = update_with_other_user(
-                self.recipient_email, project_type=self.project_type,
-                progress_callback=self.progress.emit,
-            )
+            with com_thread():
+                result = update_with_other_user(
+                    self.recipient_email, project_type=self.project_type,
+                    progress_callback=self.progress.emit,
+                )
         except Exception as exc:
             self.failed.emit(str(exc))
             return
@@ -93,9 +95,10 @@ class LocalUpdateWorker(QObject):
 
     def run(self):
         try:
-            result = local_update(
-                project_type=self.project_type, progress_callback=self.progress.emit,
-            )
+            with com_thread():
+                result = local_update(
+                    project_type=self.project_type, progress_callback=self.progress.emit,
+                )
         except Exception as exc:
             self.failed.emit(str(exc))
             return
@@ -116,10 +119,11 @@ class FinalizeWorker(QObject):
 
     def run(self):
         try:
-            result = finalize_month(
-                self.recipient_email, self.start_date, self.end_date,
-                project_type=self.project_type, progress_callback=self.progress.emit,
-            )
+            with com_thread():
+                result = finalize_month(
+                    self.recipient_email, self.start_date, self.end_date,
+                    project_type=self.project_type, progress_callback=self.progress.emit,
+                )
         except Exception as exc:
             self.failed.emit(str(exc))
             return
@@ -144,10 +148,11 @@ class LocalFinalizeWorker(QObject):
 
     def run(self):
         try:
-            result = local_finalize(
-                self.start_date, self.end_date,
-                project_type=self.project_type, progress_callback=self.progress.emit,
-            )
+            with com_thread():
+                result = local_finalize(
+                    self.start_date, self.end_date,
+                    project_type=self.project_type, progress_callback=self.progress.emit,
+                )
         except Exception as exc:
             self.failed.emit(str(exc))
             return
