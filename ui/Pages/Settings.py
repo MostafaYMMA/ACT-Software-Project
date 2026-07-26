@@ -12,7 +12,7 @@ left for a toggle to gate; Update never touches this at all.
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QComboBox, QFrame, QLineEdit,
-    QPushButton, QFileDialog,
+    QPushButton, QFileDialog, QPlainTextEdit,
 )
 from PySide6.QtCore import Qt
 
@@ -23,13 +23,19 @@ from ui.switch import Switch
 from ui.notification_settings import notification_settings
 from ui.sync_partner_settings import sync_partner_settings
 from ui.sharepoint_settings import sharepoint_settings
+from ui.late_mail_body_settings import late_mail_body_settings
 from onedrive_link_resolver import resolve_local_path_from_link, OneDriveLinkResolutionError
 
 BELL_ICON = "\U0001F514"
 SYNC_ICON = "\U0001F501"
 FOLDER_ICON = "\U0001F4C1"
 LINK_ICON = "\U0001F517"
+MAIL_ICON = "✉"
 HOURS_PER_DAY = 24
+# mailto: URLs get silently truncated by some mail clients past roughly
+# this many characters (Windows' effective URL length ceiling) -- past
+# this the Late page's preset body may not arrive in full.
+LATE_MAIL_BODY_WARN_LENGTH = 2000
 
 
 class SettingsPage(QWidget):
@@ -215,6 +221,61 @@ class SettingsPage(QWidget):
         """)
         layout.addWidget(self._partner_email_edit)
 
+        late_mail_divider = QFrame()
+        late_mail_divider.setFixedHeight(1)
+        apply_live_style(late_mail_divider, lambda c: f"background-color: {c['BORDER']};")
+        layout.addWidget(late_mail_divider)
+
+        # -- Late page mail template ---------------------------------------
+        # Optional preset body text used to pre-fill the compose window
+        # opened by the Late tab's "Send Mail" button (see
+        # ui/Pages/Late.py::_send_mail_for_row). Persisted via
+        # ui/late_mail_body_settings.py, same QSettings-singleton pattern
+        # as the rest of this page. Used exactly as typed -- static text,
+        # no per-record placeholders/templating. Left empty, the compose
+        # window opens with no body at all, same as before this existed.
+        late_mail_label = QLabel("Late Page Mail Template")
+        apply_live_style(late_mail_label, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 11px; font-weight: 700;")
+        layout.addWidget(late_mail_label)
+
+        late_mail_row = QHBoxLayout()
+        late_mail_row.setSpacing(10)
+
+        late_mail_icon_label = QLabel(MAIL_ICON)
+        late_mail_icon_label.setStyleSheet("font-size: 15px;")
+        late_mail_row.addWidget(late_mail_icon_label)
+
+        late_mail_text = QLabel("Preset body text used when sending a mail from the Late tab (optional)")
+        late_mail_text.setWordWrap(True)
+        apply_live_style(late_mail_text, lambda c: f"color: {c['TEXT_PRIMARY']}; font-size: 13px;")
+        late_mail_row.addWidget(late_mail_text, stretch=1)
+
+        layout.addLayout(late_mail_row)
+
+        self._late_mail_body_edit = QPlainTextEdit(late_mail_body_settings.preset_body)
+        self._late_mail_body_edit.setPlaceholderText(
+            "e.g. Hi,\n\nJust checking in on the status of this timecard/expense request..."
+        )
+        self._late_mail_body_edit.setFixedHeight(100)
+        self._late_mail_body_edit.textChanged.connect(self._on_late_mail_body_edited)
+        apply_live_style(self._late_mail_body_edit, lambda c: f"""
+            QPlainTextEdit {{
+                border: 1px solid {c['BORDER']};
+                border-radius: 6px;
+                padding: 8px 10px;
+                font-size: 13px;
+                background: {c['SURFACE']};
+                color: {c['TEXT_PRIMARY']};
+            }}
+            QPlainTextEdit:focus {{ border: 1px solid {c['ACCENT']}; }}
+        """)
+        layout.addWidget(self._late_mail_body_edit)
+
+        self._late_mail_body_hint = QLabel("")
+        self._late_mail_body_hint.setWordWrap(True)
+        apply_live_style(self._late_mail_body_hint, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 11px;")
+        layout.addWidget(self._late_mail_body_hint)
+
         sharepoint_divider = QFrame()
         sharepoint_divider.setFixedHeight(1)
         apply_live_style(sharepoint_divider, lambda c: f"background-color: {c['BORDER']};")
@@ -356,6 +417,7 @@ class SettingsPage(QWidget):
 
         self._load_threshold_into_controls(notification_settings.threshold_hours)
         self._update_threshold_enabled(notification_settings.enabled)
+        self._update_late_mail_body_hint(late_mail_body_settings.preset_body)
 
         self._update_labels(theme_manager.mode)
         theme_manager.theme_changed.connect(self._update_labels)
@@ -395,6 +457,23 @@ class SettingsPage(QWidget):
 
     def _on_partner_email_edited(self):
         sync_partner_settings.set_partner_email(self._partner_email_edit.text())
+
+    def _on_late_mail_body_edited(self):
+        text = self._late_mail_body_edit.toPlainText()
+        late_mail_body_settings.set_preset_body(text)
+        self._update_late_mail_body_hint(text)
+
+    def _update_late_mail_body_hint(self, text):
+        length = len(text)
+        base = "Plain text only -- mailto links can't carry formatting or HTML."
+        if length > LATE_MAIL_BODY_WARN_LENGTH:
+            self._late_mail_body_hint.setText(
+                f"{base} This is {length} characters -- mail clients may silently truncate mailto "
+                f"bodies beyond roughly {LATE_MAIL_BODY_WARN_LENGTH}, so consider shortening it."
+            )
+        else:
+            self._late_mail_body_hint.setText(f"{base} ({length} character{'s' if length != 1 else ''})")
+
     def _on_resolve_sharepoint_link(self):
         link = self._sharepoint_link_edit.text()
         sharepoint_settings.set_link(link)
