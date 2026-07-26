@@ -1411,11 +1411,37 @@ def sync_current_sheet(conn):
     never touched, so every cell the user has corrected by hand and every
     colour they've set survives each later scan intact. A re-scan can only
     ever ADD rows here.
+
+    Finalized timecards are the one exception that must NOT be re-added:
+    finalize_active_export deletes a division's rows from current_sheet on
+    purpose (the period is closed), and marks their timecards finalized = 1
+    in active_export_rows. Without excluding those here, the very next scan
+    -- including the automatic one on app startup -- would re-insert every
+    just-closed row straight back, which is exactly the "current sheet
+    still has data after Finalize, even after a restart" bug. is_exported
+    is deliberately NOT used for this: it's also set by the one-off "Export
+    Last Month"/"Export Range" buttons, which must not empty the sheet.
+
+    Self-heal: any current_sheet row that IS finalized is deleted here
+    first. This is the one delete this function does, and it's narrow --
+    only rows whose period is already closed (finalized = 1), whose edits
+    and colours were captured into the finalized export before it closed.
+    It exists so a database that accumulated finalized rows under an older
+    build (which never cleared them) cleans itself up on the next scan,
+    instead of needing a fresh Finalize click to catch up. Non-finalized
+    rows are never touched -- the "a re-scan only ever ADDs" guarantee for
+    real working rows still holds.
     """
+    conn.execute(
+        "DELETE FROM current_sheet WHERE timecard_id IN "
+        "(SELECT timecard_id FROM active_export_rows WHERE finalized = 1)"
+    )
+
     rows = conn.execute("""
         SELECT id, day, "Date", "Project Number", "Project Name", "Task Name",
                "Qty", rate, name, person_number, period, subject, sender, received
         FROM timecards_approved
+        WHERE id NOT IN (SELECT timecard_id FROM active_export_rows WHERE finalized = 1)
     """).fetchall()
 
     conn.executemany("""
@@ -3131,11 +3157,48 @@ def finalize_active_export(end_date, project_type=None):
             "DELETE FROM app_state WHERE key = ?",
             (_active_export_path_key(project_type),),
         )
+
+        # Empty this division's Current Sheet -- the period is closed, so
+        # every row showing for it now is done, not just the handful this
+        # particular Finalize batch added. Scoped to the division being
+        # closed (Finalizing Food & Beverage leaves Hospitality's sheet
+        # alone), by the same "Project Name" prefix rule used everywhere.
+        #
+        # Two steps, both needed:
+        #   1. Mark each of those timecards finalized = 1 in
+        #      active_export_rows, so sync_current_sheet won't re-add them
+        #      on the next scan (or on app startup) -- that's what makes
+        #      the sheet stay empty after a restart, not just until the
+        #      next scan. Rows already finalized in an earlier batch (the
+        #      common case when Finalize closes with 0 NEW rows but the
+        #      sheet still has old ones) are covered by the upsert too.
+        #   2. Delete them from current_sheet.
+        cs_where, cs_params = _project_type_clause(project_type)
+        cs_where_sql = f" WHERE {cs_where}" if cs_where else ""
+        closed_timecard_ids = [
+            r[0] for r in conn.execute(
+                f"SELECT timecard_id FROM current_sheet{cs_where_sql}",
+                cs_params,
+            ).fetchall()
+            if r[0] is not None
+        ]
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn.executemany(
+            "INSERT INTO active_export_rows (timecard_id, added_at, export_path, finalized) "
+            "VALUES (?, ?, ?, 1) "
+            "ON CONFLICT(timecard_id) DO UPDATE SET finalized = 1",
+            [(tid, now, path) for tid in closed_timecard_ids],
+        )
+        conn.executemany(
+            "DELETE FROM current_sheet WHERE timecard_id = ?",
+            [(tid,) for tid in closed_timecard_ids],
+        )
         conn.commit()
     finally:
         conn.close()
 
-    print(f"Finalized {path} with {result['total_rows']} row(s)")
+    print(f"Finalized {path} with {result['total_rows']} row(s); "
+          f"cleared {len(closed_timecard_ids)} Current Sheet row(s)")
     return {"path": path, "row_count": result["total_rows"]}
 
 

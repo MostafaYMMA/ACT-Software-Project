@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
 )
 from PySide6.QtCore import Qt, QThread, QTimer, QDate, QEvent
-from PySide6.QtGui import QColor, QIcon, QPixmap, QFontMetrics
+from PySide6.QtGui import QColor, QIcon, QPixmap, QFontMetrics, QPalette
 
 from ui.theme_manager import theme_manager
 from ui.theme_utils import apply_live_style
@@ -148,6 +148,49 @@ class RowTintDelegate(QStyledItemDelegate):
     def __init__(self, page, parent=None):
         super().__init__(parent)
         self._page = page
+
+    def createEditor(self, parent, option, index):
+        """
+        The default QStyledItemDelegate editor is a bare QLineEdit with NO
+        stylesheet and Qt's raw factory palette (white background, black
+        text) -- completely disconnected from both the app's live theme
+        AND this row's tint. Confirmed by inspecting a real editor
+        instance: styleSheet() was '', palette Base/Text were #ffffff/
+        #000000 regardless of light/dark mode. On a dark-themed row (or a
+        dark row_color) that reads as illegible dark-on-dark, which is
+        exactly the "typing is invisible" symptom -- so the editor needs
+        the same explicit QPalette treatment ui/account_page.py already
+        uses for QLineEdit legibility (QSS "color" alone isn't reliably
+        applied either).
+
+        Matches the cell it's editing: the row's tint (readable_text_color,
+        same WCAG contrast pick paint() uses) when one is set, otherwise
+        the theme's normal SURFACE/TEXT_PRIMARY -- covers both halves of
+        "default theme background AND any custom row_color".
+        """
+        editor = super().createEditor(parent, option, index)
+        tint = self._page.tint_for(index.row(), index.column())
+        colors = theme_manager.colors()
+        if tint:
+            background = QColor(tint)
+            text_color = readable_text_color(background)
+        else:
+            background = QColor(colors["SURFACE"])
+            text_color = colors["TEXT_PRIMARY"]
+
+        editor.setStyleSheet(f"""
+            QLineEdit {{
+                background: {background.name()};
+                color: {text_color};
+                border: 1px solid {colors['ACCENT']};
+                padding: 2px 4px;
+            }}
+        """)
+        palette = editor.palette()
+        palette.setColor(QPalette.ColorRole.Base, background)
+        palette.setColor(QPalette.ColorRole.Text, QColor(text_color))
+        editor.setPalette(palette)
+        return editor
 
     def paint(self, painter, option, index):
         tint = self._page.tint_for(index.row(), index.column())

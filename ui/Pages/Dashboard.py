@@ -15,6 +15,7 @@ from ui.table_utils import order_columns, configure_grid, set_header_labels, fit
 from ui.transition import reveal_rows, stagger_fade_in
 from ui.project_type_settings import project_type_settings
 from sync_service import sync_cards
+from outlook_service import com_thread
 from storage_service import (
     get_status_project_counts, get_status_rows, get_status_columns,
     update_status_record_field, PROJECT_TYPE_LABELS,
@@ -231,8 +232,16 @@ class SyncWorker(QObject):
         # button and only those two handlers turn it back on, so an escaping
         # exception would leave "Scanning..." stuck forever. A locked
         # exports/*.xlsx (open in Excel) is the everyday way to hit this.
+        #
+        # com_thread(): this runs on a fresh QThread every click, and
+        # win32com.client.Dispatch (see filter_service/outlook_service)
+        # raises "CoInitialize has not been called" on an OS thread that
+        # hasn't initialized COM for itself -- silently, since it's caught
+        # by broad excepts deeper in the call chain (see
+        # outlook_service.com_thread's own docstring).
         try:
-            sync_cards(progress_callback=self.progress.emit)
+            with com_thread():
+                sync_cards(progress_callback=self.progress.emit)
         except Exception as exc:
             self.failed.emit(str(exc))
             return

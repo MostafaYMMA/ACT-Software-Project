@@ -16,10 +16,33 @@ import re
 import shutil
 import tempfile
 import traceback
+from contextlib import contextmanager
 
+import pythoncom
 import win32com.client
 
 from sync_payload_excel import write_payload_workbook, read_payload_workbook
+
+
+@contextmanager
+def com_thread():
+    """Every OS thread that touches Outlook COM (win32com.client.Dispatch,
+    below) must initialize COM for ITSELF first -- apartment state is
+    per-thread, not process-wide. A plain script's main thread happens to
+    work without this, which is what made the bug this guards against so
+    easy to miss: every Scan Inbox / Update / Sync / Finalize button
+    click runs on a fresh QThread (see ui/sync_workers.py,
+    ui/Pages/Dashboard.py's SyncWorker), and Dispatch on an
+    uninitialized thread raises 'CoInitialize has not been called' --
+    caught by the broad excepts below and in filter_service.py, so it
+    failed completely silently: no email ever sent, no error shown
+    anywhere in the UI, only a traceback in the console.
+    """
+    pythoncom.CoInitialize()
+    try:
+        yield
+    finally:
+        pythoncom.CoUninitialize()
 
 OL_FOLDER_INBOX = 6
 OL_MAIL_ITEM_CLASS = 43
