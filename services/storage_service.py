@@ -1411,11 +1411,21 @@ def sync_current_sheet(conn):
     never touched, so every cell the user has corrected by hand and every
     colour they've set survives each later scan intact. A re-scan can only
     ever ADD rows here.
+
+    Excludes anything already finalized (active_export_rows.finalized = 1):
+    finalize_active_export deletes those rows from current_sheet on
+    purpose, and without this exclusion the timecard_id UNIQUE guard that
+    was blocking a re-insert disappears right along with the row, so the
+    very next scan (including one on app startup) would silently bring a
+    just-finalized row right back. is_exported is NOT used for this check
+    -- it's also set by the unrelated one-off "Export Last Month"/"Export
+    Range" actions, which must NOT keep a row out of Current Sheet.
     """
     rows = conn.execute("""
         SELECT id, day, "Date", "Project Number", "Project Name", "Task Name",
                "Qty", rate, name, person_number, period, subject, sender, received
         FROM timecards_approved
+        WHERE id NOT IN (SELECT timecard_id FROM active_export_rows WHERE finalized = 1)
     """).fetchall()
 
     conn.executemany("""
@@ -2766,7 +2776,14 @@ def export_act_invoice_overview_range(start_date: str, end_date: str, output_pat
 # The exact column list _write_act_invoice_workbook expects a row tuple to
 # be, in order -- kept in one place so the range export and the rolling
 # active export below can't drift apart on it.
-_ACT_ROW_COLUMNS = 'id, "Project Number", "Project Name", "Task Name", "Qty", rate, day, period'
+#
+# row_color is pulled in via a correlated subquery against current_sheet
+# (the only table it lives in -- see init_db) so the user's colour-coding
+# survives into the exported sheet instead of staying UI-only.
+_ACT_ROW_COLUMNS = (
+    'id, "Project Number", "Project Name", "Task Name", "Qty", rate, day, period, '
+    '(SELECT row_color FROM current_sheet WHERE current_sheet.timecard_id = timecards_approved.id) AS row_color'
+)
 
 
 def _write_act_invoice_workbook(conn, rows, output_path):
@@ -2809,10 +2826,14 @@ def _write_act_invoice_workbook(conn, rows, output_path):
         cell.fill = _HEADER_FILL
 
     r = header_row + 1
-    for _id, project_number, project_name, task_name, qty, rate, day, period in rows:
+    for _id, project_number, project_name, task_name, qty, rate, day, period, row_color in rows:
         qty_val = float(qty) if qty not in (None, "") else None
         rate_val = float(rate) if rate not in (None, "") else 0.0
         rate_usd = rate_val / aed_per_usd
+        # The user's own colour-coding from Current Sheet (see
+        # current_sheet.row_color) -- None/"" means no colour was set, so
+        # the cell is left with whatever fill the table style gives it.
+        fill = PatternFill(start_color=row_color[1:], end_color=row_color[1:], fill_type="solid") if row_color else None
 
         # LABOR row
         ws.cell(row=r, column=2, value=day)                 # Date (no year, as extracted)
@@ -2828,6 +2849,9 @@ def _write_act_invoice_workbook(conn, rows, output_path):
         sp_cell.number_format = _USD_FORMAT
         total_cell = ws.cell(row=r, column=16, value=f"=N{r}*O{r}")  # Total Amount
         total_cell.number_format = _USD_FORMAT
+        if fill is not None:
+            for col in range(2, 17):
+                ws.cell(row=r, column=col).fill = fill
         r += 1
 
         # Expense row -- Line=2, Type, Total formula; Sales Price is this
@@ -2839,6 +2863,9 @@ def _write_act_invoice_workbook(conn, rows, output_path):
         sp_cell.number_format = _USD_FORMAT
         total_cell = ws.cell(row=r, column=16, value=f"=N{r}*O{r}")
         total_cell.number_format = _USD_FORMAT
+        if fill is not None:
+            for col in range(2, 17):
+                ws.cell(row=r, column=col).fill = fill
         r += 1
 
     last_data_row = r - 1
@@ -3090,6 +3117,17 @@ def finalize_active_export(end_date, project_type=None):
         ]
         conn.executemany(
             "UPDATE timecards_approved SET is_exported = 1 WHERE id = ? AND is_exported != 1",
+            [(row_id,) for row_id in ids],
+        )
+        # The rows just closed out are done with Current Sheet too -- it's
+        # a working copy that sits between the scan and the final export
+        # (see init_db), not a permanent record, so once a row has made it
+        # into the finalized file it should no longer be sitting there
+        # editable. A re-scan can still add new rows for the next period
+        # (sync_current_sheet only ever adds); this only removes the ones
+        # that were just finalized.
+        conn.executemany(
+            "DELETE FROM current_sheet WHERE timecard_id = ?",
             [(row_id,) for row_id in ids],
         )
         _record_export(conn, os.path.basename(path), os.path.abspath(path))
