@@ -20,13 +20,15 @@ Update nothing shows, and a row picked up by a later Scan Inbox stays hidden
 until the next Update pushes it into the file.
 """
 
+import os
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget,
     QTableWidgetItem, QMenu, QToolButton, QMessageBox, QStyle, QStyledItemDelegate,
-    QButtonGroup,
+    QButtonGroup, QFileDialog,
 )
-from PySide6.QtCore import Qt, QThread, QTimer, QDate, QEvent
-from PySide6.QtGui import QColor, QIcon, QPixmap, QFontMetrics, QPalette
+from PySide6.QtCore import Qt, QThread, QTimer, QDate, QEvent, QUrl
+from PySide6.QtGui import QColor, QIcon, QPixmap, QFontMetrics, QPalette, QDesktopServices
 
 from ui.theme_manager import theme_manager
 from ui.theme_utils import apply_live_style
@@ -867,14 +869,25 @@ class CurrentSheetPage(QWidget):
         if confirm != QMessageBox.StandardButton.Yes:
             return
 
+        # Save As, shown BEFORE anything is actually closed out -- same
+        # contract as the Export History page's Finalize button (see
+        # ui/Pages/History.py::_on_finalize_clicked). Cancelling aborts the
+        # whole finalize: nothing is touched, the period stays open.
+        default_name = os.path.basename(active_path) if active_path else f"timecards_{start_str}_to_{end_str}.xlsx"
+        save_as_path, _ = QFileDialog.getSaveFileName(
+            self, "Save finalized export as", default_name, "Excel files (*.xlsx)"
+        )
+        if not save_as_path:
+            return  # cancelled -- nothing has been closed out, boundary not advanced
+
         self._set_controls_enabled(False)
         self.status_label.setText("Finalizing...")
 
         project_type = self._effective_project_type()
         if sync_on:
-            self._finalize_worker = FinalizeWorker(email, start_str, end_str, project_type)
+            self._finalize_worker = FinalizeWorker(email, start_str, end_str, project_type, save_as_path=save_as_path)
         else:
-            self._finalize_worker = LocalFinalizeWorker(start_str, end_str, project_type)
+            self._finalize_worker = LocalFinalizeWorker(start_str, end_str, project_type, save_as_path=save_as_path)
 
         self._finalize_thread = QThread(self)
         self._finalize_worker.moveToThread(self._finalize_thread)
@@ -889,6 +902,22 @@ class CurrentSheetPage(QWidget):
 
         self._finalize_thread.start()
 
+    def _open_finalized_file(self, path):
+        """Opens a just-finalized export in the system's default
+        application -- same mechanism as Export History's double-click
+        (see ui/Pages/History.py::_open_finalized_file /
+        _on_export_row_activated). Only ever called after a finalize has
+        actually succeeded; opening failing is not treated as the
+        finalize failing -- the file is safely on disk either way."""
+        if not path:
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            QMessageBox.information(
+                self, "Finalized",
+                f"The export finished and is saved at:\n\n{path}\n\n"
+                "It couldn't be opened automatically -- you can open it from that location.",
+            )
+
     def _on_finalize_finished(self, result):
         self._set_controls_enabled(True)
         row_count = result.get("row_count", 0)
@@ -896,6 +925,7 @@ class CurrentSheetPage(QWidget):
         self.status_label.setText(
             f"Finalized {path} - {row_count} row(s). The next Update starts a new sheet."
         )
+        self._open_finalized_file(path)
         QMessageBox.information(
             self, "Finalized",
             f"Closed {path} with {row_count} row(s).\n\n"

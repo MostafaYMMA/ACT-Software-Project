@@ -110,12 +110,19 @@ class FinalizeWorker(QObject):
     finished = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, recipient_email, start_date, end_date, project_type):
+    def __init__(self, recipient_email, start_date, end_date, project_type, save_as_path=None):
         super().__init__()
         self.recipient_email = recipient_email
         self.start_date = start_date
         self.end_date = end_date
         self.project_type = project_type
+        # Where the closed file should ALSO be copied (the History page's
+        # Save As dialog, shown and cancel-checked before this worker is
+        # ever constructed -- see ui/Pages/History.py::_on_finalize_clicked).
+        # None means "no Save As was requested", not "the dialog was
+        # cancelled" -- a cancelled dialog aborts the finalize entirely
+        # before a worker is ever created.
+        self.save_as_path = save_as_path
 
     def run(self):
         try:
@@ -123,6 +130,7 @@ class FinalizeWorker(QObject):
                 result = finalize_month(
                     self.recipient_email, self.start_date, self.end_date,
                     project_type=self.project_type, progress_callback=self.progress.emit,
+                    save_as_path=self.save_as_path,
                 )
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -135,16 +143,17 @@ class LocalFinalizeWorker(QObject):
     pull/notify, just a local scan + closing out the active export sheet
     (sync_service.local_finalize). As with FinalizeWorker there is no
     output_path -- the file closed is whichever one Update has been
-    filling."""
+    filling; save_as_path only says where a copy of it should also land."""
     progress = Signal(str)
     finished = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, start_date, end_date, project_type):
+    def __init__(self, start_date, end_date, project_type, save_as_path=None):
         super().__init__()
         self.start_date = start_date
         self.end_date = end_date
         self.project_type = project_type
+        self.save_as_path = save_as_path
 
     def run(self):
         try:
@@ -152,6 +161,7 @@ class LocalFinalizeWorker(QObject):
                 result = local_finalize(
                     self.start_date, self.end_date,
                     project_type=self.project_type, progress_callback=self.progress.emit,
+                    save_as_path=self.save_as_path,
                 )
         except Exception as exc:
             self.failed.emit(str(exc))

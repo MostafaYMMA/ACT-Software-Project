@@ -5,7 +5,8 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget, QTableWidgetItem,
     QHeaderView, QPushButton, QDateEdit, QFileDialog, QMessageBox, QButtonGroup,
 )
-from PySide6.QtCore import Qt, QDate, QThread
+from PySide6.QtCore import Qt, QDate, QThread, QUrl
+from PySide6.QtGui import QDesktopServices
 
 from ui.theme_utils import apply_live_style
 from ui.project_type_settings import project_type_settings
@@ -408,17 +409,31 @@ class HistoryPage(QWidget):
         if confirm != QMessageBox.StandardButton.Yes:
             return
 
+        # Save As, shown BEFORE anything is actually closed out. Cancelling
+        # here aborts the whole finalize -- nothing is touched, the period
+        # stays open -- rather than finalizing anyway and leaving the file
+        # sitting only at its internal path the user never chose. Default
+        # name is based on whatever the rolling sheet is already called.
+        default_name = (
+            os.path.basename(active_path) if active_path else self._default_name(start_str, end_str)
+        )
+        save_as_path, _ = QFileDialog.getSaveFileName(
+            self, "Save finalized export as", default_name, "Excel files (*.xlsx)"
+        )
+        if not save_as_path:
+            return  # cancelled -- nothing has been closed out, boundary not advanced
+
         self._set_sync_controls_enabled(False)
         self.status_label.setText("Finalizing...")
 
         self._finalize_thread = QThread(self)
         if sync_on:
             self._finalize_worker = FinalizeWorker(
-                email, start_str, end_str, project_type_settings.project_type
+                email, start_str, end_str, project_type_settings.project_type, save_as_path=save_as_path,
             )
         else:
             self._finalize_worker = LocalFinalizeWorker(
-                start_str, end_str, project_type_settings.project_type
+                start_str, end_str, project_type_settings.project_type, save_as_path=save_as_path,
             )
         self._finalize_worker.moveToThread(self._finalize_thread)
 
@@ -432,6 +447,24 @@ class HistoryPage(QWidget):
 
         self._finalize_thread.start()
 
+    def _open_finalized_file(self, path):
+        """Opens a just-finalized export in the system's default
+        application -- same mechanism as double-clicking an Export History
+        row (see _on_export_row_activated). Only ever called after a
+        finalize has actually succeeded (this method itself has no notion
+        of failure to report -- _on_sync_action_failed handles that
+        separately). Opening failing is NOT treated as the finalize
+        failing: the file is safely on disk either way, so this shows a
+        plain "here's where it is" message instead of an alarming error."""
+        if not path:
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            QMessageBox.information(
+                self, "Finalized",
+                f"The export finished and is saved at:\n\n{path}\n\n"
+                "It couldn't be opened automatically -- you can open it from that location.",
+            )
+
     def _on_finalize_finished(self, result):
         self._set_sync_controls_enabled(True)
         row_count = result.get("row_count", 0)
@@ -440,6 +473,7 @@ class HistoryPage(QWidget):
         self.status_label.setText(
             f"Finalized {path} - {row_count} row(s). The next Update starts a new sheet."
         )
+        self._open_finalized_file(path)
         if notified is None:
             # Sync was off -- nothing was ever attempted, so this isn't a
             # failure, just the expected local-only outcome.
@@ -537,15 +571,41 @@ class HistoryPage(QWidget):
     # -----------------------------------------------------------------
     def _on_export_row_activated(self, item):
         """Opens the exported file for the double-clicked row in whatever
-        app the OS associates with it.
+        app the OS associates with it, via the same QDesktopServices
+        mechanism the post-Finalize auto-open uses (_open_finalized_file)
+        -- one code path for "open this export", not two that could drift
+        apart on what they handle.
 
         The file is NOT assumed to still be there: an export can be moved,
         renamed, deleted, or sit on a network/USB drive that isn't mounted
         right now, and rows logged before the path column existed have no
-        path at all. Each of those gets its own message rather than an
-        exception out of os.startfile."""
+        path at all. Each failure mode gets its own specific message
+        rather than a silent no-op or an unhandled exception:
+          - item is None / row index out of range for what's loaded: a
+            safe no-op (itemDoubleClicked already only fires for a real
+            item, so this is just defensive).
+          - path is NULL/empty (legacy rows recorded before paths were
+            tracked at all).
+          - the file no longer exists at its recorded location.
+          - the recorded path is a directory, not a file (shouldn't
+            normally happen, but a stale/corrupted history row is not
+            impossible).
+          - QDesktopServices.openUrl() itself returns False (no
+            application associated with .xlsx, or the shell refused).
+
+        A file currently open/locked in Excel is NOT specifically handled
+        here: asking the shell to open it (openUrl) still succeeds --
+        Excel itself is what shows an "already open" prompt, which is
+        outside this app's control and isn't a Python-level failure at
+        all, so it degrades gracefully with no special-casing needed.
+        """
+        if item is None:
+            return
         row_index = item.row()
-        path = self._export_paths[row_index] if row_index < len(self._export_paths) else None
+        if row_index < 0 or row_index >= len(self._export_paths):
+            return  # defensive -- shouldn't happen, itemDoubleClicked implies a real row
+
+        path = self._export_paths[row_index]
         name = self.table.item(row_index, 0)
         name = name.text() if name else "this export"
 
@@ -566,12 +626,21 @@ class HistoryPage(QWidget):
             )
             return
 
-        try:
-            os.startfile(path)  # Windows-only, like the rest of this app (Outlook COM)
-        except OSError as exc:
+        if os.path.isdir(path):
+            QMessageBox.warning(
+                self, "Not a file",
+                f"{name}'s recorded location:\n\n{path}\n\n"
+                "is a folder, not a file, so it can't be opened. The history entry is "
+                "kept either way.",
+            )
+            return
+
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
             QMessageBox.warning(
                 self, "Couldn't open the file",
-                f"Windows refused to open:\n\n{path}\n\n{exc}",
+                f"Windows couldn't open:\n\n{path}\n\n"
+                "There may be no application associated with this file type, or the "
+                "request was refused. You can open it manually from that location.",
             )
 
     def refresh(self):
