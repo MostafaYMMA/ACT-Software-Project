@@ -130,18 +130,26 @@ PROJECT_TYPE_LABELS = {
 PROJECT_TYPE_SOURCE_STATUSES = ("Approved", "Pending")
 
 
-def _project_type_clause(project_type):
+def _project_type_clause(project_type, table=None):
     """
     (sql_fragment, params) restricting a query to one project type, by the
     code "Project Name" starts with -- case-insensitively, and tolerant of a
     stray leading space. Returns ("", []) for None or an unknown type, i.e.
     "all project types", so callers can splice it in unconditionally.
+
+    table: optional table name to qualify "Project Name" with (e.g.
+    "timecards_approved"). Needed only when the query joins another table
+    that also has a "Project Name" column (see rebuild_active_export /
+    export_act_invoice_overview_range's LEFT JOIN onto current_sheet for
+    row_color) -- otherwise the column reference is ambiguous. Every other,
+    unjoined call site leaves this at the default (unqualified), unchanged.
     """
     prefix = PROJECT_TYPE_PREFIXES.get(project_type)
     if prefix is None:
         return "", []
+    column = f'{table}."Project Name"' if table else '"Project Name"'
     return (
-        f'UPPER(SUBSTR(TRIM("Project Name"), 1, {len(prefix)})) = ?',
+        f'UPPER(SUBSTR(TRIM({column}), 1, {len(prefix)})) = ?',
         [prefix.upper()],
     )
 
@@ -1030,6 +1038,35 @@ def _record_export(conn, name: str, full_path: str = None):
         "INSERT INTO export_history (name, date, path) VALUES (?, ?, ?)",
         (name, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), full_path),
     )
+
+
+def relocate_last_export_history_entry(old_path, new_path):
+    """
+    Repoints the most recently recorded export_history row for old_path at
+    new_path instead -- used after a Finalize's closed file (written at
+    its internal, auto-generated EXPORTS_DIR path -- see
+    _new_active_export_path) has been COPIED to a user-chosen Save As
+    destination (see sync_service.finalize_month/local_finalize). Without
+    this, Export History's double-click would keep opening the internal
+    path, which the user never sees or chooses -- not where they actually
+    saved the file.
+
+    Targets the single most recent row for old_path (id DESC LIMIT 1)
+    rather than every row ever logged at that path, since a rolling
+    sheet's internal path is reused across finalizes only after the
+    counter in _new_active_export_path rolls over, and even then each
+    finalize logs its own fresh row.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            "UPDATE export_history SET name = ?, path = ? "
+            "WHERE id = (SELECT id FROM export_history WHERE path = ? ORDER BY id DESC LIMIT 1)",
+            (os.path.basename(new_path), os.path.abspath(new_path), old_path),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_export_history():
@@ -2807,14 +2844,19 @@ def export_act_invoice_overview_range(start_date: str, end_date: str, output_pat
     Returns the number of source timecard rows written (i.e. half the
     number of spreadsheet rows, since each becomes a LABOR+Expense pair).
     """
-    type_where, type_params = _project_type_clause(project_type)
+    # Qualified with the table name because of the LEFT JOIN below: both
+    # timecards_approved and current_sheet have a "Project Name" column, so
+    # an unqualified reference would be ambiguous once they're joined.
+    type_where, type_params = _project_type_clause(project_type, table="timecards_approved")
     type_sql = f" AND {type_where}" if type_where else ""
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.execute(
         f'SELECT {_ACT_ROW_COLUMNS} '
-        f'FROM timecards_approved WHERE "Date" >= ? AND "Date" <= ?{type_sql} '
-        'ORDER BY "Date" ASC, subject ASC',
+        'FROM timecards_approved LEFT JOIN current_sheet '
+        'ON current_sheet.timecard_id = timecards_approved.id '
+        f'WHERE timecards_approved."Date" >= ? AND timecards_approved."Date" <= ?{type_sql} '
+        'ORDER BY timecards_approved."Date" ASC, timecards_approved.subject ASC',
         [start_date, end_date, *type_params],
     )
     rows = cursor.fetchall()
@@ -2844,7 +2886,66 @@ def export_act_invoice_overview_range(start_date: str, end_date: str, output_pat
 # The exact column list _write_act_invoice_workbook expects a row tuple to
 # be, in order -- kept in one place so the range export and the rolling
 # active export below can't drift apart on it.
-_ACT_ROW_COLUMNS = 'id, "Project Number", "Project Name", "Task Name", "Qty", rate, day, period'
+#
+# row_color rides along from current_sheet (a LEFT JOIN at both call sites
+# below -- see export_act_invoice_overview_range / rebuild_active_export)
+# rather than from timecards_approved itself, which has no such column --
+# the colour is Current Sheet's own per-row highlight, not source data.
+# Every non-id column is qualified with the table name for the same
+# reason: current_sheet has columns of the same names (Project Number,
+# Project Name, Task Name, Qty, rate, day, period), which would otherwise
+# be ambiguous once the two tables are joined.
+_ACT_ROW_COLUMNS = (
+    'timecards_approved.id, timecards_approved."Project Number", timecards_approved."Project Name", '
+    'timecards_approved."Task Name", timecards_approved."Qty", timecards_approved.rate, '
+    'timecards_approved.day, timecards_approved.period, current_sheet.row_color'
+)
+
+# How strongly a Current Sheet row's highlight colour is lightened toward
+# white before being applied as a spreadsheet cell fill. The stored
+# colours are full-saturation UI palette values (e.g. "#F44336") -- loud
+# and hard to read with black text on a white sheet. 0.0 leaves a colour
+# unchanged, 1.0 would wash it out to pure white. One constant so the tint
+# can be retuned in a single place.
+_ROW_COLOR_TINT_STRENGTH = 0.55
+
+# The template's data columns (B through P) that a row's fill spans --
+# same range the column-width loop below uses. Shared here so the fill
+# and the widths can never drift apart on which columns count as "the
+# row", and so the header row (row 4) and the totals block underneath the
+# data are never in scope for a fill (only rows built inside the per-record
+# loop below ever call _row_fill_for_color).
+_ACT_DATA_COLUMNS = range(2, 17)  # B..P
+
+
+def _row_fill_for_color(row_color):
+    """
+    Converts a stored current_sheet.row_color (e.g. "#F44336", possibly an
+    8-digit ARGB value, possibly malformed/legacy data) into an openpyxl
+    PatternFill tinted toward white by _ROW_COLOR_TINT_STRENGTH, or None
+    for "no fill" -- used both for a NULL/empty colour (leave the cells
+    untouched rather than filling them white, which would break the
+    table's own banding) and for a malformed stored value (skip the fill
+    for that row rather than raising and killing the whole export).
+    """
+    if not row_color:
+        return None
+    value = row_color.lstrip("#")
+    if len(value) == 6:
+        rgb = value
+    elif len(value) == 8:
+        rgb = value[2:]  # 8-digit ARGB -- drop the leading alpha byte pair
+    else:
+        return None
+    try:
+        r, g, b = int(rgb[0:2], 16), int(rgb[2:4], 16), int(rgb[4:6], 16)
+    except ValueError:
+        return None
+    r = round(r + (255 - r) * _ROW_COLOR_TINT_STRENGTH)
+    g = round(g + (255 - g) * _ROW_COLOR_TINT_STRENGTH)
+    b = round(b + (255 - b) * _ROW_COLOR_TINT_STRENGTH)
+    argb = f"FF{r:02X}{g:02X}{b:02X}"
+    return PatternFill(start_color=argb, end_color=argb, fill_type="solid")
 
 
 def _write_act_invoice_workbook(conn, rows, output_path):
@@ -2887,11 +2988,12 @@ def _write_act_invoice_workbook(conn, rows, output_path):
         cell.fill = _HEADER_FILL
 
     r = header_row + 1
-    for _id, project_number, project_name, task_name, qty, rate, day, period in rows:
+    for _id, project_number, project_name, task_name, qty, rate, day, period, row_color in rows:
         qty_val = float(qty) if qty not in (None, "") else None
         rate_val = float(rate) if rate not in (None, "") else 0.0
         rate_usd = rate_val / aed_per_usd
 
+        labor_row = r
         # LABOR row
         ws.cell(row=r, column=2, value=day)                 # Date (no year, as extracted)
         ws.cell(row=r, column=4, value=project_name)         # Project Name
@@ -2911,6 +3013,7 @@ def _write_act_invoice_workbook(conn, rows, output_path):
         # Expense row -- Line=2, Type, Total formula; Sales Price is this
         # record's own linked expense amount (already converted to USD --
         # see _linked_expenses_by_timecard) when it has one, 0 otherwise.
+        expense_row = r
         ws.cell(row=r, column=10, value=2)
         ws.cell(row=r, column=11, value="Expense")
         sp_cell = ws.cell(row=r, column=15, value=linked_expenses.get(_id) or 0)
@@ -2918,6 +3021,17 @@ def _write_act_invoice_workbook(conn, rows, output_path):
         total_cell = ws.cell(row=r, column=16, value=f"=N{r}*O{r}")
         total_cell.number_format = _USD_FORMAT
         r += 1
+
+        # Colour both rows of the pair -- they represent one logical
+        # timecard entry -- across the full data-column span, not just the
+        # cells written above, so the fill reads as one solid band rather
+        # than a striped one. None (no colour, or a malformed stored
+        # value) means "leave these cells untouched", not "fill white".
+        fill = _row_fill_for_color(row_color)
+        if fill is not None:
+            for fill_row in (labor_row, expense_row):
+                for col in _ACT_DATA_COLUMNS:
+                    ws.cell(row=fill_row, column=col).fill = fill
 
     last_data_row = r - 1
 
@@ -3119,12 +3233,16 @@ def rebuild_active_export(project_type=None):
 
         # Scoped to THIS sheet's path, not every unfinalized row: without
         # that, an F&B rebuild would rewrite its file with the Hospitality
-        # sheet's rows in it too.
+        # sheet's rows in it too. LEFT JOINed onto current_sheet so each
+        # row's colour (if any) rides along -- see _ACT_ROW_COLUMNS; every
+        # column is qualified because current_sheet has columns of the
+        # same names.
         rows = conn.execute(
             f'SELECT {_ACT_ROW_COLUMNS} FROM timecards_approved '
-            'WHERE id IN (SELECT timecard_id FROM active_export_rows '
+            'LEFT JOIN current_sheet ON current_sheet.timecard_id = timecards_approved.id '
+            'WHERE timecards_approved.id IN (SELECT timecard_id FROM active_export_rows '
             '             WHERE finalized = 0 AND export_path = ?) '
-            'ORDER BY "Date" ASC, subject ASC',
+            'ORDER BY timecards_approved."Date" ASC, timecards_approved.subject ASC',
             (path,),
         ).fetchall()
 

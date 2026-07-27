@@ -12,6 +12,7 @@ from storage_service import (
     build_rate_update_payload, get_device_id,
     record_finalize_from_other_device, export_snapshot_rows_to_excel,
     rebuild_active_export, finalize_active_export,
+    relocate_last_export_history_entry,
     get_last_scan_time, set_last_scan_time,
 )
 from outlook_service import send_sync_mail, scan_sync_mails, read_collected_sync_mails
@@ -381,7 +382,52 @@ def push_rate_update(status_key, record_id, recipient_email):
     return send_sync_mail(recipient_email, "rate", payload, seq=0)
 
 
-def finalize_month(recipient_email, start_date, end_date, project_type=None, progress_callback=None):
+def _copy_finalized_export(internal_path, destination_path):
+    """
+    Copies a just-closed Finalize export from its internal, auto-generated
+    path (see storage_service._new_active_export_path) to the destination
+    the user chose in a Save As dialog, and repoints export_history at
+    that destination (storage_service.relocate_last_export_history_entry)
+    so Export History's double-click finds the file where the user can
+    actually still find it, not at the internal path they never see.
+
+    A COPY, not a move -- the internal file is what the rolling-export
+    model treats as the closed sheet's canonical record (see the module
+    docstring above rebuild_active_export in storage_service.py), and
+    finalize_month's caller still needs it to exist afterward (it's
+    mailed to the other user as an attachment). Leaving it in place also
+    means a failed copy can never destroy the one copy of the data that
+    is already known-good -- worst case there end up being two copies of
+    the same file, never zero.
+
+    Raises RuntimeError (not swallowed) if the copy fails. By the time
+    this runs, finalize_active_export has already committed -- the
+    period IS closed -- so a copy failure can't be walked back into "the
+    whole finalize failed" without restructuring that model (out of
+    scope here). Instead this reports clearly that the export is safely
+    finalized at internal_path, just not also at the requested
+    destination, so the caller is never told a plain, unqualified
+    success when the destination it asked for doesn't actually have the
+    file.
+    """
+    try:
+        shutil.copy2(internal_path, destination_path)
+    except OSError as exc:
+        raise RuntimeError(
+            f"The export was finalized and closed successfully at:\n\n{internal_path}\n\n"
+            f"but could not be copied to your chosen location:\n\n{destination_path}\n\n"
+            f"Reason: {exc}\n\n"
+            "Your data is safe at the internal path above -- you can copy it there "
+            "yourself, or leave it; Export History still lists it."
+        ) from exc
+
+    relocate_last_export_history_entry(internal_path, destination_path)
+    return destination_path
+
+
+def finalize_month(
+    recipient_email, start_date, end_date, project_type=None, progress_callback=None, save_as_path=None,
+):
     """
     The 'Finalize' button (sync on), called AFTER the user has confirmed
     in the UI. Order matters here:
@@ -393,7 +439,11 @@ def finalize_month(recipient_email, start_date, end_date, project_type=None, pro
          next Update opens a NEW file and starts filling that one. The
          file itself is left exactly as it is -- it is the final export;
          nothing is re-exported into a separate one.
-      3. Mail the other user a "finalize" notice: the closed file itself,
+      3. If save_as_path is given (the UI's Save As dialog -- shown BEFORE
+         this function is ever called, so a cancelled dialog means this
+         is never reached at all), copy the closed file there and
+         repoint export_history at it -- see _copy_finalized_export.
+      4. Mail the other user a "finalize" notice: the closed file itself,
          plus a closing snapshot so their data is fully caught up too.
          Their app applies this specially (via pull_collected_updates ->
          _apply_sync_messages, on their next Scan Inbox) -- logged into
@@ -401,8 +451,10 @@ def finalize_month(recipient_email, start_date, end_date, project_type=None, pro
          so the boundary is shared rather than tracked per-machine.
 
     Note there is no output_path argument: the file being finalized is
-    whichever one Update has been filling, not one chosen at save time.
-    Its path comes back in the return value.
+    whichever one Update has been filling, not one chosen at save time --
+    save_as_path only says where a COPY of it should also land. Its path
+    (the save_as_path destination, if one was given, else the internal
+    path) comes back in the return value.
     """
 
     def report(msg):
@@ -416,6 +468,10 @@ def finalize_month(recipient_email, start_date, end_date, project_type=None, pro
     finalized = finalize_active_export(end_date, project_type=project_type)
     output_path = finalized["path"]
     row_count = finalized["row_count"]
+
+    if save_as_path:
+        report("Saving the finalized export to the chosen location...")
+        output_path = _copy_finalized_export(output_path, save_as_path)
 
     # The sheet is already closed by this point, so a failure here (or no
     # partner to notify at all) must not raise -- it would leave the
@@ -575,11 +631,14 @@ def local_update(project_type=None, progress_callback=None):
     return {"scanned": True, "export": export_result}
 
 
-def local_finalize(start_date, end_date, project_type=None, progress_callback=None):
+def local_finalize(start_date, end_date, project_type=None, progress_callback=None, save_as_path=None):
     """Sync-off equivalent of 'Finalize': scans this device's own inbox,
     then closes out the active export sheet locally -- no pull, no
     notification. As with finalize_month there is no output_path: the
-    file closed is whichever one Update has been filling. notified is
+    file closed is whichever one Update has been filling -- save_as_path
+    only says where a COPY of the closed file should also land (see
+    _copy_finalized_export; shown to the user and cancel-checked in the
+    UI BEFORE this is ever called, same as finalize_month). notified is
     deliberately None (not False) so the UI can tell "sync is off,
     nothing was attempted" apart from "sync is on and the notification
     failed to send"."""
@@ -593,5 +652,10 @@ def local_finalize(start_date, end_date, project_type=None, progress_callback=No
 
     report("Closing out the current export sheet...")
     finalized = finalize_active_export(end_date, project_type=project_type)
+    output_path = finalized["path"]
 
-    return {"row_count": finalized["row_count"], "notified": None, "path": finalized["path"]}
+    if save_as_path:
+        report("Saving the finalized export to the chosen location...")
+        output_path = _copy_finalized_export(output_path, save_as_path)
+
+    return {"row_count": finalized["row_count"], "notified": None, "path": output_path}
