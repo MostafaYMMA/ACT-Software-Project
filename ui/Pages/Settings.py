@@ -12,9 +12,9 @@ left for a toggle to gate; Update never touches this at all.
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QComboBox, QFrame, QLineEdit,
-    QPushButton, QFileDialog,
+    QPushButton, QFileDialog, QPlainTextEdit, QScrollArea,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QEvent, QTimer
 
 from ui.theme_manager import theme_manager
 from ui.theme_utils import apply_live_style
@@ -23,19 +23,71 @@ from ui.switch import Switch
 from ui.notification_settings import notification_settings
 from ui.sync_partner_settings import sync_partner_settings
 from ui.sharepoint_settings import sharepoint_settings
+from ui.late_mail_body_settings import late_mail_body_settings
 from onedrive_link_resolver import resolve_local_path_from_link, OneDriveLinkResolutionError
 
 BELL_ICON = "\U0001F514"
 SYNC_ICON = "\U0001F501"
 FOLDER_ICON = "\U0001F4C1"
 LINK_ICON = "\U0001F517"
+MAIL_ICON = "✉"
 HOURS_PER_DAY = 24
+# mailto: URLs get silently truncated by some mail clients past roughly
+# this many characters (Windows' effective URL length ceiling) -- past
+# this the Late page's preset body may not arrive in full.
+LATE_MAIL_BODY_WARN_LENGTH = 2000
+# How long to wait after the user stops typing in the preset-body field
+# before persisting it (see _on_late_mail_body_edited) -- without this,
+# every keystroke was its own QSettings disk/registry write.
+LATE_MAIL_BODY_SAVE_DEBOUNCE_MS = 500
+# A full-strength accent line the full width of the page reads as visually
+# heavy, so the section dividers use the accent color at reduced opacity --
+# one constant so it can be retuned in one place.
+DIVIDER_ACCENT_OPACITY = 0.55
+# A fixed error-red used regardless of theme (errors should look like
+# errors in both light and dark mode, not shift with the palette).
+ERROR_COLOR = "#E05252"
+
+
+def _divider_style(c):
+    accent = c["ACCENT"].lstrip("#")
+    r, g, b = int(accent[0:2], 16), int(accent[2:4], 16), int(accent[4:6], 16)
+    return f"background-color: rgba({r}, {g}, {b}, {DIVIDER_ACCENT_OPACITY});"
 
 
 class SettingsPage(QWidget):
     def __init__(self):
         super().__init__()
-        layout = QVBoxLayout(self)
+
+        # This page's content has grown taller than the window in normal
+        # use (SharePoint section clipped/unreachable at typical window
+        # heights) -- no page in this app uses a QScrollArea yet, so this
+        # is the first one. The outer layout on the page itself holds only
+        # the scroll area; everything that used to be laid out directly on
+        # `self` now lives on `content` instead, unchanged otherwise.
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # QScrollBar itself is already styled globally (see ui/theme.py),
+        # but QScrollArea's own frame/background is not -- without this it
+        # paints a default frame and opaque background that clashes with
+        # the theme. Targets both the viewport (QScrollArea's direct
+        # QWidget child) and the content widget nested inside it.
+        apply_live_style(scroll_area, lambda c: """
+            QScrollArea { border: none; background: transparent; }
+            QScrollArea > QWidget > QWidget { background: transparent; }
+        """)
+        outer_layout.addWidget(scroll_area)
+
+        content = QWidget()
+        scroll_area.setWidget(content)
+
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(28, 24, 28, 24)
         layout.setSpacing(20)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -67,7 +119,7 @@ class SettingsPage(QWidget):
 
         divider = QFrame()
         divider.setFixedHeight(1)
-        apply_live_style(divider, lambda c: f"background-color: {c['BORDER']};")
+        apply_live_style(divider, _divider_style)
         layout.addWidget(divider)
 
         # -- Stale pending/rejected threshold -----------------------------
@@ -171,7 +223,7 @@ class SettingsPage(QWidget):
 
         sync_divider = QFrame()
         sync_divider.setFixedHeight(1)
-        apply_live_style(sync_divider, lambda c: f"background-color: {c['BORDER']};")
+        apply_live_style(sync_divider, _divider_style)
         layout.addWidget(sync_divider)
 
         # -- Cross-device sync partner ------------------------------------
@@ -215,9 +267,78 @@ class SettingsPage(QWidget):
         """)
         layout.addWidget(self._partner_email_edit)
 
+        late_mail_divider = QFrame()
+        late_mail_divider.setFixedHeight(1)
+        apply_live_style(late_mail_divider, _divider_style)
+        layout.addWidget(late_mail_divider)
+
+        # -- Late page mail template ---------------------------------------
+        # Optional preset body text used to pre-fill the compose window
+        # opened by the Late tab's "Send Mail" button (see
+        # ui/Pages/Late.py::_send_mail_for_row). Persisted via
+        # ui/late_mail_body_settings.py, same QSettings-singleton pattern
+        # as the rest of this page. Used exactly as typed -- static text,
+        # no per-record placeholders/templating. Left empty, the compose
+        # window opens with no body at all, same as before this existed.
+        late_mail_label = QLabel("Late Page Mail Template")
+        apply_live_style(late_mail_label, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 11px; font-weight: 700;")
+        layout.addWidget(late_mail_label)
+
+        late_mail_row = QHBoxLayout()
+        late_mail_row.setSpacing(10)
+
+        late_mail_icon_label = QLabel(MAIL_ICON)
+        late_mail_icon_label.setStyleSheet("font-size: 15px;")
+        late_mail_row.addWidget(late_mail_icon_label)
+
+        late_mail_text = QLabel("Preset body text used when sending a mail from the Late tab (optional)")
+        late_mail_text.setWordWrap(True)
+        apply_live_style(late_mail_text, lambda c: f"color: {c['TEXT_PRIMARY']}; font-size: 13px;")
+        late_mail_row.addWidget(late_mail_text, stretch=1)
+
+        layout.addLayout(late_mail_row)
+
+        self._late_mail_body_edit = QPlainTextEdit(late_mail_body_settings.preset_body)
+        self._late_mail_body_edit.setPlaceholderText(
+            "e.g. Hi,\n\nJust checking in on the status of this timecard/expense request..."
+        )
+        self._late_mail_body_edit.setFixedHeight(100)
+        self._late_mail_body_edit.textChanged.connect(self._on_late_mail_body_edited)
+        self._late_mail_body_edit.installEventFilter(self)
+        apply_live_style(self._late_mail_body_edit, lambda c: f"""
+            QPlainTextEdit {{
+                border: 1px solid {c['BORDER']};
+                border-radius: 6px;
+                padding: 8px 10px;
+                font-size: 13px;
+                background: {c['SURFACE']};
+                color: {c['TEXT_PRIMARY']};
+            }}
+            QPlainTextEdit:focus {{ border: 1px solid {c['ACCENT']}; }}
+        """)
+        layout.addWidget(self._late_mail_body_edit)
+
+        self._late_mail_body_hint = QLabel("")
+        self._late_mail_body_hint.setWordWrap(True)
+        apply_live_style(self._late_mail_body_hint, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 11px;")
+        layout.addWidget(self._late_mail_body_hint)
+
+        # QSettings writes to disk/registry -- persisting on every
+        # keystroke (textChanged) would be one write per character for a
+        # multi-line template. This timer collapses a burst of typing into
+        # a single write, restarted on every keystroke (see
+        # _on_late_mail_body_edited); the character-count hint still
+        # updates immediately, only the QSettings write is deferred.
+        # Flushed immediately (bypassing the wait) on focus-out and on the
+        # whole page being navigated away from, via eventFilter/hideEvent
+        # below, so a save is never lost to the debounce window.
+        self._late_mail_save_timer = QTimer(self)
+        self._late_mail_save_timer.setSingleShot(True)
+        self._late_mail_save_timer.timeout.connect(self._flush_late_mail_body)
+
         sharepoint_divider = QFrame()
         sharepoint_divider.setFixedHeight(1)
-        apply_live_style(sharepoint_divider, lambda c: f"background-color: {c['BORDER']};")
+        apply_live_style(sharepoint_divider, _divider_style)
         layout.addWidget(sharepoint_divider)
 
         # -- SharePoint folder (Update / View Current / Finalize on Export History) --
@@ -295,7 +416,7 @@ class SettingsPage(QWidget):
         # waiting for the next theme toggle to pick up the new color.
         self._refresh_link_status_style = apply_live_style(
             self._sharepoint_link_status,
-            lambda c: f"color: {'#E05252' if self._link_status_is_error else c['TEXT_SECONDARY']}; font-size: 11px;",
+            lambda c: f"color: {ERROR_COLOR if self._link_status_is_error else c['TEXT_SECONDARY']}; font-size: 11px;",
         )
         layout.addWidget(self._sharepoint_link_status)
 
@@ -348,14 +469,13 @@ class SettingsPage(QWidget):
 
         self._sharepoint_folder_warning = QLabel("")
         self._sharepoint_folder_warning.setWordWrap(True)
-        apply_live_style(self._sharepoint_folder_warning, lambda c: "color: #E05252; font-size: 11px;")
+        apply_live_style(self._sharepoint_folder_warning, lambda c: f"color: {ERROR_COLOR}; font-size: 11px;")
         self._sharepoint_folder_warning.setVisible(False)
         layout.addWidget(self._sharepoint_folder_warning)
 
-        layout.addStretch()
-
         self._load_threshold_into_controls(notification_settings.threshold_hours)
         self._update_threshold_enabled(notification_settings.enabled)
+        self._update_late_mail_body_hint(late_mail_body_settings.preset_body)
 
         self._update_labels(theme_manager.mode)
         theme_manager.theme_changed.connect(self._update_labels)
@@ -395,6 +515,44 @@ class SettingsPage(QWidget):
 
     def _on_partner_email_edited(self):
         sync_partner_settings.set_partner_email(self._partner_email_edit.text())
+
+    def _on_late_mail_body_edited(self):
+        text = self._late_mail_body_edit.toPlainText()
+        self._update_late_mail_body_hint(text)
+        self._late_mail_save_timer.start(LATE_MAIL_BODY_SAVE_DEBOUNCE_MS)
+
+    def _flush_late_mail_body(self):
+        late_mail_body_settings.set_preset_body(self._late_mail_body_edit.toPlainText())
+
+    def eventFilter(self, obj, event):
+        if obj is self._late_mail_body_edit and event.type() == QEvent.Type.FocusOut:
+            if self._late_mail_save_timer.isActive():
+                self._late_mail_save_timer.stop()
+                self._flush_late_mail_body()
+        return super().eventFilter(obj, event)
+
+    def hideEvent(self, event):
+        # Fires when this page is navigated away from inside the app's
+        # QStackedWidget (setCurrentWidget hides the outgoing page) -- a
+        # more reliable "the user is leaving" signal than focus alone,
+        # since a click on the sidebar doesn't necessarily focus-out the
+        # text edit first.
+        if self._late_mail_save_timer.isActive():
+            self._late_mail_save_timer.stop()
+            self._flush_late_mail_body()
+        super().hideEvent(event)
+
+    def _update_late_mail_body_hint(self, text):
+        length = len(text)
+        base = "Plain text only -- mailto links can't carry formatting or HTML."
+        if length > LATE_MAIL_BODY_WARN_LENGTH:
+            self._late_mail_body_hint.setText(
+                f"{base} This is {length} characters -- mail clients may silently truncate mailto "
+                f"bodies beyond roughly {LATE_MAIL_BODY_WARN_LENGTH}, so consider shortening it."
+            )
+        else:
+            self._late_mail_body_hint.setText(f"{base} ({length} character{'s' if length != 1 else ''})")
+
     def _on_resolve_sharepoint_link(self):
         link = self._sharepoint_link_edit.text()
         sharepoint_settings.set_link(link)

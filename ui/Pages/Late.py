@@ -3,10 +3,13 @@ Late tab: a brief of every Pending/Rejected record that's been sitting
 for at least the threshold configured in Settings (see
 ui/notification_settings.py), each row saying how long it's been stuck.
 
-Hovering a row reveals a "Send Mail" button; clicking it opens the
-system's default mail client (via a mailto: link, so this works with
-Outlook classic, new Outlook, Mail, Thunderbird, etc.) addressed to
-that record's sender (see _send_mail_for_row).
+Hovering a row expands that row's own height downward, opening a gap
+below its normal content just tall enough for a "Send Mail" button,
+centered across the full row width. Clicking it opens the system's
+default mail client (via a mailto: link, so this works with Outlook
+classic, new Outlook, Mail, Thunderbird, etc.) addressed to that record's
+sender, optionally pre-filled with a preset body configured in Settings
+(see ui/late_mail_body_settings.py) -- see _send_mail_for_row.
 """
 
 from urllib.parse import quote
@@ -15,12 +18,13 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QTableWidget, QTableWidgetItem, QHeaderView,
     QPushButton, QMessageBox,
 )
-from PySide6.QtCore import Qt, QEvent, QUrl
-from PySide6.QtGui import QColor, QBrush, QDesktopServices
+from PySide6.QtCore import Qt, QEvent, QUrl, QVariantAnimation, QEasingCurve
+from PySide6.QtGui import QColor, QBrush, QDesktopServices, QCursor
 
 from ui.theme_utils import apply_live_style
 from ui.theme_manager import theme_manager
 from ui.notification_settings import notification_settings
+from ui.late_mail_body_settings import late_mail_body_settings
 from storage_service import get_stale_records
 
 _STATUS_COLORS = {
@@ -30,13 +34,15 @@ _STATUS_COLORS = {
 
 _COLUMNS = ["Status", "Subject", "Project Number", "Project Name", "Task Name", "Date", "Been like this for"]
 
-# A dedicated trailing column for the Send Mail button, kept narrow and
-# fixed-width (see the Stretch/Fixed split in __init__) so it never
-# overlaps real row data -- it used to be centered across the whole
-# viewport width, which for a 7-column table landed squarely on top of
-# the "Project Name" column, hiding that row's actual value underneath it.
-_ACTIONS_COLUMN_INDEX = len(_COLUMNS)
-_ACTIONS_COLUMN_WIDTH = 130
+_SEND_BUTTON_WIDTH = 110
+_SEND_BUTTON_HEIGHT = 26
+
+# How long the hover expand/collapse animation takes, and how much extra
+# room (above the button's own height) is left as breathing room inside
+# the opened gap. Named constants since these are the two knobs most
+# likely to need retuning by feel.
+_EXPAND_ANIMATION_MS = 150
+_GAP_PADDING = 10
 
 
 def _format_age(hours):
@@ -58,15 +64,12 @@ def _format_threshold(hours):
     return f"{int(hours)} hour{'s' if int(hours) != 1 else ''}"
 
 
-_SEND_BUTTON_WIDTH = 110
-_SEND_BUTTON_HEIGHT = 26
-
-
 class LatePage(QWidget):
     def __init__(self):
         super().__init__()
         self.records = []       # rows currently in the table, aligned by index
-        self._hover_row = None
+        self._expanded_row = None    # row currently expanded (open gap + visible button), or None
+        self._collapsing_row = None  # row currently animating back to normal height, or None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 20, 28, 20)
@@ -80,16 +83,9 @@ class LatePage(QWidget):
         apply_live_style(self.subtitle, lambda c: f"color: {c['TEXT_SECONDARY']}; font-size: 11px;")
         layout.addWidget(self.subtitle)
 
-        self.table = QTableWidget(0, len(_COLUMNS) + 1)
-        self.table.setHorizontalHeaderLabels(_COLUMNS + ["Actions"])
+        self.table = QTableWidget(0, len(_COLUMNS))
+        self.table.setHorizontalHeaderLabels(_COLUMNS)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        # The Actions column holds only the Send Mail button -- fixed and
-        # narrow, not stretched like the data columns, so it stays its own
-        # separate space instead of competing for width with real data.
-        self.table.horizontalHeader().setSectionResizeMode(
-            _ACTIONS_COLUMN_INDEX, QHeaderView.ResizeMode.Fixed
-        )
-        self.table.setColumnWidth(_ACTIONS_COLUMN_INDEX, _ACTIONS_COLUMN_WIDTH)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -106,7 +102,27 @@ class LatePage(QWidget):
         """)
         layout.addWidget(self.table, stretch=1)
 
-        # Overlay button shown over whichever row the mouse is hovering.
+        # Qt's own default row height -- the height every row returns to
+        # once collapsed, and the baseline the expanded height is computed
+        # from. Read once up front rather than off row 0, since row 0 may
+        # not exist yet (empty table) or may itself be mid-animation later.
+        self._normal_row_height = self.table.verticalHeader().defaultSectionSize()
+
+        # Reusable animation objects (not recreated per hover) so rapid
+        # cursor movement across many rows can never leave orphaned
+        # animations running -- each new hover just restarts these.
+        self._expand_anim = QVariantAnimation(self)
+        self._expand_anim.setDuration(_EXPAND_ANIMATION_MS)
+        self._expand_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._expand_anim.valueChanged.connect(self._on_expand_value_changed)
+
+        self._collapse_anim = QVariantAnimation(self)
+        self._collapse_anim.setDuration(_EXPAND_ANIMATION_MS)
+        self._collapse_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._collapse_anim.valueChanged.connect(self._on_collapse_value_changed)
+        self._collapse_anim.finished.connect(self._on_collapse_finished)
+
+        # Overlay button shown over whichever row is currently expanded.
         # Parented to the viewport so it scrolls with the rows and sits on
         # top of the cell items.
         self.send_button = QPushButton("Send Mail", self.table.viewport())
@@ -126,15 +142,23 @@ class LatePage(QWidget):
         self.table.viewport().setMouseTracking(True)
         self.table.cellEntered.connect(self._on_cell_entered)
         self.table.viewport().installEventFilter(self)
+        self.table.verticalScrollBar().valueChanged.connect(self._reposition_button_for_expanded_row)
+        self.table.horizontalScrollBar().valueChanged.connect(self._reposition_button_for_expanded_row)
 
         self.refresh()
 
     def refresh(self):
+        # A rebuilt table must never carry over an expanded row from
+        # before -- stop anything in flight and reset state up front.
+        self._expand_anim.stop()
+        self._collapse_anim.stop()
+        self._expanded_row = None
+        self._collapsing_row = None
+        self.send_button.hide()
+
         threshold_hours = notification_settings.threshold_hours
         records = get_stale_records(threshold_hours)
         self.records = records
-        self._hover_row = None
-        self.send_button.hide()
 
         self.subtitle.setText(
             f"Pending or rejected for at least {_format_threshold(threshold_hours)} "
@@ -164,57 +188,141 @@ class LatePage(QWidget):
                         item.setBackground(QBrush(QColor(color)))
                 self.table.setItem(row_index, col_index, item)
 
-            # An empty, non-editable item under the button so the column
-            # paints with the table's normal item background/selection
-            # styling instead of being left blank, and so hovering into it
-            # still fires cellEntered (see _on_cell_entered).
-            actions_item = QTableWidgetItem("")
-            actions_item.setFlags(actions_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.table.setItem(row_index, _ACTIONS_COLUMN_INDEX, actions_item)
+            self.table.setRowHeight(row_index, self._normal_row_height)
 
     def showEvent(self, event):
         self.refresh()
         super().showEvent(event)
 
     def _on_cell_entered(self, row, column):
-        """Moves the Send Mail button over `row` and shows it, centered
-        within the dedicated Actions column -- NOT centered across the
-        whole row, which used to land the button on top of the "Project
-        Name" column and hide that row's actual value underneath it."""
+        """Expands `row` (opening the button gap) and collapses whatever
+        row was previously expanded. A no-op if `row` is already the
+        expanded row -- notably, this is also what keeps the row expanded
+        while the cursor moves DOWN into the newly opened gap: since the
+        row's own height now covers that gap, the item cells still span
+        it, so cellEntered keeps reporting the same row rather than
+        signalling a leave."""
         if row < 0 or row >= len(self.records):
-            self.send_button.hide()
-            self._hover_row = None
+            self._collapse_expanded_row()
             return
+        if row == self._expanded_row:
+            return
+        self._expand_row(row)
 
-        self._hover_row = row
-        column_x = self.table.columnViewportPosition(_ACTIONS_COLUMN_INDEX)
-        column_width = self.table.columnWidth(_ACTIONS_COLUMN_INDEX)
-        x = column_x + max(0, (column_width - _SEND_BUTTON_WIDTH) // 2)
-        y = self.table.rowViewportPosition(row) + (self.table.rowHeight(row) - _SEND_BUTTON_HEIGHT) // 2
-        self.send_button.move(x, y)
+    def _expand_row(self, row):
+        previous = self._expanded_row
+        self._expand_anim.stop()
+        self._collapse_anim.stop()
+
+        if previous is not None and previous != row and previous < self.table.rowCount():
+            self._collapsing_row = previous
+            self._collapse_anim.setStartValue(float(self.table.rowHeight(previous)))
+            self._collapse_anim.setEndValue(float(self._normal_row_height))
+            self._collapse_anim.start()
+        else:
+            self._collapsing_row = None
+
+        self._expanded_row = row
+        expanded_height = self._normal_row_height + _SEND_BUTTON_HEIGHT + 2 * _GAP_PADDING
+        self._expand_anim.setStartValue(float(self.table.rowHeight(row)))
+        self._expand_anim.setEndValue(float(expanded_height))
         self.send_button.show()
         self.send_button.raise_()
+        self._expand_anim.start()
+
+    def _collapse_expanded_row(self):
+        """Collapses whatever row is currently expanded (if any) and hides
+        the button -- used when the cursor truly leaves the table."""
+        if self._expanded_row is None:
+            return
+        row = self._expanded_row
+        self._expanded_row = None
+        self.send_button.hide()
+
+        self._expand_anim.stop()
+        self._collapse_anim.stop()
+        if row < self.table.rowCount():
+            self._collapsing_row = row
+            self._collapse_anim.setStartValue(float(self.table.rowHeight(row)))
+            self._collapse_anim.setEndValue(float(self._normal_row_height))
+            self._collapse_anim.start()
+
+    def _on_expand_value_changed(self, value):
+        row = self._expanded_row
+        if row is None or row >= self.table.rowCount():
+            return
+        self.table.setRowHeight(row, int(value))
+        self._position_button_over_row(row, float(value))
+
+    def _on_collapse_value_changed(self, value):
+        row = self._collapsing_row
+        if row is None or row >= self.table.rowCount():
+            return
+        self.table.setRowHeight(row, int(value))
+
+    def _on_collapse_finished(self):
+        row = self._collapsing_row
+        self._collapsing_row = None
+        if row is not None and row < self.table.rowCount():
+            self.table.setRowHeight(row, self._normal_row_height)
+
+    def _position_button_over_row(self, row, current_height):
+        """Centers the button horizontally across the full table width,
+        vertically centered within whatever extra gap the row currently
+        has open below its normal content (grows smoothly as the
+        animation progresses, rather than only appearing once finished)."""
+        extra = max(0.0, current_height - self._normal_row_height)
+        row_top = self.table.rowViewportPosition(row)
+        y = row_top + self._normal_row_height + max(0.0, (extra - _SEND_BUTTON_HEIGHT) / 2)
+        viewport_width = self.table.viewport().width()
+        x = max(0, (viewport_width - _SEND_BUTTON_WIDTH) // 2)
+        self.send_button.move(int(x), int(y))
+
+    def _reposition_button_for_expanded_row(self, *_args):
+        """Keeps the button glued to its row when the table is scrolled --
+        hides it instead of leaving it floating over the wrong row if the
+        expanded row scrolls out of the visible viewport entirely."""
+        if self._expanded_row is None or self._expanded_row >= self.table.rowCount():
+            return
+        row = self._expanded_row
+        row_height = self.table.rowHeight(row)
+        row_top = self.table.rowViewportPosition(row)
+        viewport_height = self.table.viewport().height()
+        if row_top + row_height <= 0 or row_top >= viewport_height:
+            self.send_button.hide()
+            return
+        self.send_button.show()
+        self._position_button_over_row(row, float(row_height))
 
     def eventFilter(self, obj, event):
-        """Hides the Send Mail button once the mouse leaves the table
-        viewport, so it doesn't linger over a row after the cursor moves
-        away (cellEntered alone only fires when entering a new cell)."""
+        """Collapses the expanded row once the mouse truly leaves the
+        table viewport. A plain QEvent.Leave isn't enough on its own: Qt
+        also delivers Leave to the viewport when the cursor moves onto the
+        Send Mail button (a child widget occupying part of the expanded
+        row's gap), even though the cursor is still visually within the
+        viewport's bounds -- collapsing on that would hide the button out
+        from under a cursor that's trying to click it. Checking the
+        cursor's actual position against the viewport's rect distinguishes
+        "moved onto the button" (still inside) from "actually left"."""
         if obj is self.table.viewport() and event.type() == QEvent.Type.Leave:
-            self.send_button.hide()
-            self._hover_row = None
+            pos = self.table.viewport().mapFromGlobal(QCursor.pos())
+            if not self.table.viewport().rect().contains(pos):
+                self._collapse_expanded_row()
         return super().eventFilter(obj, event)
 
     def _on_send_mail_clicked(self):
-        if self._hover_row is None or self._hover_row >= len(self.records):
+        if self._expanded_row is None or self._expanded_row >= len(self.records):
             return
-        record = self.records[self._hover_row]
+        record = self.records[self._expanded_row]
         self._send_mail_for_row(record)
 
     def _send_mail_for_row(self, record):
         """Opens a compose window in whatever mail client is registered
         as the system default, addressed to this record's sender (the
         same "sender" column stored for this timecard email in the
-        database), pre-filled with a reply-style subject.
+        database), pre-filled with a reply-style subject and, if one is
+        configured in Settings (see ui/late_mail_body_settings.py), a
+        preset body -- used exactly as typed, no per-record templating.
 
         Uses a mailto: link handed off to QDesktopServices rather than
         driving Outlook via COM, so it works with Outlook classic, new
@@ -235,6 +343,10 @@ class LatePage(QWidget):
         reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}" if subject else ""
 
         mailto_url = f"mailto:{quote(sender)}?subject={quote(reply_subject)}"
+
+        preset_body = late_mail_body_settings.preset_body
+        if preset_body:
+            mailto_url += f"&body={quote(preset_body)}"
 
         if not QDesktopServices.openUrl(QUrl(mailto_url)):
             QMessageBox.critical(
