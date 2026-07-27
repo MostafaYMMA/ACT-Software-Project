@@ -838,7 +838,7 @@ class CurrentSheetPage(QWidget):
         sync_on = bool(email)
         start_str, end_str = self._finalize_period()
 
-        active_path = get_active_export_path()
+        active_path = get_active_export_path(self._effective_project_type())
         sheet_text = (
             f"{active_path} is closed as the final export"
             if active_path else "the export sheet is created and closed"
