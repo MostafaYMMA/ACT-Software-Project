@@ -13,12 +13,35 @@ The chosen photo's path is saved via QSettings (same key ProfileCircle
 reads), so select_account_page.py's tiles pick it up too.
 """
 
-from PySide6.QtWidgets import QMenu, QFileDialog, QDialog, QVBoxLayout, QLabel
+from PySide6.QtWidgets import QMenu, QFileDialog
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QPixmap
 
 from ui.profile_circle import ProfileCircle, SETTINGS_ORG, SETTINGS_APP
 from ui.theme_manager import theme_manager
+from ui.photo_lightbox import PhotoLightbox
+
+
+def _find_main_window(widget):
+    """Walks up the parent chain to the ui.app.MainWindow instance,
+    identified by its objectName ("mainWindow", set in
+    ui/app.py::MainWindow.__init__) rather than an isinstance check, so
+    this file doesn't need to import ui.app (which itself imports THIS
+    file, to build the Avatar in its top bar -- a real circular import).
+
+    Deliberately NOT the same as widget.window(): main.py wraps
+    MainWindow in a QStackedWidget inside its own top-level RootWindow
+    (a QMainWindow, for the welcome-page/main-window handoff animation),
+    so window() would resolve to RootWindow -- a different, larger
+    coordinate space that isn't what "cover the whole window, sidebar and
+    top bar included" means here. MainWindow itself is what actually
+    contains the sidebar/top bar this needs to sit above."""
+    w = widget
+    while w is not None:
+        if w.objectName() == "mainWindow":
+            return w
+        w = w.parentWidget()
+    return widget.window()  # fallback -- shouldn't normally be reached
 
 
 def _menu_stylesheet():
@@ -105,16 +128,10 @@ class Avatar(ProfileCircle):
     def _show_view_dialog(self):
         if self._pixmap is None:
             return
-        c = theme_manager.colors()
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Profile photo")
-        dialog.setStyleSheet(f"background-color: {c['BG']};")
-        layout = QVBoxLayout(dialog)
-        label = QLabel()
-        scaled = self._pixmap.scaled(
-            260, 260, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
-        )
-        label.setPixmap(scaled)
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(label)
-        dialog.exec()
+        main_window = _find_main_window(self)
+        # Kept on self so it isn't garbage-collected mid-animation (same
+        # reasoning as the *_anim attributes elsewhere in this app) --
+        # overwritten, not explicitly torn down, on the next "View photo"
+        # click; the previous lightbox's widgets are already deleteLater'd
+        # by then regardless.
+        self._lightbox = PhotoLightbox(main_window, self, self._pixmap)
