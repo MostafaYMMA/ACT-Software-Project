@@ -722,6 +722,11 @@ class MainWindow(QWidget):
         switch_account_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         switch_account_btn.clicked.connect(self.switch_account_requested.emit)
         top_layout.addWidget(switch_account_btn)
+        # This app is one-account-per-laptop (single local Outlook mailbox,
+        # no multi-user switching) -- hidden rather than removed, since the
+        # signal/routing it drives (RootWindow._on_switch_account_requested)
+        # is left intact in case that assumption ever changes.
+        switch_account_btn.hide()
 
         top_layout.addStretch()
 
