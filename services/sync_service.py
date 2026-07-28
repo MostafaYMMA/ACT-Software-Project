@@ -1,6 +1,7 @@
 import os
 import shutil
 import tempfile
+import traceback
 from datetime import datetime, timedelta
 
 from filter_service import get_approved_cards, get_expense_reports, get_newest_received
@@ -16,6 +17,7 @@ from storage_service import (
     get_last_scan_time, set_last_scan_time,
 )
 from outlook_service import send_sync_mail, scan_sync_mails, read_collected_sync_mails
+from mail_export import archive_matched_email, TIMECARDS_ARCHIVE_DIR, EXPENSES_ARCHIVE_DIR
 from sharepoint_service import (
     require_sharepoint_folder, read_boundary_date, write_boundary,
     write_device_sheet, merge_device_sheets, print_workbook,
@@ -87,6 +89,14 @@ def sync_cards(progress_callback=None):
 
     all_entries = []
     for email in emails:
+        if email.get("status") == "Approved":
+            try:
+                archive_matched_email(
+                    email["mail_item"], email["received"],
+                    TIMECARDS_ARCHIVE_DIR, "timecard",
+                )
+            except Exception:
+                traceback.print_exc()
         entries = extract(email)
         print(f"  - '{email['subject']}' -> {len(entries)} entries")
         all_entries.extend(entries)
@@ -114,6 +124,16 @@ def sync_cards(progress_callback=None):
 
     expense_entries = []
     for email in expense_emails:
+        # process_email_expense's match logic requires "Approved" to be
+        # one of the three terms present -- every match here is already
+        # an approved expense report, no separate status field to check.
+        try:
+            archive_matched_email(
+                email["mail_item"], email["received"],
+                EXPENSES_ARCHIVE_DIR, "expense",
+            )
+        except Exception:
+            traceback.print_exc()
         entries = extract_expense(email)
         print(f"  - '{email['subject']}' -> {len(entries)} expense line(s)")
         expense_entries.extend(entries)
