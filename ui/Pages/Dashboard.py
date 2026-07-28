@@ -18,16 +18,12 @@ from sync_service import sync_cards
 from outlook_service import com_thread
 from storage_service import (
     get_status_project_counts, get_status_rows, get_status_columns,
-    update_status_record_field, PROJECT_TYPE_LABELS,
+    PROJECT_TYPE_LABELS,
     get_expense_rows, get_expense_count, get_expense_columns,
 )
 from date_utils import get_this_month_range, get_custom_range
 
 CARD_ANIM_MS = 220
-
-# Columns whose edits only make sense as numbers -- a non-numeric entry is
-# rejected and the cell reverts to what the database holds.
-_NUMERIC_COLUMNS = {"rate", "Qty"}
 
 # Accent used for the QDateEdit calendar popups on this page, so they read
 # as the same "orange" filter UI as the Records/History pages instead of
@@ -456,16 +452,15 @@ class DashboardPage(QWidget):
 
         self.table = QTableWidget(0, 0)
         configure_grid(self.table)
-        # Double-click puts the cell in edit mode; _on_item_changed writes the
-        # edit back to the database (that's how rate gets set -- there's no
-        # other entry point for it).
-        self.table.setEditTriggers(QTableWidget.EditTrigger.DoubleClicked)
+        # Read-only: the Dashboard is a live view of scanned mail, not an
+        # editing surface -- data can only be edited on the Current Sheet
+        # page (see ui/Pages/CurrentSheet.py's own edit path via
+        # storage_service.update_current_sheet_field).
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self._populating_table = False
         self._displayed_columns = []
         self._displayed_rows = []
         self._current_status_key = "approve"
-        self.table.itemChanged.connect(self._on_item_changed)
         apply_live_style(self.table, lambda c: f"""
             QTableWidget {{
                 border: 1px solid {c['BORDER']}; background: {c['BG']}; color: {c['TEXT_PRIMARY']};
@@ -669,23 +664,14 @@ class DashboardPage(QWidget):
         self._displayed_rows = rows
         self._current_status_key = status_key
 
-        self._populating_table = True
-        try:
-            set_header_labels(self.table, columns)
-            self.table.setRowCount(len(rows))
-            for row_index, row in enumerate(rows):
-                for col_index, column in enumerate(columns):
-                    value = row.get(column)
-                    item = QTableWidgetItem("" if value is None else str(value))
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                    # Expense rows are read-only (see _on_item_changed) -- take
-                    # the edit affordance off the cell so a double-click on the
-                    # expenses grid doesn't open an editor that goes nowhere.
-                    if status_key == "expenses":
-                        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    self.table.setItem(row_index, col_index, item)
-        finally:
-            self._populating_table = False
+        set_header_labels(self.table, columns)
+        self.table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            for col_index, column in enumerate(columns):
+                value = row.get(column)
+                item = QTableWidgetItem("" if value is None else str(value))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(row_index, col_index, item)
 
         self._fit_columns()
         # The grid fills in top-to-bottom instead of the whole block
@@ -704,52 +690,6 @@ class DashboardPage(QWidget):
         if pending_key is not None:
             self._pending_status_key = None
             self._load_status_rows(pending_key)
-
-    def _on_item_changed(self, item):
-        """Persists a double-click cell edit to the database. Fires on every
-        setItem too, so the _populating_table guard filters those out. An edit
-        that can't be saved -- non-numeric rate/Qty, an unknown column, or a
-        DB rejection -- is rolled back in the cell so the grid never shows a
-        value the database doesn't hold."""
-        if self._populating_table:
-            return
-
-        # The expenses grid is read-only here -- its rows live in the expenses
-        # table, not the status tables update_status_record_field writes to, so
-        # persisting an edit through that path would target the wrong table.
-        if self._current_status_key == "expenses":
-            return
-
-        row_index, col_index = item.row(), item.column()
-        if row_index >= len(self._displayed_rows) or col_index >= len(self._displayed_columns):
-            return
-
-        record = self._displayed_rows[row_index]
-        column = self._displayed_columns[col_index]
-        old_value = record.get(column)
-        new_value = item.text().strip()
-
-        def revert():
-            self._populating_table = True
-            try:
-                item.setText("" if old_value is None else str(old_value))
-            finally:
-                self._populating_table = False
-
-        if str(old_value or "") == new_value:
-            return
-
-        if column in _NUMERIC_COLUMNS:
-            try:
-                new_value = float(new_value) if new_value else 0.0
-            except ValueError:
-                revert()
-                return
-
-        if update_status_record_field(self._current_status_key, record.get("id"), column, new_value):
-            record[column] = new_value
-        else:
-            revert()
 
     def scan_inbox(self):
         self.scan_btn.setEnabled(False)
