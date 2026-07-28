@@ -966,6 +966,61 @@ def init_db():
         "color_updated_at TEXT", "color_updated_by TEXT",
     ])
 
+    # Read-only audit trail of every value that has actually CHANGED on a
+    # current_sheet row, from either origin: an edit made here (source =
+    # "local") or one merged in from the other device (source = that
+    # sender's device id). Nothing reads this to decide behaviour -- it
+    # does not participate in the sync merge at all, which stays
+    # last-write-wins exactly as before (see _apply_rate_if_newer /
+    # _apply_color_if_newer). It exists purely so an overwrite can be
+    # explained after the fact.
+    #
+    # Keyed by timecard_id, NOT current_sheet.id, deliberately: timecard_id
+    # is current_sheet's UNIQUE, stable link to timecards_approved, whereas
+    # current_sheet.id is an autoincrement on a table whose rows get deleted
+    # and re-inserted (finalize_active_export deletes a closed division's
+    # rows; sync_current_sheet re-INSERTs, see its docstring). Keying on the
+    # id would silently orphan a row's history the first time that churn
+    # happened.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS change_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timecard_id INTEGER,
+            field_name TEXT,
+            old_value TEXT,
+            new_value TEXT,
+            changed_at TEXT,
+            source TEXT
+        )
+    """)
+    # The two access patterns get_change_log_for_row/get_recent_changes use.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_change_log_timecard ON change_log (timecard_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_change_log_changed_at ON change_log (changed_at)"
+    )
+
+    # "Value as of the last sync" for a field that has been edited locally
+    # since then but not yet synced out. update_current_sheet_field /
+    # set_current_sheet_row_color insert a row here (once -- see their own
+    # comments) instead of writing change_log directly, so four edits made
+    # back-to-back before a sync don't produce four log entries; the flush
+    # in build_outgoing_snapshot (the moment an outgoing sync actually
+    # happens) is what turns whatever's still pending here into exactly
+    # ONE change_log entry per field, then deletes the row. Nothing reads
+    # this to decide behaviour, same as change_log -- last-write-wins sync
+    # merging is completely unaffected by any of this.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pending_change_baseline (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timecard_id INTEGER,
+            field_name TEXT,
+            baseline_value TEXT,
+            UNIQUE(timecard_id, field_name)
+        )
+    """)
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS export_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1565,6 +1620,169 @@ def prune_old_month_current_sheet_rows(reference_date=None):
         conn.close()
 
 
+def _as_log_text(value):
+    """None stays NULL; everything else is stored as text, so the one
+    old_value/new_value column pair can hold rates, colours and free-text
+    cells alike without a type column."""
+    return None if value is None else str(value)
+
+
+def _values_differ(old_value, new_value):
+    """True only when this is a genuine change -- the guard behind "never
+    log a no-op write".
+
+    Compares numerically when both sides parse as numbers, so the rate
+    round trip (user types "100", SQLite stores REAL 100.0, next read
+    returns 100.0) doesn't record a change on every save. Anything else
+    falls back to an exact text compare: colours and text cells are meant
+    to be literal, and "#FFD966" has no numeric reading.
+    """
+    if old_value is None and new_value is None:
+        return False
+    if old_value is None or new_value is None:
+        return True
+    try:
+        return float(old_value) != float(new_value)
+    except (TypeError, ValueError):
+        return str(old_value) != str(new_value)
+
+
+def _log_change(conn, timecard_id, field_name, old_value, new_value, source):
+    """
+    Appends one entry to the read-only change_log (see init_db) for a
+    current_sheet field that actually changed.
+
+    Deliberately silent no-ops on "nothing really changed" and on a row it
+    can't attribute (timecard_id None), so every call site can just call it
+    unconditionally right after its UPDATE instead of repeating those two
+    checks. Returns True only when a row was actually written.
+
+    Two kinds of caller, both already collapsed to "exactly one logical
+    change" by the time they get here: _flush_pending_change_baselines
+    (an outgoing sync flushing accumulated local edits -- source is the
+    local username) and _apply_rate_if_newer/_apply_color_if_newer (an
+    incoming sync payload -- source is the sending device's identity).
+    """
+    if timecard_id is None:
+        return False
+    if not _values_differ(old_value, new_value):
+        return False
+
+    conn.execute(
+        "INSERT INTO change_log "
+        "(timecard_id, field_name, old_value, new_value, changed_at, source) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            timecard_id, field_name,
+            _as_log_text(old_value), _as_log_text(new_value),
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            source,
+        ),
+    )
+    return True
+
+
+def _ensure_pending_baseline(conn, timecard_id, field_name, current_value):
+    """
+    Records "the value this field had right before its first unsynced
+    edit", if it hasn't already. Called by update_current_sheet_field /
+    set_current_sheet_row_color BEFORE they write the new value, with
+    current_value being the value about to be overwritten.
+
+    INSERT OR IGNORE against the (timecard_id, field_name) UNIQUE
+    constraint (see init_db) is what makes this a no-op on the 2nd/3rd/4th
+    edit in a row: only the FIRST edit since the last flush inserts a row,
+    so the baseline always points back to the value as of the last sync,
+    never to some edit in between. Silently does nothing for timecard_id
+    None -- same "can't attribute it" case _log_change used to guard.
+    """
+    if timecard_id is None:
+        return
+    conn.execute(
+        "INSERT OR IGNORE INTO pending_change_baseline "
+        "(timecard_id, field_name, baseline_value) VALUES (?, ?, ?)",
+        (timecard_id, field_name, _as_log_text(current_value)),
+    )
+
+
+def _flush_pending_change_baselines(conn, timecard_ids, source):
+    """
+    Turns every pending_change_baseline row for the given timecard_ids
+    into exactly one change_log entry each (baseline_value -> current
+    current_sheet value), then deletes those baseline rows. This is the
+    "an outgoing sync actually happened" moment -- see
+    build_outgoing_snapshot, the only caller -- so accumulated local edits
+    finally get written to the audit trail as ONE entry per field,
+    regardless of how many edits happened since the last sync.
+
+    _log_change itself still enforces "only log a real change" -- a field
+    edited then edited back to its original value before ever syncing
+    produces no log entry at all, just a deleted baseline row.
+
+    A baseline row whose current_sheet row is gone by flush time (e.g.
+    finalize deleted it, or a re-scan pruned it) is dropped without
+    logging -- there's no current value left to log a change TO.
+    """
+    if not timecard_ids:
+        return
+
+    placeholders = ",".join("?" * len(timecard_ids))
+    baselines = conn.execute(
+        f"SELECT id, timecard_id, field_name, baseline_value "
+        f"FROM pending_change_baseline WHERE timecard_id IN ({placeholders})",
+        list(timecard_ids),
+    ).fetchall()
+
+    for baseline_id, timecard_id, field_name, baseline_value in baselines:
+        current_row = conn.execute(
+            f'SELECT "{field_name}" FROM current_sheet WHERE timecard_id = ?',
+            (timecard_id,),
+        ).fetchone()
+        if current_row is not None:
+            _log_change(conn, timecard_id, field_name, baseline_value, current_row[0], source)
+        conn.execute("DELETE FROM pending_change_baseline WHERE id = ?", (baseline_id,))
+
+
+def get_change_log_for_row(timecard_id):
+    """One row's edit history, oldest first, as a list of dicts.
+
+    Oldest-first (ascending changed_at) so the table reads top-to-bottom
+    the way a person naturally reads a history -- first thing that
+    happened at the top, most recent at the bottom.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, timecard_id, field_name, old_value, new_value, changed_at, source "
+            "FROM change_log WHERE timecard_id = ? "
+            "ORDER BY changed_at ASC, id ASC",
+            (timecard_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_recent_changes(limit=100):
+    """The most recent `limit` changes across every row -- the general
+    "what has been changing lately" view. Selecting "most recent" still
+    needs newest-first internally (that's what the LIMIT has to bite
+    against), but the returned list is reversed to oldest-first before
+    being handed back, matching get_change_log_for_row's reading order."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, timecard_id, field_name, old_value, new_value, changed_at, source "
+            "FROM change_log ORDER BY changed_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+    finally:
+        conn.close()
+
+
 def update_current_sheet_field(row_id, column, value):
     """
     Writes one cell edit from the Current Sheet grid back to its row
@@ -1585,6 +1803,12 @@ def update_current_sheet_field(row_id, column, value):
     isn't read by the snapshot and has no rate_updated_at/rate_updated_by
     to merge with, so without this a rate typed into Current Sheet would
     stay on this device forever, never reaching the other user.
+
+    Does NOT write to change_log -- it only ensures a pending_change_baseline
+    row exists (see _ensure_pending_baseline). Several edits in a row before
+    a sync accumulate silently; build_outgoing_snapshot's flush is what
+    turns them into a single change_log entry once an outgoing sync
+    actually happens (see _flush_pending_change_baselines).
     """
     if column in ("id", "timecard_id", "row_color"):
         return False
@@ -1594,6 +1818,17 @@ def update_current_sheet_field(row_id, column, value):
         valid_columns = {row[1] for row in conn.execute('PRAGMA table_info("current_sheet")')}
         if column not in valid_columns:
             return False
+
+        # Read before writing: the baseline (if this is the first unsynced
+        # edit to this field) needs the value about to be overwritten, and
+        # timecard_id is the identity it's recorded against. timecard_id is
+        # the same value the rate push-through below has always used.
+        before = conn.execute(
+            f'SELECT timecard_id, "{column}" FROM current_sheet WHERE id = ?',
+            (row_id,),
+        ).fetchone()
+        timecard_id, old_value = before if before else (None, None)
+
         try:
             cursor = conn.execute(
                 f'UPDATE current_sheet SET "{column}" = ? WHERE id = ?',
@@ -1602,12 +1837,8 @@ def update_current_sheet_field(row_id, column, value):
         except sqlite3.IntegrityError:
             return False
         updated = cursor.rowcount > 0
-        timecard_id = None
-        if updated and column == "rate":
-            row = conn.execute(
-                "SELECT timecard_id FROM current_sheet WHERE id = ?", (row_id,)
-            ).fetchone()
-            timecard_id = row[0] if row else None
+        if updated:
+            _ensure_pending_baseline(conn, timecard_id, column, old_value)
         conn.commit()
     finally:
         conn.close()
@@ -1633,16 +1864,28 @@ def set_current_sheet_row_color(row_id, hex_color):
     Kept apart from update_current_sheet_field, which refuses row_color,
     so a stray cell edit can never write a colour and vice versa. Returns
     True when a row was updated.
+
+    Does NOT write to change_log -- see update_current_sheet_field's
+    docstring; same pending_change_baseline / flush-on-sync contract.
     """
     conn = sqlite3.connect(DB_PATH)
     try:
+        # Read before writing, same reasoning as update_current_sheet_field.
+        before = conn.execute(
+            "SELECT timecard_id, row_color FROM current_sheet WHERE id = ?", (row_id,)
+        ).fetchone()
+        timecard_id, old_color = before if before else (None, None)
+
         cursor = conn.execute(
             "UPDATE current_sheet SET row_color = ?, color_updated_at = ?, color_updated_by = ? "
             "WHERE id = ?",
             (hex_color, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), get_device_id(), row_id),
         )
+        updated = cursor.rowcount > 0
+        if updated:
+            _ensure_pending_baseline(conn, timecard_id, "row_color", old_color)
         conn.commit()
-        return cursor.rowcount > 0
+        return updated
     finally:
         conn.close()
 
@@ -2304,7 +2547,7 @@ def _row_dict_to_entry(row_dict, status_label):
 _UNSET = object()  # distinguishes "since_date not passed" from "since_date=None" below
 
 
-def build_outgoing_snapshot(project_type=None, since_date=_UNSET):
+def build_outgoing_snapshot(project_type=None, since_date=_UNSET, local_username=None):
     """
     Packages everything THIS device has scanned itself (origin = this
     device's id -- see save_cards) for the current open period into a
@@ -2332,6 +2575,15 @@ def build_outgoing_snapshot(project_type=None, since_date=_UNSET):
     outgoing counter (see _next_outgoing_seq) -- only meaningful to the
     email channel's apply_incoming_snapshot supersede check; the
     SharePoint channel ignores it entirely.
+
+    This is the one place an outgoing sync of THIS device's own data
+    actually happens (every caller -- push_updates, finalize_month's
+    closing snapshot, the SharePoint channel -- funnels through here), so
+    it's also where accumulated local edits get flushed into change_log
+    (see _flush_pending_change_baselines): one entry per field actually
+    changed since the last flush, not one per edit. local_username is who
+    that entry is attributed to; "local" is the fallback for a caller that
+    doesn't have one (see update_current_sheet_field's old contract).
     """
     device_id = get_device_id()
     period_start = get_last_export_date() if since_date is _UNSET else since_date
@@ -2352,6 +2604,7 @@ def build_outgoing_snapshot(project_type=None, since_date=_UNSET):
         }
 
         rows = []
+        approved_timecard_ids = []
         for status_label, table_name in STATUS_TABLES.items():
             clauses = ["origin = ?"]
             params = [device_id]
@@ -2378,7 +2631,14 @@ def build_outgoing_snapshot(project_type=None, since_date=_UNSET):
                 # row's colour on.
                 if table_name == "timecards_approved":
                     row_dict.update(colors_by_timecard.get(row_dict.get("id"), {}))
+                    approved_timecard_ids.append(row_dict.get("id"))
                 rows.append(_row_dict_to_entry(row_dict, status_label))
+
+        # change_log is only ever keyed by timecard_id, which points at
+        # timecards_approved -- current_sheet (and therefore
+        # pending_change_baseline) only ever has rows for Approved
+        # timecards, so Pending/Rejected rows have nothing to flush.
+        _flush_pending_change_baselines(conn, approved_timecard_ids, local_username or "local")
 
         seq = _next_outgoing_seq(conn)
         conn.commit()
@@ -2450,6 +2710,10 @@ def apply_incoming_snapshot(payload):
                 rate=entry.get("rate"),
                 updated_at=entry.get("rate_updated_at"),
                 updated_by=entry.get("rate_updated_by"),
+                # Change-log attribution: the sending device from this
+                # payload's metadata, so the log reads "who overwrote my
+                # value" rather than just "sync".
+                source=device_id,
             ):
                 rates_applied += 1
 
@@ -2467,6 +2731,7 @@ def apply_incoming_snapshot(payload):
                 row_color=entry.get("row_color"),
                 updated_at=entry.get("color_updated_at"),
                 updated_by=entry.get("color_updated_by"),
+                source=device_id,  # see the rate call above
             ):
                 colors_applied += 1
 
@@ -2482,7 +2747,7 @@ def apply_incoming_snapshot(payload):
     }
 
 
-def _apply_color_if_newer(conn, status_label, natural_key, row_color, updated_at, updated_by):
+def _apply_color_if_newer(conn, status_label, natural_key, row_color, updated_at, updated_by, source=None):
     """
     Last-write-wins merge for a Current Sheet row colour, the same shape as
     _apply_rate_if_newer: the incoming colour only lands if it's strictly
@@ -2503,7 +2768,7 @@ def _apply_color_if_newer(conn, status_label, natural_key, row_color, updated_at
         return False
 
     row = conn.execute(
-        'SELECT cs.id, cs.color_updated_at FROM current_sheet cs '
+        'SELECT cs.id, cs.color_updated_at, cs.timecard_id, cs.row_color FROM current_sheet cs '
         'JOIN timecards_approved t ON t.id = cs.timecard_id '
         'WHERE t.day = ? AND t."Project Number" = ? AND t."Task Name" = ? '
         'AND t.person_number = ? AND t.received_month = ?',
@@ -2512,7 +2777,7 @@ def _apply_color_if_newer(conn, status_label, natural_key, row_color, updated_at
     if row is None:
         return False  # the timecard itself hasn't landed here -- nothing to colour
 
-    current_sheet_id, stored_updated_at = row
+    current_sheet_id, stored_updated_at, timecard_id, stored_color = row
     incoming_parsed = _parse_received(updated_at)
     stored_parsed = _parse_received(stored_updated_at) if stored_updated_at else None
     if incoming_parsed is not None and stored_parsed is not None and stored_parsed >= incoming_parsed:
@@ -2523,10 +2788,16 @@ def _apply_color_if_newer(conn, status_label, natural_key, row_color, updated_at
         "WHERE id = ?",
         (row_color, updated_at, updated_by, current_sheet_id),
     )
+    # Logged only when the colour genuinely differs: an incoming payload
+    # can clear the newer-timestamp check above and still be carrying the
+    # colour this row already has, which is not something to record as an
+    # overwrite (_log_change drops it).
+    _log_change(conn, timecard_id, "row_color", stored_color, row_color,
+                source or updated_by or "sync")
     return True
 
 
-def _apply_rate_if_newer(conn, status_label, natural_key, rate, updated_at, updated_by):
+def _apply_rate_if_newer(conn, status_label, natural_key, rate, updated_at, updated_by, source=None):
     """
     The shared last-write-wins merge behind BOTH the per-row rate carried
     inside a snapshot and a standalone rate-update message (see
@@ -2567,10 +2838,19 @@ def _apply_rate_if_newer(conn, status_label, natural_key, rate, updated_at, upda
         # (which reads current_sheet, not timecards_approved) would keep
         # showing whatever rate that row had when sync_current_sheet first
         # linked it, silently going stale on the receiving device.
+        stored_row = conn.execute(
+            "SELECT rate FROM current_sheet WHERE timecard_id = ?", (record_id,)
+        ).fetchone()
         conn.execute(
             "UPDATE current_sheet SET rate = ? WHERE timecard_id = ?",
             (rate, record_id),
         )
+        # Only when there is a current_sheet row at all (the timecard can
+        # exist while its sheet row is finalized/pruned away) and the value
+        # really moved -- _log_change enforces the latter.
+        if stored_row is not None:
+            _log_change(conn, record_id, "rate", stored_row[0], rate,
+                        source or updated_by or "sync")
     return True
 
 

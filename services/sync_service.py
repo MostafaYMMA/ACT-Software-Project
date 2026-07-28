@@ -311,7 +311,7 @@ def _save_incoming_export_copy(source_path, export_name):
         pass
 
 
-def push_updates(recipient_email, project_type=None, progress_callback=None):
+def push_updates(recipient_email, project_type=None, progress_callback=None, local_username=None):
     """
     Mails the other user a full current-period snapshot of what THIS
     device has stored.
@@ -320,6 +320,10 @@ def push_updates(recipient_email, project_type=None, progress_callback=None):
     out of Outlook and into the database is Scan Inbox's job (sync_cards);
     doing it again here would just re-do that work on every Update, and
     slowly, for no new data.
+
+    local_username -- passed straight through to build_outgoing_snapshot,
+    which is where this device's own local edits get flushed into
+    change_log as part of building this snapshot (see its docstring).
     """
 
     def report(msg):
@@ -328,7 +332,7 @@ def push_updates(recipient_email, project_type=None, progress_callback=None):
             progress_callback(msg)
 
     report("Preparing update for the other user...")
-    snapshot = build_outgoing_snapshot(project_type=project_type)
+    snapshot = build_outgoing_snapshot(project_type=project_type, local_username=local_username)
     if not snapshot["rows"]:
         report("Nothing new to send.")
         return {"sent": False, "reason": "nothing to send"}
@@ -338,7 +342,7 @@ def push_updates(recipient_email, project_type=None, progress_callback=None):
     return {"sent": sent, "rows_sent": len(snapshot["rows"])}
 
 
-def update_with_other_user(recipient_email, project_type=None, progress_callback=None):
+def update_with_other_user(recipient_email, project_type=None, progress_callback=None, local_username=None):
     """
     The 'Sync' button (Current Sheet / Export History, sync on). Two
     steps, in order:
@@ -369,7 +373,8 @@ def update_with_other_user(recipient_email, project_type=None, progress_callback
     if recipient_email:
         try:
             push_result = push_updates(
-                recipient_email, project_type=project_type, progress_callback=progress_callback
+                recipient_email, project_type=project_type, progress_callback=progress_callback,
+                local_username=local_username,
             )
         except Exception as exc:  # Outlook not running, COM error, mailbox refused...
             print(f"Sync with {recipient_email} failed: {exc}")
@@ -447,6 +452,7 @@ def _copy_finalized_export(internal_path, destination_path):
 
 def finalize_month(
     recipient_email, start_date, end_date, project_type=None, progress_callback=None, save_as_path=None,
+    local_username=None,
 ):
     """
     The 'Finalize' button (sync on), called AFTER the user has confirmed
@@ -475,6 +481,13 @@ def finalize_month(
     save_as_path only says where a COPY of it should also land. Its path
     (the save_as_path destination, if one was given, else the internal
     path) comes back in the return value.
+
+    local_username -- passed through to both build_outgoing_snapshot calls
+    this makes (via update_with_other_user, and the closing snapshot
+    above), so change_log entries flushed during Finalize are attributed
+    to the right person. In practice step 1 already flushes everything
+    there is to flush; the closing snapshot's own flush is normally a
+    no-op by the time it runs.
     """
 
     def report(msg):
@@ -482,7 +495,10 @@ def finalize_month(
         if progress_callback:
             progress_callback(msg)
 
-    update_with_other_user(recipient_email, project_type=project_type, progress_callback=progress_callback)
+    update_with_other_user(
+        recipient_email, project_type=project_type, progress_callback=progress_callback,
+        local_username=local_username,
+    )
 
     report("Closing out the current export sheet...")
     finalized = finalize_active_export(end_date, project_type=project_type)
@@ -501,7 +517,7 @@ def finalize_month(
     if recipient_email:
         report("Notifying the other user...")
         try:
-            closing_snapshot = build_outgoing_snapshot(project_type=project_type)
+            closing_snapshot = build_outgoing_snapshot(project_type=project_type, local_username=local_username)
             finalize_payload = {
                 "device_id": get_device_id(),
                 "export_filename": os.path.basename(output_path),

@@ -5,6 +5,8 @@ itself is responsible for resolving "which account" via a password-
 gated tile click - see ui/select_account_page.py and
 test_select_account_page.py for that page's own behavior).
 
+Also covers ui/app.py's MainWindow no longer showing its "Switch
+Account" button (kept, just hidden).
 """
 
 import os
@@ -68,7 +70,7 @@ class StartupRoutingTests(unittest.TestCase):
         self.assertIs(window.stack.currentWidget(), window.select_page)
         window.deleteLater()
 
-    def test_switch_account_button_emits_its_signal(self):
+    def test_switch_account_button_is_hidden_but_still_wired(self):
         from ui.app import MainWindow
 
         storage_service.init_db()  # DB_PATH is patched to a temp file in setUp
@@ -77,10 +79,12 @@ class StartupRoutingTests(unittest.TestCase):
         switch_btn = next(
             b for b in main_window.findChildren(QPushButton) if "Switch Account" in b.text()
         )
+        self.assertTrue(switch_btn.isHidden())
+        # Signal wiring must still be intact.
         received = []
         main_window.switch_account_requested.connect(lambda: received.append(True))
         switch_btn.click()
-        self.assertTrue(received, "clicking the button should emit the signal")
+        self.assertTrue(received, "clicking the (hidden) button should still emit the signal")
         main_window.deleteLater()
 
 

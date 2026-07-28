@@ -3,10 +3,19 @@ Entry point. Flow on every launch:
   1. Boot splash (animated ACT logo) - shown immediately.
   2. The app then routes to account creation or account selection:
        - No accounts yet on this machine -> AccountCreationPage
-       - One or more accounts exist      -> SelectAccountPage
-  3. Once an account is created OR selected -> straight into
-     MainWindow (the actual dashboard/sidebar app) - no intermediate
-     "Welcome back" splash step anymore.
+       - One or more accounts exist      -> SelectAccountPage. This app is
+         one-account-per-laptop (single local Outlook mailbox), so in
+         practice this is almost always exactly one tile - but the page
+         itself, not this file, is what resolves "more than one account
+         somehow exists on this machine": it shows every account found and
+         requires clicking + re-entering that account's password before
+         continuing (see ui/select_account_page.py), rather than this file
+         silently picking/discarding one. Its "Add account" tile only shows
+         when there are zero accounts (see select_account_page.py), since
+         this app doesn't support adding a second account once one exists.
+  3. Once an account is created OR selected -> straight into MainWindow
+     (the actual dashboard/sidebar app) - no intermediate "Welcome back"
+     splash step anymore.
 
 This file is the only "traffic cop" - it doesn't contain any account
 logic (that's ui/athu.py) or any page layout (that's the rest of ui/).

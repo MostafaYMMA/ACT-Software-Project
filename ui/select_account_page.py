@@ -111,7 +111,13 @@ class SelectAccountPage(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         # Follows the live theme now (light/dark), same as every other
         # page - matches BootLogoSplash's background exactly.
-        apply_live_style(self, lambda c: f"background-color: {c['BG']};")
+        # Scoped to this class specifically, not a bare "background-color:
+        # ...;" declaration -- see ui/account_page.py's AccountCreationPage
+        # for why a selector-less rule here would be risky: it cascades
+        # down through Qt's style sheet inheritance to every descendant,
+        # winning over any app-level QPushButton#primaryButton-style rule
+        # a future button on this page might rely on.
+        apply_live_style(self, lambda c: f"SelectAccountPage {{ background-color: {c['BG']}; }}")
 
         self._outer = QVBoxLayout(self)
         self._outer.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -239,9 +245,15 @@ class SelectAccountPage(QWidget):
             tile.clicked.connect(self._on_tile_clicked)
             grid.addWidget(tile, i // COLUMNS, i % COLUMNS)
 
-        add_tile = AccountTile("", is_add_tile=True)
-        add_tile.clicked.connect(lambda _u: self.add_account_requested.emit())
-        grid.addWidget(add_tile, len(accounts) // COLUMNS, len(accounts) % COLUMNS)
+        # One-account-per-laptop: once an account exists, there's nowhere
+        # sensible to add another from here - only offer the "Add account"
+        # tile on a true first run (no accounts at all), which in practice
+        # main.py routes straight to AccountCreationPage instead of this
+        # page anyway; kept here too so this page is correct standalone.
+        if not accounts:
+            add_tile = AccountTile("", is_add_tile=True)
+            add_tile.clicked.connect(lambda _u: self.add_account_requested.emit())
+            grid.addWidget(add_tile, 0, 0)
 
         self._outer.addWidget(self._grid_container, alignment=Qt.AlignmentFlag.AlignCenter)
 

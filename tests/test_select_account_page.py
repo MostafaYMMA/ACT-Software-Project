@@ -1,8 +1,9 @@
 """
-Covers ui/select_account_page.py's SelectAccountPage: every existing
-account gets a tile, plus an "Add account" tile, and clicking an
-account tile requires re-entering that account's password before
-account_selected fires.
+Covers ui/select_account_page.py's SelectAccountPage: the "Add account"
+tile only appears on a true first run (zero accounts) - this app is
+one-account-per-laptop, so once an account exists there's no supported
+way to add a second one from this page. Also covers the existing
+click-tile -> password-gated selection flow, which this relies on.
 """
 
 import os
@@ -55,15 +56,15 @@ class SelectAccountPageTests(unittest.TestCase):
         self.assertTrue(tiles[0].is_add_tile)
         page.deleteLater()
 
-    def test_add_tile_still_shown_alongside_an_existing_account(self):
+    def test_add_tile_hidden_once_an_account_exists(self):
         from ui.select_account_page import SelectAccountPage
 
         athu.save_account("Omar", "secret123")
         page = SelectAccountPage()
         page._rebuild_grid()
         tiles = self._tile_labels(page)
-        self.assertEqual(sorted(t.username for t in tiles if not t.is_add_tile), ["Omar"])
-        self.assertTrue(any(t.is_add_tile for t in tiles))
+        self.assertEqual([t.username for t in tiles], ["Omar"])
+        self.assertFalse(any(t.is_add_tile for t in tiles))
         page.deleteLater()
 
     def test_clicking_a_tile_requires_the_correct_password_before_selecting(self):

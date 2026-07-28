@@ -56,10 +56,14 @@ class UpdateWorker(QObject):
     finished = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, recipient_email, project_type):
+    def __init__(self, recipient_email, project_type, local_username=None):
         super().__init__()
         self.recipient_email = recipient_email
         self.project_type = project_type
+        # Who change_log attributes this sync's flushed local edits to
+        # (see storage_service.build_outgoing_snapshot) -- the page that
+        # constructs this worker passes its own logged-in username.
+        self.local_username = local_username
 
     def run(self):
         try:
@@ -67,6 +71,7 @@ class UpdateWorker(QObject):
                 result = update_with_other_user(
                     self.recipient_email, project_type=self.project_type,
                     progress_callback=self.progress.emit,
+                    local_username=self.local_username,
                 )
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -110,7 +115,8 @@ class FinalizeWorker(QObject):
     finished = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, recipient_email, start_date, end_date, project_type, save_as_path=None):
+    def __init__(self, recipient_email, start_date, end_date, project_type, save_as_path=None,
+                 local_username=None):
         super().__init__()
         self.recipient_email = recipient_email
         self.start_date = start_date
@@ -123,6 +129,9 @@ class FinalizeWorker(QObject):
         # cancelled" -- a cancelled dialog aborts the finalize entirely
         # before a worker is ever created.
         self.save_as_path = save_as_path
+        # See UpdateWorker.local_username -- same attribution, this button
+        # also pushes an outgoing snapshot (see finalize_month).
+        self.local_username = local_username
 
     def run(self):
         try:
@@ -130,7 +139,7 @@ class FinalizeWorker(QObject):
                 result = finalize_month(
                     self.recipient_email, self.start_date, self.end_date,
                     project_type=self.project_type, progress_callback=self.progress.emit,
-                    save_as_path=self.save_as_path,
+                    save_as_path=self.save_as_path, local_username=self.local_username,
                 )
         except Exception as exc:
             self.failed.emit(str(exc))
