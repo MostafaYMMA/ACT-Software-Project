@@ -59,7 +59,15 @@ class AccountCreationPage(QWidget):
         # attribute is set - without it, only child widgets show color,
         # never the page itself.
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        apply_live_style(self, lambda c: f"background-color: {c['BG']};")
+        # Scoped to this class specifically (not a bare "background-color:
+        # ...;" declaration) - a selector-less rule set on an ancestor
+        # cascades its background-color down through Qt's style sheet
+        # inheritance to ALL descendants, including create_btn below, and
+        # wins over the app-level QPushButton#primaryButton rule (ui/theme.py)
+        # for that property. That was silently turning the "Create Account"
+        # button this page's own pale background color instead of orange,
+        # making its (also light) text unreadable in light mode.
+        apply_live_style(self, lambda c: f"AccountCreationPage {{ background-color: {c['BG']}; }}")
         self._build_ui()
 
     def _build_ui(self):
