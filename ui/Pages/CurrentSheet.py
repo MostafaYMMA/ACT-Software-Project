@@ -38,6 +38,7 @@ from ui.sync_workers import (
     RefreshWorker, UpdateWorker, FinalizeWorker, LocalFinalizeWorker,
 )
 from ui.table_utils import order_columns, configure_grid, fit_columns, HEADER_LABELS
+from ui.change_log_dialog import ChangeLogDialog
 from ui.transition import reveal_rows
 from storage_service import (
     get_current_sheet_rows, update_current_sheet_field, set_current_sheet_row_color,
@@ -200,6 +201,24 @@ class RowTintDelegate(QStyledItemDelegate):
         editor.setPalette(palette)
         return editor
 
+    def updateEditorGeometry(self, editor, option, index):
+        """
+        The default QStyledItemDelegate implementation sizes the editor to
+        the cell's TEXT sub-rect, not the full cell rect -- it shrinks
+        option.rect by whatever contents margin the style computes for the
+        item, which here includes ui/theme.py's `QTableWidget::item`
+        padding (6px top+bottom). That leaves an editor only ~17-18px tall
+        inside a 30px-high row: comfortably less than what this editor's
+        OWN frame needs (its createEditor() stylesheet above adds 2px
+        padding + 1px border on top of a 13px-font line height, ~21-23px
+        minimum), so the text renders clipped top and bottom -- exactly the
+        "barely legible" in-place editor symptom. Handing it the full,
+        unshrunk cell rect instead (option.rect) gives it the same room the
+        30px row already has, with no row-height or global QLineEdit change
+        needed.
+        """
+        editor.setGeometry(option.rect)
+
     def paint(self, painter, option, index):
         tint = self._page.tint_for(index.row(), index.column())
         if not tint:
@@ -235,8 +254,17 @@ class RowTintDelegate(QStyledItemDelegate):
 
 
 class CurrentSheetPage(QWidget):
-    def __init__(self):
+    def __init__(self, user_name=None):
         super().__init__()
+        # The logged-in user's name (see ui/app.py's MainWindow, which
+        # receives it at login and passes it straight through here) --
+        # recorded as the change_log "source" for every local edit this
+        # page makes, so the Change History dialog can show who actually
+        # made an edit instead of a generic "This computer" placeholder.
+        # None (the default) is only for callers that don't have a
+        # logged-in user to pass -- storage_service falls back to "local"
+        # in that case, same as before this change.
+        self.user_name = user_name
         self._displayed_columns = []
         self._displayed_rows = []
         self._populating_table = False
@@ -650,7 +678,14 @@ class CurrentSheetPage(QWidget):
         """Right-click is a second way into the very same palette the
         leading column's button drops down -- not a different set of
         colours, and not a free-form picker, so there's one highlight
-        vocabulary however you reach it."""
+        vocabulary however you reach it.
+
+        It also carries the row's read-only change history, appended HERE
+        rather than inside _build_palette_menu: that method also feeds the
+        leading column's swatch dropdown, which is deliberately nothing but
+        colours (see its docstring), so putting a non-colour entry in it
+        would break exactly the "one highlight vocabulary" it exists for.
+        """
         item = self.table.itemAt(position)
         if item is None:
             return
@@ -658,8 +693,32 @@ class CurrentSheetPage(QWidget):
         if row_index >= len(self._displayed_rows):
             return
 
-        menu = self._build_palette_menu(row_index, self._displayed_rows[row_index])
+        menu = self._build_row_menu(row_index, self._displayed_rows[row_index])
         menu.exec(self.table.viewport().mapToGlobal(position))
+
+    def _build_row_menu(self, row_index, record):
+        """The full right-click menu: the colour palette, then the row's
+        change history. Kept separate from _on_context_menu (which only
+        positions and shows it) so what the menu CONTAINS can be checked
+        without spinning a modal event loop -- same split
+        _build_palette_menu already uses."""
+        menu = self._build_palette_menu(row_index, record)
+        menu.addSeparator()
+        history_action = menu.addAction("View change history...")
+        history_action.triggered.connect(
+            lambda checked=False, rec=record: self._show_change_history(rec)
+        )
+        return menu
+
+    def _show_change_history(self, record):
+        """Opens the read-only audit trail for one row. Keyed by
+        timecard_id, not the current_sheet id -- that's what change_log
+        records against (see storage_service.init_db's change_log block)."""
+        timecard_id = record.get("timecard_id")
+        if timecard_id is None:
+            return
+        description = " - ".join(str(record.get(key)) for key in ("day", "Project Name", "Task Name") if record.get(key))
+        ChangeLogDialog(timecard_id, description, parent=self).exec()
 
     def _set_color(self, row_index, record, hex_color):
         if not set_current_sheet_row_color(record.get("id"), hex_color):
@@ -782,7 +841,7 @@ class CurrentSheetPage(QWidget):
         self._set_controls_enabled(False)
         self.status_label.setText("Syncing...")
 
-        self._sync_worker = UpdateWorker(email, self._effective_project_type())
+        self._sync_worker = UpdateWorker(email, self._effective_project_type(), local_username=self.user_name)
         self._sync_thread = QThread(self)
         self._sync_worker.moveToThread(self._sync_thread)
 
@@ -885,7 +944,10 @@ class CurrentSheetPage(QWidget):
 
         project_type = self._effective_project_type()
         if sync_on:
-            self._finalize_worker = FinalizeWorker(email, start_str, end_str, project_type, save_as_path=save_as_path)
+            self._finalize_worker = FinalizeWorker(
+                email, start_str, end_str, project_type, save_as_path=save_as_path,
+                local_username=self.user_name,
+            )
         else:
             self._finalize_worker = LocalFinalizeWorker(start_str, end_str, project_type, save_as_path=save_as_path)
 

@@ -654,7 +654,7 @@ class MainWindow(QWidget):
         self.pages = {
             "Dashboard": DashboardPage(),
             "Records": RecordsPage(),
-            "CurrentSheet": CurrentSheetPage(),
+            "CurrentSheet": CurrentSheetPage(self.user_name),
             "History": HistoryPage(),
             "Late": LatePage(),
             "Settings": SettingsPage(),
