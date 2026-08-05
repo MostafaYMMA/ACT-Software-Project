@@ -6,6 +6,7 @@ import sys
 import tempfile
 import traceback
 import zipfile
+from email import message_from_binary_file, policy
 
 import win32com.client
 
@@ -405,6 +406,66 @@ def extract_msg_text(filepath):
     return "\n".join(text_chunks)
 
 
+def extract_eml_text(filepath):
+    """
+    .eml is a plain RFC 822 message (unlike .msg, Outlook's proprietary
+    binary format) -- parseable with the stdlib `email` module, no extra
+    dependency needed. An .eml attachment is itself a full email that can
+    carry the timecard either directly in its own body, or one level
+    deeper in ITS OWN attachments (e.g. a forwarded PDF timecard) -- so,
+    like extract_zip_text(), this recurses into nested attachments via
+    extract_text_from_file() rather than only reading the shallow body.
+    """
+    text_chunks = []
+    temp_extract_dir = tempfile.mkdtemp(prefix="eml_extract_")
+    try:
+        with open(filepath, "rb") as f:
+            msg = message_from_binary_file(f, policy=policy.default)
+
+        subject = msg.get("Subject")
+        if subject:
+            text_chunks.append(str(subject))
+
+        body_part = msg.get_body(preferencelist=("plain", "html"))
+        if body_part is not None:
+            try:
+                body_text = body_part.get_content()
+            except Exception:
+                body_text = ""
+            if body_part.get_content_type() == "text/html":
+                body_text = extract_html_text_from_string(body_text)
+            if body_text:
+                text_chunks.append(body_text)
+
+        for part in msg.walk():
+            filename = part.get_filename()
+            if not filename:
+                continue
+            try:
+                payload = part.get_content()
+            except Exception:
+                continue
+            if isinstance(payload, str):
+                payload = payload.encode("utf-8", errors="ignore")
+            if not isinstance(payload, (bytes, bytearray)):
+                continue
+            safe_name = f"{abs(hash(filename))}_{filename}"
+            nested_path = os.path.join(temp_extract_dir, safe_name)
+            try:
+                with open(nested_path, "wb") as nf:
+                    nf.write(payload)
+                nested_text = extract_text_from_file(nested_path)
+                if nested_text:
+                    text_chunks.append(nested_text)
+            except Exception:
+                traceback.print_exc()
+    except Exception:
+        traceback.print_exc()
+    finally:
+        shutil.rmtree(temp_extract_dir, ignore_errors=True)
+    return "\n".join(text_chunks)
+
+
 def extract_odf_text(filepath):
     if odf_load is None or odf_text is None:
         return ""
@@ -418,14 +479,24 @@ def extract_odf_text(filepath):
     return "\n".join(text_chunks)
 
 
-def extract_html_text(filepath):
+def extract_html_text_from_string(raw_html):
+    if not raw_html:
+        return ""
     try:
-        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-            raw_html = f.read()
         if BeautifulSoup is not None:
             soup = BeautifulSoup(raw_html, "lxml")
             return soup.get_text(separator="\n")
         return re.sub(r"<[^>]+>", " ", raw_html)
+    except Exception:
+        traceback.print_exc()
+        return ""
+
+
+def extract_html_text(filepath):
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            raw_html = f.read()
+        return extract_html_text_from_string(raw_html)
     except Exception:
         traceback.print_exc()
         return ""
@@ -531,6 +602,8 @@ def extract_text_from_file(filepath):
             return extract_rtf_text(filepath)
         elif ext == ".msg":
             return extract_msg_text(filepath)
+        elif ext == ".eml":
+            return extract_eml_text(filepath)
         elif ext == ".zip":
             return extract_zip_text(filepath)
         elif ext in (".odt", ".ods", ".odp"):
