@@ -23,12 +23,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "services"))
 import storage_service
 
 
-def _entry(status, received, day="Saturday, 07 Mar"):
+def _entry(status, received, day="Saturday, 07 Mar", sender="s@x.com"):
     return {
         "status": status, "day": day, "project_name": "HL Test Project",
         "project_code": "400380981", "task": "1.01.00 - FP Labor",
         "hours": "8", "name": "Osama", "person_number": "1960153",
-        "subject": "Fwd: FW: Timecard& expenses.", "sender": "s@x.com",
+        "subject": "Fwd: FW: Timecard& expenses.", "sender": sender,
         "received": received, "labor_type": "ORCL", "time_type": "AE",
         "period": "3/7/26 - 3/13/26",
         "rate": None, "rate_updated_at": None, "rate_updated_by": None,
@@ -95,6 +95,11 @@ class ReceivedEarliestWinsTests(unittest.TestCase):
         self.assertEqual(self._count("timecards_approved"), 1)
         self.assertEqual(self._count("timecards_pending"), 0)
         self.assertEqual(self._received("timecards_approved"), [LATE])
+
+    def test_different_sender_is_treated_as_different_entry(self):
+        storage_service.save_cards([_entry("Approved", EARLY, sender="one@example.com")])
+        storage_service.save_cards([_entry("Approved", MID, sender="two@example.com")])
+        self.assertEqual(self._count(), 2)
 
     def test_forward_status_change_moves_and_keeps_new_received(self):
         # Pending first, Approval later: entry moves to approved with the
