@@ -538,11 +538,12 @@ def get_stale_records(min_age_hours):
 
 def _create_timecards_table(conn, table_name):
     # What makes two entries the SAME entry: the same work day, on the same
-    # project and task, from the same person, received in the same month.
-    # received_month is in the key on purpose -- the same timecard received
-    # in a different month is a separate entry, not a duplicate to overwrite.
-    # It's a stored column rather than an expression because SQLite can't put
-    # substr(received, 1, 7) inside a table-level UNIQUE constraint.
+    # project and task, from the same sender/person, received in the same
+    # month. received_month is in the key on purpose -- the same timecard
+    # received in a different month is a separate entry, not a duplicate to
+    # overwrite. It's a stored column rather than an expression because
+    # SQLite can't put substr(received, 1, 7) inside a table-level UNIQUE
+    # constraint.
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS "{table_name}" (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -563,40 +564,51 @@ def _create_timecards_table(conn, table_name):
             received_month TEXT,
             is_exported INTEGER DEFAULT 0,
             rate REAL DEFAULT 0,
-            ----UNIQUE(day, "Project Number", "Task Name", sender, received_month)
-            ----UNIQUE(day, "Project Number","Project Name",person_number ,"Task Name", received_month)
-            UNIQUE(day, "Project Number", "Task Name", person_number, received_month)
-
+            UNIQUE(day, "Project Number", "Task Name", sender, person_number, period, received_month)
         )
     """)
 
 
-def _needs_received_month_rebuild(conn, table_name):
+def _needs_timecard_key_rebuild(conn, table_name):
     """
-    True when table_name exists but predates received_month. Such a table was
-    created before the column joined the row key, and can't be patched in place
-    (see _rebuild_status_table_with_received_month). A table that doesn't exist
-    yet returns False -- _create_timecards_table builds it correctly from the
-    start.
+    True when table_name exists but predates the current timecard row key.
+    Such a table can't be patched in place (see
+    _rebuild_status_table_for_current_key): a new UNIQUE constraint must be
+    introduced by rebuilding the table from scratch. A table that doesn't
+    exist yet returns False -- _create_timecards_table builds it correctly
+    from the start.
     """
     columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{table_name}")')}
-    return bool(columns) and "received_month" not in columns
+    if not columns:
+        return False
+
+    if "received_month" not in columns:
+        return True
+
+    sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    if not sql_row or not sql_row[0]:
+        return False
+    return "UNIQUE(day, \"Project Number\", \"Task Name\", sender, person_number, period, received_month)" not in sql_row[0]
 
 
-def _rebuild_status_table_with_received_month(conn, table_name):
+def _rebuild_status_table_for_current_key(conn, table_name):
     """
-    Brings a status table created before received_month existed up to the
-    current schema. received_month is half of the row key and part of the
-    table's UNIQUE constraint, so ALTER TABLE ADD COLUMN can't introduce it:
-    that can't extend a UNIQUE constraint, and _upsert_timecard's ON CONFLICT
-    needs the constraint to match. The table is rebuilt instead -- renamed
-    aside, a fresh one created, existing rows copied over with received_month
-    derived from each row's received timestamp, then the old table dropped.
+    Brings a status table up to the current schema. The timecard row key now
+    includes sender as well as person_number and received_month, so ALTER TABLE
+    ADD COLUMN can't introduce a new UNIQUE constraint: that can't extend a
+    UNIQUE constraint, and _upsert_timecard's ON CONFLICT needs the constraint
+    to match. The table is rebuilt instead -- renamed aside, a fresh one
+    created, existing rows copied over with received_month derived from each
+    row's received timestamp, then the old table dropped.
 
     Row ids are carried across so invoice_lines.timecard_id links back into the
     approved table still resolve. When two old rows collapse onto the new
-    (day, project, task, person, month) key, the one with the latest received
-    wins -- the same "newest state is current" rule _save_row enforces.
+    (day, project, task, sender, person, month) key, the one with the latest
+    received wins -- the same "newest state is current" rule _save_row
+    enforces.
     """
     tmp_name = f"{table_name}__pre_received_month"
     conn.execute(f'DROP TABLE IF EXISTS "{tmp_name}"')
@@ -828,8 +840,8 @@ def init_db():
         # A table created before received_month existed can't be patched in
         # place (the column is part of the UNIQUE key) -- rebuild it first so
         # the CREATE/ensure below act on a table that already has the column.
-        if _needs_received_month_rebuild(conn, table_name):
-            _rebuild_status_table_with_received_month(conn, table_name)
+        if _needs_timecard_key_rebuild(conn, table_name):
+            _rebuild_status_table_for_current_key(conn, table_name)
         _create_timecards_table(conn, table_name)
         # ADD COLUMN with a DEFAULT backfills existing rows with it, so
         # records created before these columns existed start as
@@ -1377,16 +1389,16 @@ def _to_row(entry: dict) -> tuple:
 
 def _row_key(row: tuple) -> tuple:
     """
-    (day, Project Number, Task Name, person_number, received_month) out of a
-    _to_row tuple -- the status tables' UNIQUE key. It deliberately says
-    nothing about status, so it identifies the same entry across all three
-    of them.
+    (day, Project Number, Task Name, sender, person_number, period, received_month)
+    out of a _to_row tuple -- the status tables' UNIQUE key. It deliberately
+    says nothing about status, so it identifies the same entry across all
+    three of them.
 
-    The entry is keyed by WHOSE timecard it is (person_number), not by who
-    happened to send the email -- the same timecard forwarded by two people
-    is one entry, not two.
+    The entry is keyed by both the person on the timecard and the sender of
+    the email, so the same timecard forwarded by two different people is
+    treated as two distinct entries.
     """
-    return (row[0], row[5], row[7], row[10], row[14])
+    return (row[0], row[5], row[7], row[12], row[10], row[9], row[14])
 
 
 def _rebuild_summary(conn):
@@ -1947,7 +1959,7 @@ def _find_existing(conn, key):
         for row in conn.execute(f"""
             SELECT id, received, rate, is_exported, origin FROM "{table_name}"
             WHERE day = ? AND "Project Number" = ? AND "Task Name" = ?
-              AND person_number = ? AND received_month = ?
+              AND sender = ? AND person_number = ? AND period = ? AND received_month = ?
         """, key):
             found.append((table_name, *row))
     return found
@@ -1958,18 +1970,18 @@ def _upsert_timecard(conn, table_name, row, origin=None):
     # table's UNIQUE constraint (see _create_timecards_table) -- SQLite
     # raises "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
     # constraint" otherwise. The key columns are not in the DO UPDATE list
-    # (they're what was matched on); sender is, since it's no longer part of
-    # the key and a later forward of the same timecard should refresh it.
-    # origin is also deliberately NOT in the DO UPDATE list, same reasoning
-    # as rate/is_exported below -- who an entry originally came from isn't
-    # a property of its latest received timestamp, so a later rescan or
-    # resync must never flip it.
+    # (they're what was matched on); sender stays in the key, so a later
+    # forward of a different sender's timecard must not overwrite the local
+    # one. origin is also deliberately NOT in the DO UPDATE list, same
+    # reasoning as rate/is_exported below -- who an entry originally came
+    # from isn't a property of its latest received timestamp, so a later
+    # rescan or resync must never flip it.
     conn.execute(f"""
         INSERT INTO "{table_name}"
         (day, "Date", labor_type, time_type, "Qty", "Project Number", "Project Name", "Task Name", name, period, person_number, subject, sender, received, received_month, origin)
         VALUES
         (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(day, "Project Number", "Task Name", person_number, received_month) DO UPDATE SET
+        ON CONFLICT(day, "Project Number", "Task Name", sender, person_number, period, received_month) DO UPDATE SET
             "Date" = excluded."Date",
             labor_type = excluded.labor_type,
             time_type = excluded.time_type,
@@ -2051,7 +2063,7 @@ def _save_row(conn, table_name, row, origin=None):
                 is_exported = CASE WHEN COALESCE(is_exported, 0) = 0 THEN ? ELSE is_exported END,
                 origin = COALESCE(origin, ?)
             WHERE day = ? AND "Project Number" = ? AND "Task Name" = ?
-              AND person_number = ? AND received_month = ?
+              AND sender = ? AND person_number = ? AND period = ? AND received_month = ?
         """, (carried_rate, carried_is_exported, origin, *key))
 
 
@@ -3103,8 +3115,9 @@ def export_act_invoice_overview_range(start_date: str, end_date: str, output_pat
                      Project Name, Period, Task Name, Qty, Sales Price
                      (=rate, converted from AED to USD at the live rate --
                      see below), Total Amount (=Qty*Sales Price formula).
-                     Invoice No / Project Mgr / SOW / Consultant are left
-                     blank -- not tracked by this system.
+                     Invoice No / Project Mgr / SOW are left blank -- not
+                     tracked by this system; Consultant is populated from the
+                     record's sender email.
       Expense row -> Line=2, Type=Expense, and the Total Amount formula.
                      Sales Price is that record's own linked expense
                      amount (already in USD -- see
@@ -3178,7 +3191,8 @@ def export_act_invoice_overview_range(start_date: str, end_date: str, output_pat
 _ACT_ROW_COLUMNS = (
     'timecards_approved.id, timecards_approved."Project Number", timecards_approved."Project Name", '
     'timecards_approved."Task Name", timecards_approved."Qty", timecards_approved.rate, '
-    'timecards_approved.day, timecards_approved.period, current_sheet.row_color'
+    'timecards_approved.day, timecards_approved.period, timecards_approved.sender, '
+    'current_sheet.row_color'
 )
 
 # How strongly a Current Sheet row's highlight colour is lightened toward
@@ -3268,7 +3282,7 @@ def _write_act_invoice_workbook(conn, rows, output_path):
         cell.fill = _HEADER_FILL
 
     r = header_row + 1
-    for _id, project_number, project_name, task_name, qty, rate, day, period, row_color in rows:
+    for _id, project_number, project_name, task_name, qty, rate, day, period, sender, row_color in rows:
         qty_val = float(qty) if qty not in (None, "") else None
         rate_val = float(rate) if rate not in (None, "") else 0.0
         rate_usd = rate_val / aed_per_usd
@@ -3283,6 +3297,7 @@ def _write_act_invoice_workbook(conn, rows, output_path):
         ws.cell(row=r, column=10, value=1)                   # Line
         ws.cell(row=r, column=11, value="LABOR")              # Type
         ws.cell(row=r, column=12, value=project_number)      # Project Number
+        ws.cell(row=r, column=13, value=sender)              # Consultant
         ws.cell(row=r, column=14, value=qty_val)              # Qty
         sp_cell = ws.cell(row=r, column=15, value=rate_usd)   # Sales Price (USD)
         sp_cell.number_format = _USD_FORMAT
