@@ -3103,8 +3103,9 @@ def export_act_invoice_overview_range(start_date: str, end_date: str, output_pat
                      Project Name, Period, Task Name, Qty, Sales Price
                      (=rate, converted from AED to USD at the live rate --
                      see below), Total Amount (=Qty*Sales Price formula).
-                     Invoice No / Project Mgr / SOW / Consultant are left
-                     blank -- not tracked by this system.
+                     Invoice No / Project Mgr / SOW are left blank -- not
+                     tracked by this system; Consultant is populated from the
+                     record's sender email.
       Expense row -> Line=2, Type=Expense, and the Total Amount formula.
                      Sales Price is that record's own linked expense
                      amount (already in USD -- see
@@ -3178,7 +3179,8 @@ def export_act_invoice_overview_range(start_date: str, end_date: str, output_pat
 _ACT_ROW_COLUMNS = (
     'timecards_approved.id, timecards_approved."Project Number", timecards_approved."Project Name", '
     'timecards_approved."Task Name", timecards_approved."Qty", timecards_approved.rate, '
-    'timecards_approved.day, timecards_approved.period, current_sheet.row_color'
+    'timecards_approved.day, timecards_approved.period, timecards_approved.sender, '
+    'current_sheet.row_color'
 )
 
 # How strongly a Current Sheet row's highlight colour is lightened toward
@@ -3268,7 +3270,7 @@ def _write_act_invoice_workbook(conn, rows, output_path):
         cell.fill = _HEADER_FILL
 
     r = header_row + 1
-    for _id, project_number, project_name, task_name, qty, rate, day, period, row_color in rows:
+    for _id, project_number, project_name, task_name, qty, rate, day, period, sender, row_color in rows:
         qty_val = float(qty) if qty not in (None, "") else None
         rate_val = float(rate) if rate not in (None, "") else 0.0
         rate_usd = rate_val / aed_per_usd
@@ -3283,6 +3285,7 @@ def _write_act_invoice_workbook(conn, rows, output_path):
         ws.cell(row=r, column=10, value=1)                   # Line
         ws.cell(row=r, column=11, value="LABOR")              # Type
         ws.cell(row=r, column=12, value=project_number)      # Project Number
+        ws.cell(row=r, column=13, value=sender)              # Consultant
         ws.cell(row=r, column=14, value=qty_val)              # Qty
         sp_cell = ws.cell(row=r, column=15, value=rate_usd)   # Sales Price (USD)
         sp_cell.number_format = _USD_FORMAT
